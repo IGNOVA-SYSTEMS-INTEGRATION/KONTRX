@@ -1,0 +1,23 @@
+# Build directories
+build/
+Build/
+bin/
+obj/
+
+# IDE files
+.vscode/ipch/
+.vscode/.browse.vc.db
+.vscode/browse.vc.db
+
+# Compiled files
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.su
+*.d
+
+# OS files
+.DS_Store
+Thumbs.db

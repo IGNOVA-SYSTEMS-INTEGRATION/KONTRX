@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Flash & Debug STM32",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/stm32_modbus",
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "servertype": "openocd",
+            "device": "STM32F407VE",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f4x.cfg"
+            ],
+            "svdFile": "" 
+        }
+    ]
+}
