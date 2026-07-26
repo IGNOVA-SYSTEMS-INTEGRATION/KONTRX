@@ -2,9 +2,12 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Flash & Debug Bootloader",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build2/Bootloader",
+            "name": "Flash & Debug Kontrx RTOS (Sensors)",
+            "executable": "${workspaceFolder}/build/KontrxRTOS",
+            "loadFiles": [
+                "${workspaceFolder}/build/KontrxRTOS.hex"
+            ],
             "request": "launch",
             "type": "cortex-debug",
             "runToEntryPoint": "main",
@@ -17,9 +20,12 @@
             "svdFile": ""
         },
         {
-            "name": "Flash & Debug STM32 App",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build2/Kontrx",
+            "name": "Flash & Debug Kontrx RTOS (Sensors)",
+            "executable": "${workspaceFolder}/build/KontrxRTOS",
+            "loadFiles": [
+                "${workspaceFolder}/build/KontrxRTOS.hex"
+            ],
             "request": "launch",
             "type": "cortex-debug",
             "runToEntryPoint": "main",

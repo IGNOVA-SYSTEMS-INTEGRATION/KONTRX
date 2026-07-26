@@ -214,6 +214,10 @@ static int Is_Pin_Reserved(uint8_t port, uint8_t pin) {
     if (port == 1) {
         if (pin == 10 || pin == 11 || pin == 12 || pin == 13 || pin == 14 || pin == 15) return 1;
     }
+    /* PC4: W5500 hardware reset; PC6/PC7: USART6 debug console */
+    if (port == 2) {
+        if (pin == 4 || pin == 6 || pin == 7) return 1;
+    }
     /* PD2, PD3: MAX485 RE/DE Control */
     if (port == 3) {
         if (pin == 2 || pin == 3) return 1;
@@ -659,6 +663,8 @@ void Task_HTTPServer(void *arg) {
     if (!sem_ota_start) sem_ota_start = osSemaphoreNew(1, 0, NULL);
     if (!sem_ota_done)  sem_ota_done  = osSemaphoreNew(1, 0, NULL);
 
+    printf("[HTTP] Task started; opening TCP port %u\r\n", HTTP_PORT);
+
     for (;;) {
         switch (getSn_SR(HTTP_SOCK)) {
 
@@ -666,14 +672,21 @@ void Task_HTTPServer(void *arg) {
          * CLOSED → create TCP socket and prepare to listen
          * -------------------------------------------------------------- */
         case SOCK_CLOSED:
-            socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00);
+            if (socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
+                printf("[HTTP] Socket open failed\r\n");
+                osDelay(100);
+            }
             break;
 
         /* ---------------------------------------------------------------
          * INIT → start listening for incoming connections
          * -------------------------------------------------------------- */
         case SOCK_INIT:
-            listen(HTTP_SOCK);
+            if (listen(HTTP_SOCK) != SOCK_OK) {
+                printf("[HTTP] Listen failed\r\n");
+            } else {
+                printf("[HTTP] Listening on port %u\r\n", HTTP_PORT);
+            }
             break;
 
         /* ---------------------------------------------------------------

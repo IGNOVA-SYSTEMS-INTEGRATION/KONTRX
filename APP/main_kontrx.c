@@ -138,11 +138,30 @@ int main(void) {
     reg_wizchip_cs_cbfunc(W5500_CS_Select, W5500_CS_Deselect);
     reg_wizchip_spi_cbfunc(W5500_SPI_ReadByte, W5500_SPI_WriteByte);
 
+    /* Start from known W5500 register state.  This also clears a stale
+     * PING-block/PPPoE mode or an abandoned socket left by a brown-out. */
+    wizchip_sw_reset();
+
     /* Set RX/TX buffer sizes for 8 sockets (2KB each = 16KB total) */
     uint8_t rx_tx_buf_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
     if (wizchip_init(rx_tx_buf_sizes, rx_tx_buf_sizes) != 0) {
         printf("[NET] wizchip_init FAILED\r\n");
     }
+
+    /* VERSIONR is a direct SPI sanity check.  It must be 0x04 on a W5500;
+     * report a wiring/reset fault explicitly instead of only printing an IP
+     * address that was stored in software. */
+    uint8_t w5500_version = getVERSIONR();
+    if (w5500_version != 0x04U) {
+        printf("[NET] W5500 SPI FAILED: VERSIONR=0x%02X (expected 0x04)\r\n",
+               w5500_version);
+    } else {
+        printf("[NET] W5500 SPI OK: VERSIONR=0x04, PHY link %s\r\n",
+               (wizphy_getphylink() == PHY_LINK_ON) ? "UP" : "DOWN");
+    }
+
+    /* Keep normal ping reception enabled. */
+    setMR(0);
 
     /* ---- 5. Static IP Configuration ---- */
     wiz_NetInfo net = {
@@ -154,9 +173,16 @@ int main(void) {
         .dhcp = NETINFO_STATIC
     };
     ctlnetwork(CN_SET_NETINFO, &net);
-    printf("[NET] IP: %d.%d.%d.%d  GW: %d.%d.%d.%d\r\n",
-        net.ip[0], net.ip[1], net.ip[2], net.ip[3],
-        net.gw[0], net.gw[1], net.gw[2], net.gw[3]);
+
+    /* Read the registers back from the chip.  Printing the requested values
+     * alone can hide a failed SPI write and makes ARP failures opaque. */
+    wiz_NetInfo net_readback = {0};
+    ctlnetwork(CN_GET_NETINFO, &net_readback);
+    printf("[NET] IP readback: %d.%d.%d.%d  GW: %d.%d.%d.%d  MAC: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+        net_readback.ip[0], net_readback.ip[1], net_readback.ip[2], net_readback.ip[3],
+        net_readback.gw[0], net_readback.gw[1], net_readback.gw[2], net_readback.gw[3],
+        net_readback.mac[0], net_readback.mac[1], net_readback.mac[2],
+        net_readback.mac[3], net_readback.mac[4], net_readback.mac[5]);
 
     /* ---- 6. LED ---- */
     LED_Init();

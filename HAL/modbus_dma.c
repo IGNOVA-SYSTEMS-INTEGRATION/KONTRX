@@ -104,6 +104,11 @@ static uint8_t tx_dma_buf[MODBUS_TX_BUF_SIZE];
 
 /* Byte count captured in IDLE ISR */
 static volatile uint16_t rx_received_len = 0;
+/* A Modbus RTU frame is only complete after the expected response bytes have
+ * arrived.  Some sensors leave an inter-byte gap that raises USART IDLE after
+ * the first byte; treating that as a full frame caused the observed "got 1"
+ * failure and discarded the rest of the response. */
+static volatile uint16_t rx_expected_len = 0;
 
 /* RTOS synchronisation primitives */
 static osSemaphoreId_t sem_dma_rx_done  = NULL;
@@ -273,27 +278,48 @@ void Modbus_DMA_Init(void) {
  *  Non-blocking TX helper — sends a Modbus frame via DMA
  * ====================================================================== */
 static uint8_t Modbus_Send_Frame(const uint8_t *frame, uint8_t len) {
-    /* Arm RX DMA to capture the response */
+    /* Flush any stale RX semaphore from previous transaction */
+    xSemaphoreTake((SemaphoreHandle_t)sem_dma_rx_done, 0);
+
+    /* Disable RX DMA before TX to avoid capturing our own echo */
     DMA1->Stream[1].CR &= ~DMA_CR_EN;
     while (DMA1->Stream[1].CR & DMA_CR_EN);
-    DMA1->LIFCR |= (0x3FU << 6);
-    DMA1->Stream[1].NDTR = MODBUS_RX_BUF_SIZE;
-    DMA1->Stream[1].CR  |= DMA_CR_EN;
+    DMA1->LIFCR = (0x3FU << 6);
 
-    /* 3.5-char inter-frame delay (≈4ms @ 9600 baud) */
+    /* 3.5-char inter-frame silence before TX */
     osDelay(5);
 
     MAX485_TX();
-    osDelay(1); /* MAX485 driver settling */
+    osDelay(1); /* MAX485 DE settling time */
 
     /* Kick off TX via DMA */
     DMA1_Tx_Start(frame, len);
 
     /* Block until TX DMA fires TC interrupt (max 50 ms) */
     osStatus_t st = osSemaphoreAcquire(sem_dma_tx_done, 50);
+
+    /* Switch MAX485 back to RX mode after TX shift register is drained */
     MAX485_RX();
 
-    return (st == osOK) ? 1 : 0;
+    if (st != osOK) {
+        return 0;
+    }
+
+    /* Now clear IDLE flag that fired on TX echo (RS485 loopback):
+     * Reading SR then DR resets the IDLE flag. */
+    volatile uint32_t tmp = USART3->SR;
+    tmp = USART3->DR;
+    (void)tmp;
+
+    /* Flush the stale semaphore that was posted by TX-echo IDLE event */
+    xSemaphoreTake((SemaphoreHandle_t)sem_dma_rx_done, 0);
+
+    /* Re-arm RX DMA to capture the actual slave response */
+    DMA1->Stream[1].NDTR = MODBUS_RX_BUF_SIZE;
+    DMA1->LIFCR = (0x3FU << 6);
+    DMA1->Stream[1].CR |= DMA_CR_EN;
+
+    return 1;
 }
 
 /* ======================================================================
@@ -311,6 +337,8 @@ static uint8_t Modbus_Read_Registers_Timeout(uint8_t slave, uint16_t reg,
     uint16_t crc = Modbus_CRC16(frame, 6);
     frame[6] = (uint8_t)(crc & 0xFF);
     frame[7] = (uint8_t)(crc >> 8);
+
+    rx_expected_len = (uint16_t)(3U + ((uint16_t)num_regs * 2U) + 2U);
 
     if (!Modbus_Send_Frame(frame, 8)) {
         printf("[Modbus] TX failed for slave=%d reg=0x%04X\r\n", slave, reg);
@@ -577,11 +605,16 @@ void USART3_IRQHandler(void) {
         tmp = USART3->DR;
         (void)tmp;
 
-        /* Stop RX DMA to freeze NDTR */
-        DMA1->Stream[1].CR &= ~DMA_CR_EN;
-
         /* Bytes received = total buffer - remaining */
-        rx_received_len = (uint16_t)(MODBUS_RX_BUF_SIZE - DMA1->Stream[1].NDTR);
+        uint16_t received = (uint16_t)(MODBUS_RX_BUF_SIZE - DMA1->Stream[1].NDTR);
+
+        /* IDLE is one character time, not the Modbus 3.5-character frame
+         * delimiter.  Keep DMA running until the complete response arrives. */
+        if (received < rx_expected_len) return;
+
+        /* Stop RX DMA to freeze NDTR once the complete frame is present. */
+        DMA1->Stream[1].CR &= ~DMA_CR_EN;
+        rx_received_len = received;
 
         /* Signal the polling task */
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;

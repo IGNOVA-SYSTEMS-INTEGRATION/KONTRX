@@ -105,6 +105,7 @@ set_target_properties(KontrxRTOS PROPERTIES
 
 add_custom_command(TARGET KontrxRTOS POST_BUILD
     COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:KontrxRTOS> KontrxRTOS.bin
+    COMMAND arm-none-eabi-objcopy -O ihex $<TARGET_FILE:KontrxRTOS> KontrxRTOS.hex
     COMMAND arm-none-eabi-size $<TARGET_FILE:KontrxRTOS>
-    COMMENT "Generating KontrxRTOS.bin (RTOS Application for OTA)"
+    COMMENT "Generating KontrxRTOS.bin and KontrxRTOS.hex (RTOS Application)"
 )

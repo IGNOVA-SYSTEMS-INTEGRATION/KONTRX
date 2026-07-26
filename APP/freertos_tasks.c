@@ -34,6 +34,7 @@
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include <stdio.h>
 
 /* ======================================================================
  *  Global uptime counter
@@ -64,9 +65,24 @@ static const struct { uint8_t port; uint8_t pin; } relay_defaults[MAX_RELAYS] = 
     {0, 0},  /* R6  PA0 */
     {0, 2},  /* R7  PA2 */
     {0, 4},  /* R8  PA4 */
-    {2, 4},  /* R9  PC4 */
+    /* PC4 is the W5500 reset line, so it must never be configured as a relay.
+     * R9 is intentionally disabled until a board-specific, non-reserved pin is
+     * assigned from the configuration UI. */
+    {0xFF, 0xFF},
     {3, 8},  /* R10 PD8 */
 };
+
+/* These pins are owned by fixed hardware functions.  In particular, allowing
+ * a persisted relay configuration to drive PC4 low holds the W5500 in reset. */
+static uint8_t Relay_Pin_Is_Reserved(uint8_t port, uint8_t pin) {
+    if (port > 4 || pin > 15) return 1;
+
+    if (port == 0 && (pin == 6 || pin == 9 || pin == 10)) return 1;  /* LED, USART1 */
+    if (port == 1 && pin >= 10 && pin <= 15) return 1;                /* Modbus, W5500 SPI */
+    if (port == 2 && (pin == 4 || pin == 6 || pin == 7)) return 1;    /* W5500 RST, USART6 */
+    if (port == 3 && (pin == 2 || pin == 3)) return 1;                /* MAX485 RE#/DE */
+    return 0;
+}
 
 /* ======================================================================
  *  Relay GPIO Initialisation
@@ -86,7 +102,11 @@ void Relay_Init(void) {
         uint8_t port = cfg.relays[i].port_id;
         uint8_t pin  = cfg.relays[i].pin_num;
 
-        if (port > 4 || pin > 15) continue;
+        if (Relay_Pin_Is_Reserved(port, pin)) {
+            printf("[Relay] R%d pin P%c%u is reserved; relay disabled\r\n",
+                   i + 1, (port <= 4) ? ('A' + port) : '?', pin);
+            continue;
+        }
 
         GPIO_TypeDef *gpio = GPIO_Ports[port];
 
@@ -122,7 +142,7 @@ void Relay_SetState(uint8_t idx, uint8_t state) {
     uint8_t pin    = cfg.relays[idx].pin_num;
     uint8_t is_nc  = cfg.relays[idx].is_nc;
 
-    if (port > 4 || pin > 15) return;
+    if (Relay_Pin_Is_Reserved(port, pin)) return;
 
     GPIO_TypeDef *gpio = GPIO_Ports[port];
 
