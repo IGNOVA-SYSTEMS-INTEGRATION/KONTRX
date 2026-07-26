@@ -1,10 +1,14 @@
 #include "gpio_stm32.h"
 
+GPIO_TypeDef * const GPIO_Ports[5] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE};
+
 void GPIO_InitOutput(GPIO_TypeDef* port, uint8_t pin) {
     // Enable Clock for Port
     if (port == GPIOA) RCC->AHB1ENR |= (1 << 0);
     else if (port == GPIOB) RCC->AHB1ENR |= (1 << 1);
+    else if (port == GPIOC) RCC->AHB1ENR |= (1 << 2);
     else if (port == GPIOD) RCC->AHB1ENR |= (1 << 3);
+    else if (port == GPIOE) RCC->AHB1ENR |= (1 << 4);
 
     // Set MODER to 01 (General purpose output mode)
     port->MODER &= ~(3U << (pin * 2));

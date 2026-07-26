@@ -1,0 +1,5 @@
+D:/WORKSPACE/IGNOVA/DEVELOPMENT/Kontrx/build2/CMakeFiles/Bootloader.dir
+D:/WORKSPACE/IGNOVA/DEVELOPMENT/Kontrx/build2/CMakeFiles/Kontrx.dir
+D:/WORKSPACE/IGNOVA/DEVELOPMENT/Kontrx/build2/CMakeFiles/KontrxRTOS.dir
+D:/WORKSPACE/IGNOVA/DEVELOPMENT/Kontrx/build2/CMakeFiles/edit_cache.dir
+D:/WORKSPACE/IGNOVA/DEVELOPMENT/Kontrx/build2/CMakeFiles/rebuild_cache.dir

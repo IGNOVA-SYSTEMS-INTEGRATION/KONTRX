@@ -417,7 +417,7 @@ void MqttSubscribeTask(void *pvParameters) {
 
     printf("IP: %d.%d.%d.%d\r\n", net_info.ip[0], net_info.ip[1], net_info.ip[2], net_info.ip[3]);
 
-    uint8_t targetIP[4] = {192, 168, 8, 22};
+    uint8_t targetIP[4] = {192, 168, 1, 13};
     uint16_t targetPort = 1883;
     NewNetwork(&n, 0); 
     

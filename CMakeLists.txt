@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.10)
 
 project(Kontrx C CXX ASM)
 
-# Target MCU variable (Default to STM32F4)
 set(TARGET_MCU "STM32F4" CACHE STRING "Target Microcontroller")
 
 # CPU Specific Flags
@@ -11,61 +10,101 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -O0 -g -Wall -Wextra -D_WIZCHIP
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -O0 -g -Wall -Wextra -D_WIZCHIP_=W5500")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${CPU_FLAGS} -g")
 
-set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/stm32f407vet6.ld")
-set(CMAKE_EXE_LINKER_FLAGS "-T${LINKER_SCRIPT} ${CPU_FLAGS} -Wl,-Map=${PROJECT_NAME}.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float")
-
-# Core Include Directories
-include_directories(HAL APP ioLibrary_Driver/Ethernet ioLibrary_Driver/Ethernet/W5500 ioLibrary_Driver/Internet/DHCP ioLibrary_Driver/Internet/MQTT ioLibrary_Driver/Internet/MQTT/MQTTPacket/src)
+# Include Directories
+include_directories(HAL APP MCAL/STM32F4 ioLibrary_Driver/Ethernet ioLibrary_Driver/Ethernet/W5500 ioLibrary_Driver/Internet/DHCP)
 include_directories(. FreeRTOS/include FreeRTOS/portable/GCC/ARM_CM4F)
 
-# Common Sources
-set(SOURCES
+# Common MCAL Sources
+set(MCAL_SOURCES
     startup_stm32f407xx.c
-    APP/main.c
     HAL/led.c
-    HAL/modbus.c
+    MCAL/STM32F4/gpio_stm32.c
+    MCAL/STM32F4/uart_stm32.c
+    MCAL/STM32F4/spi_stm32.c
+    MCAL/STM32F4/flash_stm32.c
+    MCAL/STM32F4/rtc_stm32.c
+)
+
+# Ethernet Drivers
+set(ETHERNET_SOURCES
+    ioLibrary_Driver/Ethernet/wizchip_conf.c
+    ioLibrary_Driver/Ethernet/socket.c
+    ioLibrary_Driver/Ethernet/W5500/w5500.c
+    ioLibrary_Driver/Internet/DHCP/dhcp.c
+)
+
+# -------------------------------------------------------------------
+# FreeRTOS Kernel Sources
+# -------------------------------------------------------------------
+set(FREERTOS_SOURCES
     FreeRTOS/tasks.c
     FreeRTOS/queue.c
     FreeRTOS/list.c
     FreeRTOS/timers.c
     FreeRTOS/event_groups.c
-    FreeRTOS/portable/MemMang/heap_4.c
+    FreeRTOS/stream_buffer.c
     FreeRTOS/portable/GCC/ARM_CM4F/port.c
-    ioLibrary_Driver/Ethernet/wizchip_conf.c
-    ioLibrary_Driver/Ethernet/socket.c
-    ioLibrary_Driver/Ethernet/W5500/w5500.c
-    ioLibrary_Driver/Internet/DHCP/dhcp.c
-    ioLibrary_Driver/Internet/MQTT/MQTTClient.c
-    ioLibrary_Driver/Internet/MQTT/mqtt_interface.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTConnectClient.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTConnectServer.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTDeserializePublish.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTFormat.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTPacket.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSerializePublish.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSubscribeClient.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSubscribeServer.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTUnsubscribeClient.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTUnsubscribeServer.c
+    FreeRTOS/portable/MemMang/heap_4.c
 )
 
-# Hardware Specific files based on TARGET_MCU
-if(TARGET_MCU STREQUAL "STM32F4")
-    include_directories(MCAL/STM32F4)
-    list(APPEND SOURCES 
-        MCAL/STM32F4/gpio_stm32.c
-        MCAL/STM32F4/uart_stm32.c
-        MCAL/STM32F4/spi_stm32.c
-    )
-else()
-    message(FATAL_ERROR "Unsupported TARGET_MCU: ${TARGET_MCU}")
-endif()
+# -------------------------------------------------------------------
+# Kontrx RTOS Application Sources
+# -------------------------------------------------------------------
+set(RTOS_APP_SOURCES
+    APP/cmsis_os2.c
+    APP/freertos_tasks.c
+    APP/http_server_task.c
+    APP/ota_task.c
+    HAL/modbus_dma.c
+)
 
-add_executable(${PROJECT_NAME} ${SOURCES})
+# -------------------------------------------------------------------
+# Target 1: Bootloader (Built with bootloader.ld, flash @ 0x08000000)
+# -------------------------------------------------------------------
+set(BOOTLOADER_LINKER "${CMAKE_SOURCE_DIR}/bootloader.ld")
+add_executable(Bootloader APP/bootloader.c ${MCAL_SOURCES})
+set_target_properties(Bootloader PROPERTIES LINK_FLAGS "-T${BOOTLOADER_LINKER} ${CPU_FLAGS} -Wl,-Map=Bootloader.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs")
 
-# Create .bin file and print size
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:${PROJECT_NAME}> ${PROJECT_NAME}.bin
-    COMMAND arm-none-eabi-size $<TARGET_FILE:${PROJECT_NAME}>
-    COMMENT "Generating .bin and printing size"
+add_custom_command(TARGET Bootloader POST_BUILD
+    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:Bootloader> Bootloader.bin
+    COMMAND arm-none-eabi-size $<TARGET_FILE:Bootloader>
+    COMMENT "Generating Bootloader.bin"
+)
+
+# -------------------------------------------------------------------
+# Target 2: Kontrx Application — legacy test build (no RTOS)
+#            Built with app_ota.ld, flash @ 0x08008000
+# -------------------------------------------------------------------
+set(APP_LINKER "${CMAKE_SOURCE_DIR}/app_ota.ld")
+add_executable(Kontrx APP/main_w5500_test.c ${MCAL_SOURCES} ${ETHERNET_SOURCES})
+set_target_properties(Kontrx PROPERTIES LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=Kontrx.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float")
+
+add_custom_command(TARGET Kontrx POST_BUILD
+    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:Kontrx> Kontrx.bin
+    COMMAND arm-none-eabi-size $<TARGET_FILE:Kontrx>
+    COMMENT "Generating Kontrx.bin (Application for OTA)"
+)
+
+# -------------------------------------------------------------------
+# Target 3: KontrxRTOS — Full RTOS application with FreeRTOS CMSIS-OS v2
+#            Entry:     APP/main_kontrx.c
+#            Linker:    app_ota.ld  (flash origin 0x08008000)
+#            Features:  1ms Control Engine, Modbus DMA, HTTP REST Server, OTA
+# -------------------------------------------------------------------
+add_executable(KontrxRTOS
+    APP/main_kontrx.c
+    ${MCAL_SOURCES}
+    ${ETHERNET_SOURCES}
+    ${FREERTOS_SOURCES}
+    ${RTOS_APP_SOURCES}
+)
+
+set_target_properties(KontrxRTOS PROPERTIES
+    LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=KontrxRTOS.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float"
+)
+
+add_custom_command(TARGET KontrxRTOS POST_BUILD
+    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:KontrxRTOS> KontrxRTOS.bin
+    COMMAND arm-none-eabi-size $<TARGET_FILE:KontrxRTOS>
+    COMMENT "Generating KontrxRTOS.bin (RTOS Application for OTA)"
 )
