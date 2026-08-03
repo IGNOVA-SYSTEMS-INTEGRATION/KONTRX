@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include "stm32f407_regs.h"
 
+// GPIO Ports Lookup Table (GPIOA=0, GPIOB=1, GPIOC=2, GPIOD=3, GPIOE=4)
+extern GPIO_TypeDef * const GPIO_Ports[5];
+
 // Generic GPIO Functions
 void GPIO_InitOutput(GPIO_TypeDef* port, uint8_t pin);
 void GPIO_TogglePin(GPIO_TypeDef* port, uint8_t pin);

@@ -1,10 +1,14 @@
 #include "gpio_stm32.h"
 
+GPIO_TypeDef * const GPIO_Ports[5] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE};
+
 void GPIO_InitOutput(GPIO_TypeDef* port, uint8_t pin) {
     // Enable Clock for Port
     if (port == GPIOA) RCC->AHB1ENR |= (1 << 0);
     else if (port == GPIOB) RCC->AHB1ENR |= (1 << 1);
+    else if (port == GPIOC) RCC->AHB1ENR |= (1 << 2);
     else if (port == GPIOD) RCC->AHB1ENR |= (1 << 3);
+    else if (port == GPIOE) RCC->AHB1ENR |= (1 << 4);
 
     // Set MODER to 01 (General purpose output mode)
     port->MODER &= ~(3U << (pin * 2));
@@ -113,19 +117,6 @@ void GPIO_Init_W5500_Pins(void) {
     // CS: PB12 (Output)
     GPIO_InitOutput(GPIOB, 12);
     W5500_CS_Deselect(); // Initially High
-
-    // RST: PC4 (Output)
-    // Wait, GPIO_InitOutput only supports GPIOA, GPIOB, GPIOD in its current implementation!
-    // I will manually init PC4 here to be safe.
-    GPIOC->MODER &= ~(3U << (4 * 2));
-    GPIOC->MODER |= (1U << (4 * 2));
-    GPIOC->OTYPER &= ~(1U << 4);
-    GPIOC->OSPEEDR &= ~(3U << (4 * 2));
-    GPIOC->OSPEEDR |= (2U << (4 * 2));
-    GPIOC->PUPDR &= ~(3U << (4 * 2));
-    
-    // Set RST high initially
-    GPIOC->BSRR = (1U << 4);
 }
 
 void W5500_CS_Select(void) {
@@ -137,13 +128,12 @@ void W5500_CS_Deselect(void) {
 }
 
 void W5500_Hardware_Reset(void) {
-    GPIOC->BSRR = (1U << (4 + 16)); // Low
-    for (volatile uint32_t i = 0; i < 50000; i++) __asm__("nop"); // Delay
-    GPIOC->BSRR = (1U << 4); // High
-    for (volatile uint32_t i = 0; i < 500000; i++) __asm__("nop"); // Delay
+    /* Kept for callers that expect a settle-time delay. */
+    for (volatile uint32_t i = 0; i < 50000; i++) __asm__("nop");
+    for (volatile uint32_t i = 0; i < 500000; i++) __asm__("nop");
 }
 
-void GPIO_Init_PE4_Button(void) {
+/*void GPIO_Init_PE4_Button(void) {
     // Enable GPIOE Clock
     RCC->AHB1ENR |= (1U << 4);
     
@@ -153,7 +143,7 @@ void GPIO_Init_PE4_Button(void) {
     // Enable Pull-up on PE4
     GPIOE->PUPDR &= ~(3U << (4 * 2));
     GPIOE->PUPDR |= (1U << (4 * 2));  // 01: Pull-up
-}
+}*/
 
 uint8_t GPIO_Read_PE4(void) {
     // Return 1 if pressed (assuming active low with pull-up)

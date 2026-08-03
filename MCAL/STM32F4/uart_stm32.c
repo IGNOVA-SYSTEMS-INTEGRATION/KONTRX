@@ -42,35 +42,59 @@ uint8_t UART_ReceiveByte(void) {
     return (uint8_t)(USART3->DR & 0xFF);
 }
 
-// USART1 Debug Implementation
+// USART6 Debug Implementation  (PC6 = TX, PC7 = RX, AF8)
 void UART_Debug_Init(void) {
-    // Enable Clock for USART1 (APB2 is typically 16MHz default if no PLL)
-    RCC->APB2ENR |= (1 << 4);
+    // 1. Enable GPIOC clock
+    RCC->AHB1ENR |= (1U << 2);
 
-    USART1->CR1 &= ~(1U << 13);
+    // 2. Configure PC6 (TX) and PC7 (RX) as Alternate Function
+    GPIOC->MODER &= ~((3U << (6 * 2)) | (3U << (7 * 2)));
+    GPIOC->MODER |=  ((2U << (6 * 2)) | (2U << (7 * 2)));  // AF mode
 
-    // 9600 baud -> 0x0683
-    USART1->BRR = 0x0683;
+    // Push-Pull, High Speed
+    GPIOC->OTYPER  &= ~((1U << 6) | (1U << 7));
+    GPIOC->OSPEEDR &= ~((3U << (6*2)) | (3U << (7*2)));
+    GPIOC->OSPEEDR |=  ((2U << (6*2)) | (2U << (7*2)));
 
-    USART1->CR1 &= ~(1U << 12);
-    USART1->CR1 &= ~(1U << 10);
-    USART1->CR2 &= ~(3U << 12);
+    // Pull-up on RX (PC7)
+    GPIOC->PUPDR &= ~((3U << (6*2)) | (3U << (7*2)));
+    GPIOC->PUPDR |=  (1U << (7*2));  // Pull-up on PC7 (RX)
 
-    USART1->CR1 |= (1U << 3); // TE
-    USART1->CR1 |= (1U << 2); // RE
+    // 3. Set AF8 (USART6) on PC6 and PC7
+    //    AFRL controls pins 0-7  → AFR[0]
+    //    PC6 → AFRL[27:24],  PC7 → AFRL[31:28]
+    GPIOC->AFR[0] &= ~((0xFU << (6 * 4)) | (0xFU << (7 * 4)));
+    GPIOC->AFR[0] |=  ((8U  << (6 * 4)) | (8U  << (7 * 4)));  // AF8
 
-    USART1->CR1 |= (1U << 13); // UE
+    // 4. Enable USART6 clock on APB2
+    RCC->APB2ENR |= (1U << 5);
+
+    // 5. Configure USART6
+    USART6->CR1 &= ~(1U << 13);   // Disable while configuring
+
+    // BRR for 9600 baud @ 16 MHz APB2:
+    // BRR = 16000000 / 9600 = 1666.67  → Mantissa=104(0x68), Frac=3(0x3) → 0x0683
+    USART6->BRR = 0x0683;
+
+    USART6->CR1 &= ~(1U << 12);   // 8 data bits
+    USART6->CR1 &= ~(1U << 10);   // No parity
+    USART6->CR2 &= ~(3U << 12);   // 1 stop bit
+
+    USART6->CR1 |= (1U << 3);     // TE — Transmitter Enable
+    USART6->CR1 |= (1U << 2);     // RE — Receiver Enable
+
+    USART6->CR1 |= (1U << 13);    // UE — USART Enable
 }
 
 void UART_Debug_SendByte(uint8_t data) {
-    while (!(USART1->SR & (1U << 7)));
-    USART1->DR = data;
-    while (!(USART1->SR & (1U << 6)));
+    while (!(USART6->SR & (1U << 7)));  // Wait TXE
+    USART6->DR = data;
+    while (!(USART6->SR & (1U << 6)));  // Wait TC
 }
 
 uint8_t UART_Debug_ReceiveByte(void) {
-    while (!(USART1->SR & (1U << 5)));
-    return (uint8_t)(USART1->DR & 0xFF);
+    while (!(USART6->SR & (1U << 5)));  // Wait RXNE
+    return (uint8_t)(USART6->DR & 0xFF);
 }
 
 // Wrapper functions for Modbus Function Pointers

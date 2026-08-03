@@ -2,9 +2,30 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Flash & Debug STM32",
             "cwd": "${workspaceFolder}",
-            "executable": "${workspaceFolder}/build/stm32_modbus",
+            "name": "Flash & Debug Kontrx RTOS (Sensors)",
+            "executable": "${workspaceFolder}/build/KontrxRTOS",
+            "loadFiles": [
+                "${workspaceFolder}/build/KontrxRTOS.hex"
+            ],
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "servertype": "openocd",
+            "device": "STM32F407VE",
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32f4x.cfg"
+            ],
+            "svdFile": ""
+        },
+        {
+            "cwd": "${workspaceFolder}",
+            "name": "Flash & Debug Kontrx RTOS (Sensors)",
+            "executable": "${workspaceFolder}/build/KontrxRTOS",
+            "loadFiles": [
+                "${workspaceFolder}/build/KontrxRTOS.hex"
+            ],
             "request": "launch",
             "type": "cortex-debug",
             "runToEntryPoint": "main",
