@@ -68,7 +68,7 @@ void Relay_SetState(uint8_t idx, uint8_t state);
  *  Buffer — kept static to avoid stack pressure
  * ====================================================================== */
 static uint8_t rx_buf[RX_BUF_SIZE];
-static char    tx_buf[2048];
+static char    tx_buf[4096];
 
 /* OTA page buffer — drains W5500 before flash erase to prevent RX overflow */
 #define OTA_PAGE_SIZE 7168U
@@ -107,17 +107,27 @@ static int JSON_StatusResponse(char *buf, int buflen) {
 
     int pos = 0;
 
-    /* --- sensors (dynamic) --- */
+    /* --- sensors (full configured list, joined with live readings) --- */
     pos += snprintf(buf + pos, buflen - pos, "{\"sensors\":[");
-    for (uint8_t i = 0; i < s_sd.readings_count && i < MAX_SENSORS; i++) {
-        const SensorReading_t *r = &s_sd.readings[i];
+    uint8_t emitted = 0;
+    for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
+        uint8_t type = s_cfg.sensors.entries[i].type;
+        uint8_t id   = s_cfg.sensors.entries[i].id;
+        float val = -1000.0f, tmp = -1000.0f;
+        uint8_t valid = 0;
+        for (uint8_t j = 0; j < s_sd.readings_count && j < MAX_SENSORS; j++) {
+            if (s_sd.readings[j].type == type && s_sd.readings[j].id == id) {
+                val = s_sd.readings[j].value;
+                tmp = s_sd.readings[j].temp;
+                valid = s_sd.readings[j].valid;
+                break;
+            }
+        }
+        if (emitted) pos += snprintf(buf + pos, buflen - pos, ",");
         pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"%s\",\"id\":%u,\"value\":%.2f,\"temp\":%.2f,\"valid\":%u}%s",
-            SensorTypeName(r->type), r->id,
-            (r->value < -900.0f) ? -1000.0f : r->value,
-            (r->temp  < -900.0f) ? -1000.0f : r->temp,
-            r->valid,
-            (i < s_sd.readings_count - 1) ? "," : "");
+            "{\"type\":\"%s\",\"id\":%u,\"value\":%.2f,\"temp\":%.2f,\"valid\":%u}",
+            SensorTypeName(type), id, val, tmp, valid);
+        emitted = 1;
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
 
@@ -434,8 +444,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             temp_nc[relay_count]     = (nc == 1) ? 1 : 0;
             char nm[20] = {0};
             JSON_ReadStr(obj_start, "name", nm, sizeof(nm));
-            snprintf(temp_names[relay_count], sizeof(temp_names[relay_count]),
-                     nm[0] ? "%s" : "Relay%u", nm[0] ? nm : (const char *)"", relay_count + 1);
+            if (nm[0]) {
+                snprintf(temp_names[relay_count], sizeof(temp_names[relay_count]), "%s", nm);
+            } else {
+                snprintf(temp_names[relay_count], sizeof(temp_names[relay_count]), "Relay%u", relay_count + 1);
+            }
             relay_count++;
 
             /* advance past this object */
