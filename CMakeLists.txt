@@ -86,6 +86,21 @@ add_custom_command(TARGET Kontrx POST_BUILD
 )
 
 # -------------------------------------------------------------------
+# Target 2b: RS485_Diag — standalone raw byte-arrival diagnostic
+#            Built with app_ota.ld, flash @ 0x08008000
+#            Does NOT touch HAL/modbus.c or HAL/modbus_dma.c — safe to
+#            build/flash/iterate without risking the production stack.
+# -------------------------------------------------------------------
+add_executable(RS485_Diag APP/main_rs485_diag_test.c ${MCAL_SOURCES})
+set_target_properties(RS485_Diag PROPERTIES LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=RS485_Diag.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs")
+
+add_custom_command(TARGET RS485_Diag POST_BUILD
+    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:RS485_Diag> RS485_Diag.bin
+    COMMAND arm-none-eabi-size $<TARGET_FILE:RS485_Diag>
+    COMMENT "Generating RS485_Diag.bin (standalone RS485 raw-byte diagnostic)"
+)
+
+# -------------------------------------------------------------------
 # Target 3: KontrxRTOS — Full RTOS application with FreeRTOS CMSIS-OS v2
 #            Entry:     APP/main_kontrx.c
 #            Linker:    app_ota.ld  (flash origin 0x08008000)

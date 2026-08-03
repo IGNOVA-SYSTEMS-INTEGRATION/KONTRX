@@ -17,7 +17,7 @@ void FLASH_Lock(void) {
 }
 
 void FLASH_EraseSector(uint8_t sector) {
-    /* Disable interrupts during flash erase */
+    /* Only hold interrupts during register setup (microseconds) */
     __asm volatile ("cpsid i" : : : "memory");
 
     FLASH_WaitBusy();
@@ -31,13 +31,15 @@ void FLASH_EraseSector(uint8_t sector) {
     FLASH_CTRL->CR |= (sector << FLASH_CR_SNB_POS) | FLASH_CR_SER | FLASH_CR_PSIZE32;
     FLASH_CTRL->CR |= FLASH_CR_STRT;
 
+    /* Re-enable interrupts during the long busy-wait (50-100ms)
+     * so W5500 RX buffer can be serviced by other tasks. */
+    __asm volatile ("cpsie i" : : : "memory");
+
     FLASH_WaitBusy();
 
-    /* Clear SER bit */
+    __asm volatile ("cpsid i" : : : "memory");
     FLASH_CTRL->CR &= ~FLASH_CR_SER;
     FLASH_Lock();
-
-    /* Enable interrupts again */
     __asm volatile ("cpsie i" : : : "memory");
 }
 

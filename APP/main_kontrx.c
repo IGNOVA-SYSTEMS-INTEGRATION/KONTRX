@@ -16,7 +16,7 @@
  *
  * Peripheral Map (all configured before RTOS starts):
  *   USART1 PA9/PA10 AF7  → Debug printf
- *   SPI2   PB13/14/15 AF5, CS=PB12, RST=PC4 → W5500
+ *   SPI2   PB13/14/15 AF5, CS=PB12        → W5500
  *   USART3 PB10/PB11 AF7, DE=PD3, RE=PD2   → MAX485 / Modbus (DMA init in task)
  *   PE2,PE4,PE6,PC0,PC2,PA0,PA2,PA4,PC4,PD8 → Relays (configurable)
  */
@@ -54,17 +54,6 @@ int _write(int file, char *ptr, int len) {
  * ====================================================================== */
 static uint8_t W5500_SPI_ReadByte(void)           { return SPI2_ReadWriteByte(0xFF); }
 static void    W5500_SPI_WriteByte(uint8_t data)  { SPI2_ReadWriteByte(data); }
-
-/* ======================================================================
- *  W5500 hardware reset
- * ====================================================================== */
-static void W5500_Reset(void) {
-    /* RST = PC4 (active LOW) */
-    GPIOC->BSRR = (1U << (4 + 16)); /* Pull LOW */
-    for (volatile uint32_t i = 0; i < 50000; i++);
-    GPIOC->BSRR = (1U << 4);        /* Release HIGH */
-    for (volatile uint32_t i = 0; i < 200000; i++);
-}
 
 /* ======================================================================
  *  W5500 Tick integration for DHCP library
@@ -124,16 +113,9 @@ int main(void) {
     GPIO_Init_W5500_Pins();
     SPI2_Init();
 
-    /* PC4 = RST, configure as output */
-    RCC->AHB1ENR |= (1U << 2); /* GPIOC clock */
-    GPIOC->MODER  &= ~(3U << (4 * 2));
-    GPIOC->MODER  |=  (1U << (4 * 2));
-    GPIOC->OSPEEDR|=  (2U << (4 * 2));
-    GPIOC->OTYPER &= ~(1U << 4);
-    GPIOC->BSRR = (1U << 4); /* RST HIGH initially */
-
-    /* ---- 4. W5500 Reset + Driver Init ---- */
-    W5500_Reset();
+    /* ---- 4. W5500 Driver Init ---- */
+    /* (Hard reset already done by bootloader's W5500_BootReset() via SPI,
+     * so we only need the software reset + init here.) */
 
     reg_wizchip_cs_cbfunc(W5500_CS_Select, W5500_CS_Deselect);
     reg_wizchip_spi_cbfunc(W5500_SPI_ReadByte, W5500_SPI_WriteByte);
@@ -156,6 +138,13 @@ int main(void) {
         printf("[NET] W5500 SPI FAILED: VERSIONR=0x%02X (expected 0x04)\r\n",
                w5500_version);
     } else {
+        /* Wait for PHY link (bootloader may have started auto-negotiation
+         * but the link may not be up yet). */
+        uint32_t phy_tries = 30;
+        while (wizphy_getphylink() != PHY_LINK_ON && phy_tries-- > 0) {
+            printf("[NET] Waiting for PHY link...\r\n");
+            for (volatile uint32_t i = 0; i < 1000000; i++);
+        }
         printf("[NET] W5500 SPI OK: VERSIONR=0x04, PHY link %s\r\n",
                (wizphy_getphylink() == PHY_LINK_ON) ? "UP" : "DOWN");
     }

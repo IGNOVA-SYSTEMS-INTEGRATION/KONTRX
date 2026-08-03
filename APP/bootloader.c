@@ -1,6 +1,8 @@
 #include "stm32f407_regs.h"
 #include "uart_stm32.h"
 #include "flash_stm32.h"
+#include "gpio_stm32.h"
+#include "spi_stm32.h"
 #include <stdio.h>
 
 #define APP_START_ADDR       0x08008000U
@@ -22,6 +24,32 @@ static void Delay_ms(uint32_t ms) {
 
 typedef void (*pFunction)(void);
 
+/* Raw W5500 reset via SPI — no ioLibrary dependency.
+ * Sends MR_RST to reset digital core, then PHYCFGR to force PHY
+ * out of reset and restart auto-negotiation. */
+static void W5500_BootReset(void) {
+    SPI2_Init();
+
+    /* Phase 1: Software reset (MR_RST = 0x80 to MR register at offset 0x0000) */
+    W5500_CS_Select();
+    SPI2_ReadWriteByte(0x00); /* (0x04 & 0x00FF0000) >> 16 = 0x00 */
+    SPI2_ReadWriteByte(0x00); /* (0x04 & 0x0000FF00) >> 8  = 0x00 */
+    SPI2_ReadWriteByte(0x04); /* (0x04 & 0x000000FF)       = 0x04 */
+    SPI2_ReadWriteByte(0x80); /* MR_RST */
+    W5500_CS_Deselect();
+    Delay_ms(50);
+
+    /* Phase 2: PHY reset + auto-negotiation restart (PHYCFGR = 0x88) */
+    /* PHYCFGR offset = 0x002E, write = 0x04 → addr = (0x002E << 8) | 0x04 = 0x002E04 */
+    W5500_CS_Select();
+    SPI2_ReadWriteByte(0x00); /* (0x002E04 & 0x00FF0000) >> 16 = 0x00 */
+    SPI2_ReadWriteByte(0x2E); /* (0x002E04 & 0x0000FF00) >> 8  = 0x2E */
+    SPI2_ReadWriteByte(0x04); /* (0x002E04 & 0x000000FF)       = 0x04 */
+    SPI2_ReadWriteByte(0x88); /* RST=1, ANEN=1, ANRST=1 */
+    W5500_CS_Deselect();
+    Delay_ms(100);
+}
+
 static void JumpToApplication(uint32_t app_addr) {
     uint32_t jump_addr = *(__IO uint32_t *)(app_addr + 4);
     pFunction JumpToApp = (pFunction)jump_addr;
@@ -38,6 +66,11 @@ static void JumpToApplication(uint32_t app_addr) {
 
 int main(void) {
     UART_Debug_Init();
+
+    /* Keep W5500 CS high during bootloader flash operations to prevent
+     * the W5500 from interpreting random SPI noise as commands. */
+    GPIO_Init_W5500_Pins();
+    W5500_CS_Deselect();
 
     printf("\r\n========================================\r\n");
     printf("  Kontrx Bootloader v1.0\r\n");
@@ -84,9 +117,7 @@ int main(void) {
         printf("[BOOT] Clearing OTA Flag...\r\n");
         FLASH_EraseSector(1);
 
-        printf("[BOOT] Update Complete! Resetting...\r\n");
-        Delay_ms(100);
-        SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;
+        printf("[BOOT] Update Complete! Jumping to App...\r\n");
     } else {
         printf("[BOOT] No update pending. Jumping to App (0x08008000)...\r\n");
     }
@@ -94,6 +125,7 @@ int main(void) {
     /* Verify application is valid (check stack pointer is in SRAM: 0x20000000 - 0x20020000) */
     uint32_t app_sp = *(__IO uint32_t *)APP_START_ADDR;
     if (app_sp >= 0x20000000U && app_sp <= 0x20020000U) {
+        W5500_BootReset();
         Delay_ms(50);
         JumpToApplication(APP_START_ADDR);
     } else {

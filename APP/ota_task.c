@@ -1,25 +1,24 @@
 /**
  * @file    ota_task.c
- * @brief   Kontrx — Background Dual-Bank OTA Update Task (Priority: Low)
+ * @brief   Kontrx — Background OTA Update Task (Priority: Low)
  *
  * Sequence after HTTP task uploads binary to staging area:
  *   1. Wait for sem_ota_start (posted by HTTP task).
  *   2. Verify CRC32 of the staged binary.
  *   3. If OK: erase Sector 1, write OTA_Meta_t with PENDING status.
  *   4. Post sem_ota_done (HTTP task sends 200 OK response).
- *   5. Delay 200ms (response transmitted), then trigger SCB_AIRCR reset.
- *   6. Bootloader reads OTA_Meta, copies staging → app, clears flag, resets.
+ *   5. Delay 300ms (response transmitted), then trigger SCB_AIRCR reset.
+ *   6. Bootloader reads OTA_Meta, copies staging to app, clears flag, resets.
  *
- * Flash Layout:
+ * Flash Layout (STM32F407VET6 — 512KB):
  *   Sector  0 (0x08000000, 16KB)  — Bootloader
- *   Sector  1 (0x08004000, 16KB)  — OTA Meta / Boot flags
- *   Sector  2 (0x08008000, 64KB)  — App (part 1)
- *   Sector  3 (0x08040000, 64KB)  — Staging start  ← new firmware written here
- *   Sector  4 (0x08080000, 64KB)  — Staging (continued)
- *   ...
- *   Sector 11 (0x080E0000, 64KB)  — Config EEPROM (last 4KB preserved during OTA)
+ *   Sector  1 (0x08004000, 16KB)  — OTA Meta
+ *   Sectors 2-5 (0x08008000-0x0803FFFF, 224KB) — App
+ *   Sectors 6-7 (0x08040000-0x0807FFFF, 256KB) — Staging
+ *   Sector  7 tail (0x0807C000, 16KB) — Config EEPROM
  *
- * The task yields (osDelay) frequently to prevent starving the 1ms control engine.
+ * Config backup/restore is handled by the HTTP task before/after
+ * erasing staging sectors (6 & 7). This task only touches Sector 1.
  */
 
 #include "ota_task.h"
@@ -28,14 +27,11 @@
 #include "stm32f407_regs.h"
 #include "cmsis_os2.h"
 #include <stdio.h>
-#include <string.h>
 
 /* ======================================================================
  *  Staging flash region
  * ====================================================================== */
 #define STAGING_ADDR        0x08040000U
-#define CONFIG_EEPROM_ADDR  0x080E0000U
-#define CONFIG_EEPROM_SIZE  (16U * 1024U)   /* Last 16KB of Sector 11 */
 
 /* ======================================================================
  *  CRC32 — standard Ethernet polynomial (used by many tools)
@@ -52,23 +48,6 @@ static uint32_t CRC32_Compute(const uint8_t *data, uint32_t len) {
         if ((i & 0xFF) == 0xFF) osDelay(1);
     }
     return ~crc;
-}
-
-/* ======================================================================
- *  Config backup: read CONFIG_EEPROM_SIZE bytes into a static buffer,
- *  then restore after sector erase.
- *  Only used if staging overlaps sector 11 (it doesn't in current layout,
- *  but kept here as a safety net for large firmware images).
- * ====================================================================== */
-static uint8_t config_backup[256];  /* Only back up the first 256B (Gateway_Config_t) */
-
-static void Config_Backup(void) {
-    memcpy(config_backup, (uint8_t *)CONFIG_EEPROM_ADDR, sizeof(config_backup));
-}
-
-static void Config_Restore(void) {
-    FLASH_EraseSector(11);
-    FLASH_WriteBuffer(CONFIG_EEPROM_ADDR, config_backup, sizeof(config_backup));
 }
 
 /* ======================================================================
@@ -107,10 +86,7 @@ void Task_OTAUpdate(void *arg) {
             continue;
         }
 
-        /* Step 3: Backup config EEPROM before erasing meta sector */
-        Config_Backup();
-
-        /* Step 4: Write OTA_Meta_t to Sector 1 */
+        /* Step 3: Write OTA_Meta_t to Sector 1 */
         printf("[OTA] Writing OTA metadata...\r\n");
         FLASH_EraseSector(1);
         osDelay(50); /* Yield while flash busy */
@@ -129,9 +105,6 @@ void Task_OTAUpdate(void *arg) {
                            read_meta->status == OTA_STATUS_PENDING &&
                            read_meta->size   == fw_size);
         printf("[OTA] Meta verify: %s\r\n", meta_ok ? "OK" : "FAIL");
-
-        /* Step 5: Restore config if needed */
-        Config_Restore();
 
         ota_write_ok = meta_ok ? 1 : 0;
         osSemaphoreRelease(sem_ota_done);

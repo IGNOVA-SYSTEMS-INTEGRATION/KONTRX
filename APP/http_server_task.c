@@ -70,6 +70,10 @@ void Relay_SetState(uint8_t idx, uint8_t state);
 static uint8_t rx_buf[RX_BUF_SIZE];
 static char    tx_buf[2048];
 
+/* OTA page buffer — drains W5500 before flash erase to prevent RX overflow */
+#define OTA_PAGE_SIZE 7168U
+static uint8_t ota_page_buf[OTA_PAGE_SIZE];
+
 /* ======================================================================
  *  Static working buffers for JSON_StatusResponse
  *  Keeping these off the task stack prevents stack overflow on the
@@ -110,6 +114,8 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     uint8_t do_id = (s_cfg.sensor_ids[3] == 0 || s_cfg.sensor_ids[3] == 0xFF) ? 4 : s_cfg.sensor_ids[3];
     uint8_t ammonia_id = (s_cfg.sensor_ids[4] == 0 || s_cfg.sensor_ids[4] == 0xFF) ? 5 : s_cfg.sensor_ids[4];
     uint8_t ultra_id = (s_cfg.sensor_ids[5] == 0 || s_cfg.sensor_ids[5] == 0xFF) ? 10 : s_cfg.sensor_ids[5];
+    uint8_t multi_us_id = s_cfg.sensor_ids[5];
+    uint8_t single_us_id = s_cfg.sensor_ids[6];
 
     return snprintf(buf, buflen,
         "{\"ph\":%.2f,\"ph_temp\":%.2f,"
@@ -118,9 +124,13 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"do_val\":%.2f,\"do_temp\":%.2f,"
         "\"ammonia\":%.2f,\"ammonia_temp\":%.2f,"
         "\"ultra_dist\":%.2f,\"ultra_temp\":%.2f,"
-        "\"sensor_ids\":[%u,%u,%u,%u,%u,%u],"
+        "\"us1\":%.0f,\"us2\":%.0f,\"us3\":%.0f,\"us4\":%.0f,"
+        "\"us5\":%.0f,\"us6\":%.0f,\"us7\":%.0f,\"us8\":%.0f,"
+        "\"us_avg\":%.0f,\"us_comp\":%.0f,\"us_temp\":%.1f,"
+        "\"sensor_ids\":[%u,%u,%u,%u,%u,%u,%u,%u],"
         "\"uptime_s\":%lu,"
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+        "\"serial\":\"KX-%02X%02X%02X%02X%02X%02X\","
         "\"ip\":\"%d.%d.%d.%d\","
         "\"fw\":\"v2.0.0\","
         "\"relays\":%s}",
@@ -130,8 +140,12 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         s_sd.do_val, s_sd.do_temp,
         s_sd.ammonia, s_sd.ammonia_temp,
         s_sd.ultrasonic_dist, s_sd.ultrasonic_temp,
-        ph_id, orp_id, ec_id, do_id, ammonia_id, ultra_id,
-        (unsigned long)RTC_GetUptimeSeconds(),
+        s_sd.us_multi[0], s_sd.us_multi[1], s_sd.us_multi[2], s_sd.us_multi[3],
+        s_sd.us_multi[4], s_sd.us_multi[5], s_sd.us_multi[6], s_sd.us_multi[7],
+        s_sd.us_avg, s_sd.us_comp, s_sd.us_multi_temp,
+        ph_id, orp_id, ec_id, do_id, ammonia_id, multi_us_id, single_us_id, 0,
+        (unsigned long)g_uptime_seconds,
+        s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
         s_relay_json);
@@ -214,9 +228,9 @@ static int Is_Pin_Reserved(uint8_t port, uint8_t pin) {
     if (port == 1) {
         if (pin == 10 || pin == 11 || pin == 12 || pin == 13 || pin == 14 || pin == 15) return 1;
     }
-    /* PC4: W5500 hardware reset; PC6/PC7: USART6 debug console */
+    /* PC6/PC7: USART6 debug console */
     if (port == 2) {
-        if (pin == 4 || pin == 6 || pin == 7) return 1;
+        if (pin == 6 || pin == 7) return 1;
     }
     /* PD2, PD3: MAX485 RE/DE Control */
     if (port == 3) {
@@ -487,13 +501,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int do_val = JSON_ReadInt(body, "do");
         int ammonia_val = JSON_ReadInt(body, "ammonia");
         int ultra_val = JSON_ReadInt(body, "ultra");
+        int multi_us_val = JSON_ReadInt(body, "multi_us");
+        int single_us_val = JSON_ReadInt(body, "single_us");
 
+        if (multi_us_val >= 1 && multi_us_val <= 247) cfg.sensor_ids[5] = (uint8_t)multi_us_val;
+        else if (ultra_val >= 1 && ultra_val <= 247) cfg.sensor_ids[5] = (uint8_t)ultra_val;
+        if (single_us_val >= 1 && single_us_val <= 247) cfg.sensor_ids[6] = (uint8_t)single_us_val;
         if (ph_val >= 1 && ph_val <= 247) cfg.sensor_ids[0] = (uint8_t)ph_val;
         if (orp_val >= 1 && orp_val <= 247) cfg.sensor_ids[1] = (uint8_t)orp_val;
         if (ec_val >= 1 && ec_val <= 247) cfg.sensor_ids[2] = (uint8_t)ec_val;
         if (do_val >= 1 && do_val <= 247) cfg.sensor_ids[3] = (uint8_t)do_val;
         if (ammonia_val >= 1 && ammonia_val <= 247) cfg.sensor_ids[4] = (uint8_t)ammonia_val;
-        if (ultra_val >= 1 && ultra_val <= 247) cfg.sensor_ids[5] = (uint8_t)ultra_val;
 
         cfg.magic = 0xC01D0001U;
         Update_Shared_Config(&cfg);
@@ -591,24 +609,62 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
 
-        /* Erase staging area (Sectors 6 & 7, keeping Sector 7's last page for config) */
+        /* --- PHASE 1: Drain W5500 RX buffer into page buffer before
+         * erasing flash. This prevents RX buffer overflow during the long
+         * sector erase (50-100ms per sector). --- */
+        uint32_t page_filled = 0;
+
+        uint32_t write_addr    = STAGING_ADDR;
+        uint32_t total_written = 0;
+
+        /* Drain the first body chunk (already in rx_buf after headers) */
+        uint32_t first_body_len = (uint32_t)(len - (uint32_t)(body - (char *)req));
+        if (first_body_len > 0 && total_written < content_length) {
+            uint32_t to_copy = content_length - total_written;
+            if (first_body_len < to_copy) to_copy = first_body_len;
+            if (to_copy > OTA_PAGE_SIZE - page_filled) to_copy = OTA_PAGE_SIZE - page_filled;
+            memcpy(ota_page_buf + page_filled, body, to_copy);
+            page_filled    += to_copy;
+            total_written  += to_copy;
+        }
+
+        /* Drain remaining W5500 data into page buffer */
+        uint32_t timeout_cnt = 0;
+        while (total_written < content_length && page_filled < OTA_PAGE_SIZE) {
+            uint16_t chunk = getSn_RX_RSR(sn);
+            if (chunk > 0) {
+                timeout_cnt = 0;
+                uint32_t remaining = content_length - total_written;
+                uint32_t buf_space = OTA_PAGE_SIZE - page_filled;
+                if ((uint32_t)chunk > remaining) chunk = (uint16_t)remaining;
+                if ((uint32_t)chunk > buf_space) chunk = (uint16_t)buf_space;
+                int32_t recvd = recv(sn, ota_page_buf + page_filled, chunk);
+                if (recvd > 0) {
+                    page_filled   += (uint32_t)recvd;
+                    total_written += (uint32_t)recvd;
+                }
+            } else {
+                if (getSn_SR(sn) != SOCK_ESTABLISHED) break;
+                osDelay(1);
+                timeout_cnt++;
+                if (timeout_cnt > 10000) break;
+            }
+        }
+
+        /* --- PHASE 2: Erase staging. W5500 buffer is now mostly empty,
+         * giving maximum headroom for data arriving during the erase. --- */
         FLASH_EraseSector(6);
         FLASH_EraseSector(7);
 
-        uint32_t write_addr  = STAGING_ADDR;
-        uint32_t total_written = 0;
-
-        /* Write the first chunk (already in rx_buf after headers) */
-        uint32_t first_body_len = (uint32_t)(len - (uint32_t)(body - (char *)req));
-        if (first_body_len > 0 && total_written < content_length) {
-            uint32_t to_write = (first_body_len > content_length) ? content_length : first_body_len;
-            FLASH_WriteBuffer(write_addr, (uint8_t *)body, to_write);
-            write_addr    += to_write;
-            total_written += to_write;
+        /* Write drained data to flash */
+        if (page_filled > 0) {
+            FLASH_WriteBuffer(write_addr, ota_page_buf, page_filled);
+            write_addr   += page_filled;
+            page_filled   = 0;
         }
 
-        /* Stream remaining chunks */
-        uint32_t timeout_cnt = 0;
+        /* --- PHASE 3: Stream remaining chunks with proper recv checking --- */
+        timeout_cnt = 0;
         while (total_written < content_length) {
             uint16_t chunk = getSn_RX_RSR(sn);
             if (chunk > 0) {
@@ -616,15 +672,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 if (chunk > sizeof(rx_buf)) chunk = sizeof(rx_buf);
                 uint32_t remaining = content_length - total_written;
                 if ((uint32_t)chunk > remaining) chunk = (uint16_t)remaining;
-                recv(sn, rx_buf, chunk);
-                FLASH_WriteBuffer(write_addr, rx_buf, chunk);
-                write_addr    += chunk;
-                total_written += chunk;
+                int32_t recvd = recv(sn, rx_buf, chunk);
+                if (recvd > 0) {
+                    FLASH_WriteBuffer(write_addr, rx_buf, (uint32_t)recvd);
+                    write_addr    += (uint32_t)recvd;
+                    total_written += (uint32_t)recvd;
+                }
             } else {
                 if (getSn_SR(sn) != SOCK_ESTABLISHED) break;
                 osDelay(1);
                 timeout_cnt++;
-                if (timeout_cnt > 10000) break; /* 10 s timeout */
+                if (timeout_cnt > 10000) break;
             }
         }
 
