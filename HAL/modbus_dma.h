@@ -10,7 +10,13 @@
 #define MAX_MULTI_US   4
 
 #define SENSOR_TYPE_MULTI_US 7
-#define CONFIG_MAGIC_CURRENT 0xC01D0002U
+/* Bumped 0xC01D0002 -> 0xC01D0003: Gateway_Config_t gained the `serial`
+ * field (layout change), so old flash configs must re-init to defaults. */
+#define CONFIG_MAGIC_CURRENT 0xC01D0003U
+
+/* Firmware version — single source of truth for /api/status "fw" and the QR.
+ * Keep this in sync with the actual release. (beta 1.0.1) */
+#define FW_VERSION "1.0.1"
 
 /* Sensor types: 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US */
 typedef struct {
@@ -65,6 +71,8 @@ typedef struct {
     SensorList_t sensors;
     Relay_Config_t relays[MAX_RELAYS];
     uint8_t relay_count;
+    uint32_t serial;              /* Sequential device serial, e.g. 1 => "KX-0000001".
+                                   * Stored in flash, editable from the web UI. */
     char mqtt_broker[64];
     uint16_t mqtt_port;
     char mqtt_client_id[32];

@@ -45,7 +45,9 @@ static uint32_t CRC32_Compute(const uint8_t *data, uint32_t len) {
             else          crc >>= 1;
         }
         /* Yield every 256 bytes to avoid starving 1ms task */
-        if ((i & 0xFF) == 0xFF) osDelay(1);
+        if ((i & 0xFF) == 0xFF) osDelay(1); /* 1ms yield = exact 1ms, keeps the
+                                             * 1ms Control Engine schedulable
+                                             * during long CRC computation. */
     }
     return ~crc;
 }
@@ -69,7 +71,9 @@ void Task_OTAUpdate(void *arg) {
                (unsigned long)fw_size, (unsigned long)STAGING_ADDR);
 
         /* Step 1: Compute CRC32 of staged firmware */
-        osDelay(10);
+        osDelay(10); /* 10ms: give the HTTP task a head-start to finish draining
+                      * the W5500 RX buffer before OTA reads flash. One-shot
+                      * during OTA only, not part of the scan cycle. */
         uint32_t crc = CRC32_Compute((const uint8_t *)STAGING_ADDR, fw_size);
         printf("[OTA] CRC32 = 0x%08lX\r\n", (unsigned long)crc);
 
@@ -89,7 +93,9 @@ void Task_OTAUpdate(void *arg) {
         /* Step 3: Write OTA_Meta_t to Sector 1 */
         printf("[OTA] Writing OTA metadata...\r\n");
         FLASH_EraseSector(1);
-        osDelay(50); /* Yield while flash busy */
+        osDelay(50); /* 50ms: yield while flash is busy erasing (erase is
+                      * interrupt-enabled in FLASH_EraseSector, but this keeps
+                      * the scheduler calm during the busy-wait). OTA-only. */
 
         OTA_Meta_t meta = {
             .magic  = OTA_MAGIC_VALUE,
@@ -111,7 +117,10 @@ void Task_OTAUpdate(void *arg) {
 
         if (meta_ok) {
             /* Give HTTP task 300ms to transmit the 200 OK response */
-            osDelay(300);
+            osDelay(300); /* 300ms: wait for the HTTP task to flush the "200 OK"
+                           * over the W5500 socket BEFORE the reset. Rebooting
+                           * early would cut off the browser's response and the
+                           * update would appear to fail. OTA-only, one-shot. */
             printf("[OTA] Rebooting into bootloader...\r\n");
             /* Software reset */
             SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;

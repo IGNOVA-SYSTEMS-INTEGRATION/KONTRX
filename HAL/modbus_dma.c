@@ -70,11 +70,30 @@ void Modbus_DMA_Init(void) {
         cfg.magic = CONFIG_MAGIC_CURRENT;
         cfg.sensors.count = 0;
         cfg.relay_count = 0;
+        cfg.serial = 1; /* default serial for a fresh device */
         cfg.mqtt_port = 1883;
         Update_Shared_Config(&cfg);
     }
 }
 
+/*
+ * Modbus_Safe_Transaction — one blocking RS485 read (polling, no DMA).
+ *
+ * WHY THIS IS SLOW (> 1 ms per call, unavoidable):
+ *   UART runs at 9600 baud (USART3 BRR=0x0683 => ~9598 baud), so one byte
+ *   takes ~1.04 ms on the wire. A single 8-byte request + 3.5-char gap +
+ *   9-byte response is ~21 ms minimum, plus the slave's own reply delay.
+ *   Modbus RTU protocol REQUIRES the 3.5-char silent gap between frames,
+ *   so this can never be reduced below ~20 ms without raising the baud.
+ *
+ * CONCURRENCY IMPACT:
+ *   This function BUSY-WAITS (no osDelay in the RX loop). It runs in
+ *   Task_ModbusSensorPoll (priority AboveNormal=3), which is LOWER than the
+ *   1ms Control Engine (Realtime=5). FreeRTOS preempts on the tick, so the
+ *   Control Engine still fires every 1ms — it only reads the mutex-protected
+ *   snapshot and never touches UART. The HTTP/OTA tasks (priority 1-2) are
+ *   the ones starved during the busy-wait, which is acceptable.
+ */
 static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc, uint16_t reg, uint8_t num, uint16_t *out) {
     uint8_t f[8] = {slave, fc, reg>>8, reg&0xFF, 0, num, 0, 0};
     uint16_t crc = Modbus_CRC16(f, 6);
@@ -83,7 +102,9 @@ static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc, uint16_t reg, 
     volatile uint32_t sr = USART3->SR; volatile uint32_t dr = USART3->DR; (void)sr; (void)dr;
 
     MAX485_TX();
-    osDelay(2);
+    osDelay(2); /* 2ms: settle time for MAX485 direction switch (RE#/DE via PD2/PD3).
+                 * Fixed by transceiver physics — the driver needs this before
+                 * the first TX byte, otherwise the request is truncated. */
     for(int i=0; i<8; i++) {
         while(!(USART3->SR & (1U << 7)));
         USART3->DR = f[i];
@@ -94,6 +115,9 @@ static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc, uint16_t reg, 
 
     uint8_t rx[50]; int received = 0;
     uint32_t start = osKernelGetTickCount();
+    /* RX wait window: up to 100ms. This is the single biggest per-transaction
+     * blocker. It must be large enough to cover the slave's reply latency
+     * (most Modbus slaves take 10-100ms to answer). Cannot be 1ms. */
     while((osKernelGetTickCount() - start) < 100) {
         if(USART3->SR & (1U << 5)) {
             if(received < 50) rx[received++] = (uint8_t)USART3->DR;
@@ -183,7 +207,10 @@ void Modbus_DMA_PollSensors(void) {
                         } else {
                             mu->dist[i] = -1000.0f;
                         }
-                        osDelay(20);
+                        osDelay(20); /* 20ms between the 8 distance reads of one
+                                      * Multi-US board: gives the board time to
+                                      * refresh each channel + Modbus gap. A full
+                                      * board costs 8x(transaction ~21ms + 20ms). */
                     }
                     if (valid) mu->avg = (float)(sum / valid);
                     if (Modbus_Safe_Transaction(sid, 0x03, 0x0080, 3, rs)) {
@@ -205,7 +232,11 @@ void Modbus_DMA_PollSensors(void) {
         }
 
         if (rd->valid) local.readings_count++;
-        osDelay(50);
+        osDelay(50); /* 50ms gap AFTER each sensor: spacing between consecutive
+                      * RS485 transactions so a slow sensor's reply never
+                      * collides with the next poll. With N configured sensors,
+                      * one full cycle = N x (transaction ~21ms + 50ms). This is
+                      * the "Modbus poll cycle" — it is inherently >> 1ms. */
     }
 
     local.last_update_time = osKernelGetTickCount();
@@ -239,7 +270,10 @@ void Modbus_DMA_PerformScan(void) {
             g_scan_status.count++;
         }
         g_scan_status.progress = (i * 100) / 247;
-        osDelay(10);
+        osDelay(10); /* 10ms between probed addresses: lets a non-responding
+                      * slave's timeout elapse before the next probe. A full
+                      * network scan sweeps 247 addresses => many seconds,
+                      * far beyond 1ms (it's a one-shot background operation). */
     }
     g_scan_status.is_scanning = 0;
 }

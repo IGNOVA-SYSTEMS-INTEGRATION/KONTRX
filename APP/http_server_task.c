@@ -165,12 +165,12 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     pos += snprintf(buf + pos, buflen - pos,
         "\"uptime_s\":%lu,"
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
-        "\"serial\":\"KX-%02X%02X%02X%02X%02X%02X\","
+        "\"serial\":\"KX-%07lu\","
         "\"ip\":\"%d.%d.%d.%d\","
-        "\"fw\":\"v2.0.0\"}",
+        "\"fw\":\"" FW_VERSION "\"}",
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
-        s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
+        (unsigned long)s_cfg.serial,
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3]);
 
     return pos;
@@ -303,7 +303,9 @@ static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
         if (result > 0) {
             sent += (uint32_t)result;
         } else if (result == SOCK_BUSY) {
-            osDelay(1);   /* Yield — let scheduler service other tasks */
+            osDelay(1);   /* 1ms yield — W5500 TX buffer full; wait a tick and
+                             retry. Allows other tasks (incl. 1ms Control Engine)
+                             to run meanwhile. Well within 1ms budget. */
         } else {
             break;        /* Socket error — abort */
         }
@@ -519,7 +521,45 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cfg.mqtt_port = p;
         }
 
-        cfg.magic = 0xC01D0001U; /* Ensure CONFIG_MAGIC is saved */
+        cfg.magic = CONFIG_MAGIC_CURRENT; /* Ensure CONFIG_MAGIC is saved */
+        Update_Shared_Config(&cfg);
+
+        /* Persist */
+        FLASH_EraseSector(11);
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/config/serial → Set sequential device serial:
+     *   {"serial": 7}   (or {"serial":"0000007"})  => "KX-0000007"
+     * Stored in flash; used by /api/status and the QR payload.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/serial", 23) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
+        body += 4;
+
+        const char *sv = JSON_FindValue(body, "serial");
+        if (!sv) {
+            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Missing serial.\"}");
+            Send_Response(sn, HTTP_200_JSON, tx_buf);
+            return;
+        }
+        uint32_t s = 0;
+        while (*sv >= '0' && *sv <= '9') { s = s * 10 + (uint32_t)(*sv - '0'); sv++; }
+        if (s == 0 || s > 9999999UL) {
+            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Serial must be 1..9999999.\"}");
+            Send_Response(sn, HTTP_200_JSON, tx_buf);
+            return;
+        }
+
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+        cfg.serial = s;
+        cfg.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&cfg);
 
         /* Persist */
@@ -775,7 +815,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 }
             } else {
                 if (getSn_SR(sn) != SOCK_ESTABLISHED) break;
-                osDelay(1);
+                osDelay(1);  /* 1ms wait for more OTA bytes — W5500 RX empty.
+                              * Keeps HTTP task non-busy so Control Engine (1ms)
+                              * and Modbus polling are serviced between chunks. */
                 timeout_cnt++;
                 if (timeout_cnt > 10000) break;
             }
@@ -827,7 +869,9 @@ void Task_HTTPServer(void *arg) {
         case SOCK_CLOSED:
             if (socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
                 printf("[HTTP] Socket open failed\r\n");
-                osDelay(100);
+                osDelay(100); /* 100ms backoff before retrying W5500 socket open.
+                               * W5500 needs this to release the socket struct.
+                               * One-shot; does not touch the 1ms path. */
             }
             break;
 
@@ -867,7 +911,10 @@ void Task_HTTPServer(void *arg) {
                 for (int retry = 0; retry < 10; retry++) {
                     size = getSn_RX_RSR(HTTP_SOCK);
                     if (size >= 8) break;
-                    osDelay(5);
+                    osDelay(5); /* 5ms poll step while waiting for the browser's
+                                 * request bytes to arrive from the network.
+                                 * Max wait = 10 x 5ms = 50ms, then 404 fallback.
+                                 * HTTP task only; unrelated to the 1ms engine. */
                 }
 
                 if (size > 0) {
@@ -904,6 +951,8 @@ void Task_HTTPServer(void *arg) {
             break;
         }
 
-        osDelay(1); /* 1ms yield — faster socket cycling for ~1KB API responses */
+        osDelay(1); /* 1ms yield per loop — keeps the W5500 state machine
+                     * responsive (~1KB API responses) without starving the
+                     * 1ms Control Engine. Exact 1ms, does not exceed budget. */
     }
 }

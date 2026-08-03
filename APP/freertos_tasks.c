@@ -6,11 +6,16 @@
  * ┌─────────────────────────────────┬──────────┬─────────┬─────────────────────────────┐
  * │ Task                            │ Priority │ Stack   │ Period / Trigger             │
  * ├─────────────────────────────────┼──────────┼─────────┼─────────────────────────────┤
- * │ Task_ControlEngine              │ RT (5)   │ 512 B   │ Every 1ms (1000 Hz)         │
- * │ Task_ModbusSensorPoll           │ High (3) │ 1024 B  │ Every 250ms (round-robin)   │
+ * │ Task_ControlEngine              │ RT (5)   │ 512 B   │ Every 1ms (1000 Hz) ← ONLY   │
+ * │ Task_ModbusSensorPoll           │ High (3) │ 1024 B  │ Every ~500ms (poll cycle)    │
  * │ Task_HTTPServer                 │ Norm (2) │ 2048 B  │ W5500 socket event          │
  * │ Task_OTAUpdate                  │ Low (1)  │ 1024 B  │ sem_ota_start from HTTP     │
  * └─────────────────────────────────┴──────────┴─────────┴─────────────────────────────┘
+ *
+ * NOTE: ONLY Task_ControlEngine runs at exactly 1ms. The Modbus poll task runs
+ * every ~500ms (+ N x ~70ms per sensor cycle at 9600 baud) — see modbus_dma.c.
+ * The 1ms Control Engine is never blocked by it: priority 5 > 3, and the engine
+ * uses non-blocking osMutexAcquire(..., 0) + vTaskDelayUntil.
  *
  * IPC:
  *   sensorMutex  — guards Modbus_SensorData_t (modbus_dma.c ↔ http_server_task.c)
@@ -97,6 +102,7 @@ void Relay_Init(void) {
         cfg.magic = CONFIG_MAGIC_CURRENT;
         cfg.sensors.count = 0;
         cfg.relay_count = 10;
+        cfg.serial = 1; /* first device gets serial 1 => "KX-0000001" */
         cfg.mqtt_port = 1883;
         for (int i = 0; i < MAX_RELAYS; i++) {
             cfg.relays[i].port_id = relay_defaults[i].port;
@@ -170,8 +176,14 @@ void Relay_SetState(uint8_t idx, uint8_t state) {
 
 /* ======================================================================
  *  TASK 1: High-Speed Control Engine — Priority: Real-Time (5)
- *  Period: 1ms (1000 Hz)
+ *  Period: 1ms (1000 Hz) — the ONLY strict 1ms path in the system.
  *  CONSTRAINT: NO blocking calls, NO I/O, NO DMA waits.
+ *
+ *  WHY IT STAYS EXACTLY AT 1ms:
+ *   - vTaskDelayUntil() (not vTaskDelay) = absolute deadline, no drift.
+ *   - The body is a mutex copy (non-blocking, timeout=0) + user logic.
+ *   - Priority 5 > Modbus(3) > HTTP(2) > OTA(1), so slower tasks can only
+ *     run in the scheduler slots BETWEEN 1ms cycles, never inside one.
  * ====================================================================== */
 static void Task_ControlEngine(void *arg) {
     (void)arg;
@@ -214,13 +226,14 @@ static void Task_ControlEngine(void *arg) {
  * ====================================================================== */
 static void Task_ModbusSensorPoll(void *arg) {
     (void)arg;
-    osDelay(2000); // انتظر ثانيتين قبل بدء أول عملية Modbus
+    osDelay(2000); // 2s boot delay: let the W5500 finish link negotiation and
+                   // sensors power up before the first Modbus poll. One-time only.
     
     printf("[Task] ModbusSensorPoll starting...\r\n");
 
     /* One-time driver init */
     Modbus_DMA_Init();
-        osDelay(1000); 
+        osDelay(1000); // 1s post-init: settle UART/MAX485 before first read.
 
     printf("[Task] ModbusSensorPoll entering main loop\r\n");
 
@@ -228,10 +241,16 @@ static void Task_ModbusSensorPoll(void *arg) {
         if (g_scan_status.is_scanning) {
             printf("[Task] Scan mode active\r\n");
             Modbus_DMA_PerformScan();
-            osDelay(2000);
+            osDelay(2000); // 2s pause between full network scans (247 probes).
+                           // One-shot user action, not the realtime path.
         } else {
             Modbus_DMA_PollSensors();
-            osDelay(500);
+            osDelay(500); /* 500ms gap between complete poll cycles. This sets
+                           * the sensor refresh rate. Each cycle itself already
+                           * takes N x ~70ms (transaction+gap), so 1ms is
+                           * physically impossible at 9600 baud. The 1ms Control
+                           * Engine is NOT delayed by this: it has higher
+                           * priority (5 vs 3) and only reads the snapshot. */
         }
     }
 }

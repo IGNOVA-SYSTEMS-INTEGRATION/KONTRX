@@ -143,6 +143,9 @@ int main(void) {
         uint32_t phy_tries = 30;
         while (wizphy_getphylink() != PHY_LINK_ON && phy_tries-- > 0) {
             printf("[NET] Waiting for PHY link...\r\n");
+            /* Busy-wait ~?ms per try. Runs BEFORE the RTOS scheduler starts
+             * (main loop, no tasks yet), so it does NOT affect the 1ms Control
+             * Engine. Max ~30 tries; only delays boot, not runtime timing. */
             for (volatile uint32_t i = 0; i < 1000000; i++);
         }
         printf("[NET] W5500 SPI OK: VERSIONR=0x04, PHY link %s\r\n",

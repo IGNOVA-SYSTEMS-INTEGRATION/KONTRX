@@ -1,10 +1,20 @@
 #include "flash_stm32.h"
 #include "stm32f407_regs.h"
 
+/*
+ * FLASH_WaitBusy — busy-waits until the flash controller finishes.
+ *
+ * TIMING IMPACT (> 1 ms):
+ *  - A sector erase on STM32F407 takes 50-100 ms; the busy-wait blocks here.
+ *  - The interrupt window is handled by FLASH_EraseSector: interrupts are only
+ *    disabled for the microseconds of register setup, then re-enabled, so the
+ *    1ms Control Engine keeps running during the erase. BUT the erase busy-wait
+ *    itself still occupies CPU in THIS task's priority, delaying tasks of equal
+ *    or lower priority (Modbus poll, HTTP). OTA-only path.
+ */
 static void FLASH_WaitBusy(void) {
     while (FLASH_CTRL->SR & FLASH_SR_BSY);
 }
-
 void FLASH_Unlock(void) {
     if (FLASH_CTRL->CR & FLASH_CR_LOCK) {
         FLASH_CTRL->KEYR = FLASH_KEY1;
