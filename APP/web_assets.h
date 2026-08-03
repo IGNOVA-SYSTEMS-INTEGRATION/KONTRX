@@ -711,41 +711,10 @@ static const char KONTRX_HTML[] =
     "getModuleCount:function(){return this.moduleCount;},"
     "make:function(){"
       "var t=1;"
-      "for(t=1;t<10;t++){"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+      "for(t=1;t<41;t++){"
         "var b=QRRSBlock.getRSBlocks(t,this.errorCorrectionLevel),buf=new QRBitBuffer(),tot=0;"
         "for(var i=0;i<b.length;i++)tot+=b[i].dataCount;"
-        "for(var i=0;i<this.dataList.length;i++){var d=this.dataList[i];buf.put(d.mode,4);buf.put(d.getLength(),8);d.write(buf);}"
+        "for(var i=0;i<this.dataList.length;i++){var d=this.dataList[i];buf.put(d.mode,4);buf.put(d.getLength(),QRUtil.getLengthInBits(d.mode,t));d.write(buf);}"
         "if(buf.getLengthInBits()<=tot*8)break;"
       "}"
       "this.typeNumber=t;this.makeImpl(false,this.getBestMaskPattern());"
@@ -755,7 +724,7 @@ static const char KONTRX_HTML[] =
       "this.modules=new Array(this.moduleCount);"
       "for(var r=0;r<this.moduleCount;r++){this.modules[r]=new Array(this.moduleCount);for(var c=0;c<this.moduleCount;c++)this.modules[r][c]=null;}"
       "this.setupPositionProbePattern(0,0);this.setupPositionProbePattern(this.moduleCount-7,0);this.setupPositionProbePattern(0,this.moduleCount-7);"
-      "this.setupPositionAdjustPattern();this.setupTimingPattern();this.setupTypeInfo(test,mask);"
+      "this.setupPositionAdjustPattern();this.setupTimingPattern();this.setupTypeInfo(test,mask);if(this.typeNumber>=7)this.setupTypeNumber(test);"
       "var data=QRCode.createData(this.typeNumber,this.errorCorrectionLevel,this.dataList);"
       "this.mapData(data,mask);"
     "},"
@@ -793,6 +762,11 @@ static const char KONTRX_HTML[] =
       "}"
       "this.modules[this.moduleCount-8][8]=(!test);"
     "},"
+    "setupTypeNumber:function(test){"
+      "var bits=QRUtil.getBCHTypeNumber(this.typeNumber);"
+      "for(var i=0;i<18;i++){var mod=(!test&&((bits>>i)&1)==1);this.modules[Math.floor(i/3)][i%3+this.moduleCount-8-3]=mod;}"
+      "for(var i=0;i<18;i++){var mod=(!test&&((bits>>i)&1)==1);this.modules[i%3+this.moduleCount-8-3][Math.floor(i/3)]=mod;}"
+    "},"
     "mapData:function(data,mask){"
       "var inc=-1,row=this.moduleCount-1,bitIndex=7,byteIndex=0;"
       "for(var col=this.moduleCount-1;col>0;col-=2){"
@@ -813,7 +787,7 @@ static const char KONTRX_HTML[] =
   "};"
   "QRCode.createData=function(typeNumber,errorCorrectionLevel,dataList){"
     "var rsBlocks=QRRSBlock.getRSBlocks(typeNumber,errorCorrectionLevel),buffer=new QRBitBuffer();"
-    "for(var i=0;i<dataList.length;i++){var d=dataList[i];buffer.put(d.mode,4);buffer.put(d.getLength(),8);d.write(buffer);}"
+    "for(var i=0;i<dataList.length;i++){var d=dataList[i];buffer.put(d.mode,4);buffer.put(d.getLength(),QRUtil.getLengthInBits(d.mode,typeNumber));d.write(buffer);}"
     "var totalDataCount=0;for(var i=0;i<rsBlocks.length;i++)totalDataCount+=rsBlocks[i].dataCount;"
     "if(buffer.getLengthInBits()+4<=totalDataCount*8)buffer.put(0,4);"
     "while(buffer.getLengthInBits()%8!=0)buffer.putBit(false);"
@@ -838,9 +812,12 @@ static const char KONTRX_HTML[] =
     "return data;"
   "};"
   "var QRUtil={"
-    "PATTERN_POSITION_TABLE:[[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50]],"
-    "G15:(1<<10)|(1<<8)|(1<<5)|(1<<4)|(1<<2)|(1<<1)|(1<<0),G15_MASK:(1<<14)|(1<<12)|(1<<8)|(1<<4)|(1<<1),"
+    "PATTERN_POSITION_TABLE:[[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],[6,26,48,70],[6,26,50,74],[6,30,54,78],[6,30,56,82],[6,30,58,86],[6,34,62,90],[6,28,50,72,94],[6,26,50,74,98],[6,30,54,78,102],[6,28,54,80,106],[6,32,58,84,110],[6,30,58,86,114],[6,34,62,90,118],[6,26,50,74,98,122],[6,30,54,78,102,126],[6,26,52,78,104,130],[6,30,56,82,108,134],[6,34,60,86,112,138],[6,30,58,86,114,142],[6,34,62,90,118,146],[6,30,54,78,102,126,150],[6,24,50,76,102,128,154],[6,28,54,80,106,132,158],[6,32,58,84,110,136,162],[6,26,54,82,110,138,166],[6,30,58,86,114,142,170]],"
+    "G15:(1<<10)|(1<<8)|(1<<5)|(1<<4)|(1<<2)|(1<<1)|(1<<0),G15_MASK:(1<<14)|(1<<12)|(1<<10)|(1<<4)|(1<<1),"
+"G18:(1<<12)|(1<<11)|(1<<10)|(1<<9)|(1<<8)|(1<<5)|(1<<2)|(1<<0),"
     "getBCHTypeInfo:function(data){var d=data<<10;while(QRUtil.getBCHDigit(d)-QRUtil.getBCHDigit(QRUtil.G15)>=0)d^=(QRUtil.G15<<(QRUtil.getBCHDigit(d)-QRUtil.getBCHDigit(QRUtil.G15)));return((data<<10)|d)^QRUtil.G15_MASK;},"
+"getBCHTypeNumber:function(data){var d=data<<12;while(QRUtil.getBCHDigit(d)-QRUtil.getBCHDigit(QRUtil.G18)>=0)d^=(QRUtil.G18<<(QRUtil.getBCHDigit(d)-QRUtil.getBCHDigit(QRUtil.G18)));return(data<<12)|d;},"
+"getLengthInBits:function(mode,type){if(type<10){if(mode==1)return 10;if(mode==2)return 9;if(mode==4)return 8;if(mode==8)return 8;}else if(type<27){if(mode==1)return 12;if(mode==2)return 11;if(mode==4)return 16;if(mode==8)return 10;}if(mode==1)return 14;if(mode==2)return 13;if(mode==4)return 16;if(mode==8)return 12;},"
     "getBCHDigit:function(data){var digit=0;while(data!=0){digit++;data>>>=1;}return digit;},"
     "getPatternPosition:function(t){return QRUtil.PATTERN_POSITION_TABLE[t-1];},"
     "getMask:function(m,i,j){"
@@ -854,13 +831,18 @@ static const char KONTRX_HTML[] =
     "getErrorCorrectPolynomial:function(len){var a=new QRPolynomial([1],0);for(var i=0;i<len;i++)a=a.multiply(new QRPolynomial([1,QRMath.gexp(i)],0));return a;},"
     "getLostPoint:function(qr){"
       "var mc=qr.getModuleCount(),lp=0;"
-      "for(var r=0;r<mc;r++)for(var c=0;c<mc;c++){"
-        "var same=0,dark=qr.isDark(r,c);"
-        "for(var dr=-1;dr<=1;dr++){if(r+dr<0||mc<=r+dr)continue;for(var dc=-1;dc<=1;dc++){if(c+dc<0||mc<=c+dc)continue;if(dr==0&&dc==0)continue;if(dark==qr.isDark(r+dr,c+dc))same++;}}"
+      "for(var row=0;row<mc;row++)for(var col=0;col<mc;col++){"
+        "var same=0,dark=qr.isDark(row,col);"
+        "for(var r=-1;r<=1;r++){if(row+r<0||mc<=row+r)continue;for(var c=-1;c<=1;c++){if(col+c<0||mc<=col+c)continue;if(r==0&&c==0)continue;if(dark==qr.isDark(row+r,col+c))same++;}}"
         "if(same>5)lp+=(3+same-5);"
       "}"
+      "for(var row=0;row<mc-1;row++)for(var col=0;col<mc-1;col++){var count=0;if(qr.isDark(row,col))count++;if(qr.isDark(row+1,col))count++;if(qr.isDark(row,col+1))count++;if(qr.isDark(row+1,col+1))count++;if(count==0||count==4)lp+=3;}"
+      "for(var row=0;row<mc;row++)for(var col=0;col<mc-6;col++){if(qr.isDark(row,col)&&!qr.isDark(row,col+1)&&qr.isDark(row,col+2)&&qr.isDark(row,col+3)&&qr.isDark(row,col+4)&&!qr.isDark(row,col+5)&&qr.isDark(row,col+6))lp+=40;}"
+      "for(var col=0;col<mc;col++)for(var row=0;row<mc-6;row++){if(qr.isDark(row,col)&&!qr.isDark(row+1,col)&&qr.isDark(row+2,col)&&qr.isDark(row+3,col)&&qr.isDark(row+4,col)&&!qr.isDark(row+5,col)&&qr.isDark(row+6,col))lp+=40;}"
+      "var darkCount=0;for(var col=0;col<mc;col++)for(var row=0;row<mc;row++)if(qr.isDark(row,col))darkCount++;"
+      "var ratio=Math.abs(100*darkCount/mc/mc-50)/5;lp+=ratio*10;"
       "return lp;"
-    "}"
+    "},"
   "};"
   "var QRMath={"
     "glog:function(n){return QRMath.LOG_TABLE[n];},"
@@ -890,10 +872,10 @@ static const char KONTRX_HTML[] =
     "}"
   "};"
   "function QRRSBlock(t,d){this.totalCount=t;this.dataCount=d;}"
-  "QRRSBlock.RS_BLOCK_TABLE=[[1,26,19],[1,26,16],[1,26,13],[1,26,9],[1,44,34],[1,44,28],[1,44,22],[1,44,16],[1,70,55],[1,70,44],[1,70,34],[2,35,13],[1,100,80],[2,50,32],[2,50,24],[4,25,9]];"
+  "QRRSBlock.RS_BLOCK_TABLE=[[1,26,19],[1,26,16],[1,26,13],[1,26,9],[1,44,34],[1,44,28],[1,44,22],[1,44,16],[1,70,55],[1,70,44],[2,35,17],[2,35,13],[1,100,80],[2,50,32],[2,50,24],[4,25,9],[1,134,108],[2,67,43],[2,33,15,2,34,16],[2,33,11,2,34,12],[2,86,68],[4,43,27],[4,43,19],[4,43,15],[2,98,78],[4,49,31],[2,32,14,4,33,15],[4,39,13,1,40,14],[2,121,97],[2,60,38,2,61,39],[4,40,18,2,41,19],[4,40,14,2,41,15],[2,146,116],[3,58,36,2,59,37],[4,36,16,4,37,17],[4,36,12,4,37,13],[2,86,68,2,87,69],[4,69,43,1,70,44],[6,43,19,2,44,20],[6,43,15,2,44,16],[4,101,81],[1,80,50,4,81,51],[4,50,22,4,51,23],[3,36,12,8,37,13],[2,116,92,2,117,93],[6,58,36,2,59,37],[4,46,20,6,47,21],[7,42,14,4,43,15],[4,133,107],[8,59,37,1,60,38],[8,44,20,4,45,21],[12,33,11,4,34,12],[3,145,115,1,146,116],[4,64,40,5,65,41],[11,36,16,5,37,17],[11,36,12,5,37,13],[5,109,87,1,110,88],[5,65,41,5,66,42],[5,54,24,7,55,25],[11,36,12,7,37,13],[5,122,98,1,123,99],[7,73,45,3,74,46],[15,43,19,2,44,20],[3,45,15,13,46,16],[1,135,107,5,136,108],[10,74,46,1,75,47],[1,50,22,15,51,23],[2,42,14,17,43,15],[5,150,120,1,151,121],[9,69,43,4,70,44],[17,50,22,1,51,23],[2,42,14,19,43,15],[3,141,113,4,142,114],[3,70,44,11,71,45],[17,47,21,4,48,22],[9,39,13,16,40,14],[3,135,107,5,136,108],[3,67,41,13,68,42],[15,54,24,5,55,25],[15,43,15,10,44,16],[4,144,116,4,145,117],[17,68,42],[17,50,22,6,51,23],[19,46,16,6,47,17],[2,139,111,7,140,112],[17,74,46],[7,54,24,16,55,25],[34,37,13],[4,151,121,5,152,122],[4,75,47,14,76,48],[11,54,24,14,55,25],[16,45,15,14,46,16],[6,147,117,4,148,118],[6,73,45,14,74,46],[11,54,24,16,55,25],[30,46,16,2,47,17],[8,132,106,4,133,107],[8,75,47,13,76,48],[7,54,24,22,55,25],[22,45,15,13,46,16],[10,142,114,2,143,115],[19,74,46,4,75,47],[28,50,22,6,51,23],[33,46,16,4,47,17],[8,152,122,4,153,123],[22,73,45,3,74,46],[8,53,23,26,54,24],[12,45,15,28,46,16],[3,147,117,10,148,118],[3,73,45,23,74,46],[4,54,24,31,55,25],[11,45,15,31,46,16],[7,146,116,7,147,117],[21,73,45,7,74,46],[1,53,23,37,54,24],[19,45,15,26,46,16],[5,145,115,10,146,116],[19,75,47,10,76,48],[15,54,24,25,55,25],[23,45,15,25,46,16],[13,145,115,3,146,116],[2,74,46,29,75,47],[42,54,24,1,55,25],[23,45,15,28,46,16],[17,145,115],[10,74,46,23,75,47],[10,54,24,35,55,25],[19,45,15,35,46,16],[17,145,115,1,146,116],[14,74,46,21,75,47],[29,54,24,19,55,25],[11,45,15,46,46,16],[13,145,115,6,146,116],[14,74,46,23,75,47],[44,54,24,7,55,25],[59,46,16,1,47,17],[12,151,121,7,152,122],[12,75,47,26,76,48],[39,54,24,14,55,25],[22,45,15,41,46,16],[6,151,121,14,152,122],[6,75,47,34,76,48],[46,54,24,10,55,25],[2,45,15,64,46,16],[17,152,122,4,153,123],[29,74,46,14,75,47],[49,54,24,10,55,25],[24,45,15,46,46,16],[4,152,122,18,153,123],[13,74,46,32,75,47],[48,54,24,14,55,25],[42,45,15,32,46,16],[20,147,117,4,148,118],[40,75,47,7,76,48],[43,54,24,22,55,25],[10,45,15,67,46,16],[19,148,118,6,149,119],[18,75,47,31,76,48],[34,54,24,34,55,25],[20,45,15,61,46,16]];"
   "QRRSBlock.getRSBlocks=function(typeNumber,errorCorrectionLevel){"
     "var b=QRRSBlock.RS_BLOCK_TABLE[(typeNumber-1)*4+(errorCorrectionLevel==1?0:errorCorrectionLevel==0?1:errorCorrectionLevel==3?2:3)];"
-    "var list=[];for(var i=0;i<b[0];i++)list.push(new QRRSBlock(b[1],b[2]));return list;"
+    "var list=[];for(var i=0;i<b.length;i+=3)for(var j=0;j<b[i];j++)list.push(new QRRSBlock(b[i+1],b[i+2]));return list;"
   "};"
   "function QRBitBuffer(){this.buffer=[];this.length=0;}"
   "QRBitBuffer.prototype={"
@@ -910,14 +892,46 @@ static const char KONTRX_HTML[] =
 "})();"
 
 "function generateQR(d){"
-  "var text='MAC:'+((d&&d.mac)||'00:08:DC:11:22:33')+'|IP:'+((d&&d.ip)||'192.168.1.200')+'|FW:'+((d&&d.fw)||'v2.0.0');"
-  "var canvas=document.getElementById('qr-canvas');"
-  "document.getElementById('qr-label').textContent=text;"
+  "var mac=(d&&d.mac)||'00:08:DC:11:22:33';"
+  "var ip=(d&&d.ip)||'192.168.1.200';"
+  "var serial=(d&&d.serial)||'KX-000000000000';"
+  "var fw=(d&&d.fw)||'v2.0.0';"
+  "var machex=mac.replace(/:/g,'');"
+  "var ids=(d&&d.sensor_ids)||[1,2,3,4,5,10,0,0];"
+  "var rel=(d&&d.relays)||[];"
+  "var sensors=["
+    "{id:ids[0]||1,type:'ph',unit:'pH',name:'PH Sensor'},"
+    "{id:ids[1]||2,type:'orp',unit:'mV',name:'ORP Sensor'},"
+    "{id:ids[2]||3,type:'ec',unit:'uS/cm',name:'EC Sensor'},"
+    "{id:ids[3]||4,type:'do',unit:'mg/L',name:'DO Sensor'},"
+    "{id:ids[4]||5,type:'ammonia',unit:'ppm',name:'Ammonia Sensor'},"
+    "{id:ids[5]||10,type:'ultra',unit:'cm',name:'Ultrasonic Sensor'},"
+    "{id:ids[6]||11,type:'single_us',unit:'cm',name:'Single Ultrasonic Sensor'}"
+  "];"
+  "var qrData={"
+    "version:fw,"
+    "type:'KONTRX-GATEWAY',"
+    "serialNumber:serial,"
+    "macAddress:mac,"
+    "sparkplugEdgeNodeId:'kontrx-'+machex,"
+    "sparkplugDeviceId:'KontrxDevice-01',"
+    "timestamp:Math.floor(Date.now()/1000),"
+    "sensors:sensors,"
+    "relays:{"
+      "additionalProp1:rel[0]?rel[0].state:0,"
+      "additionalProp2:rel[1]?rel[1].state:0,"
+      "additionalProp3:rel[2]?rel[2].state:0"
+    "}"
+  "};"
+  "var text=JSON.stringify({qrData:qrData});"
+  "document.getElementById('qr-label').textContent="
+    "'Serial:'+serial+'|MAC:'+mac+'|IP:'+ip;"
   "try{"
     "var qr=new qrcode(0,1);"
     "qr.addData(text);"
     "qr.make();"
     "var count=qr.getModuleCount();"
+    "var canvas=document.getElementById('qr-canvas');"
     "var ctx=canvas.getContext('2d');"
     "var size=canvas.width;"
     "var cellSize=Math.floor(size/(count+4));"

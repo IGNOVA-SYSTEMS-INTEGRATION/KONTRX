@@ -130,6 +130,7 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"sensor_ids\":[%u,%u,%u,%u,%u,%u,%u,%u],"
         "\"uptime_s\":%lu,"
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+        "\"serial\":\"KX-%02X%02X%02X%02X%02X%02X\","
         "\"ip\":\"%d.%d.%d.%d\","
         "\"fw\":\"v2.0.0\","
         "\"relays\":%s}",
@@ -144,6 +145,7 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         s_sd.us_avg, s_sd.us_comp, s_sd.us_multi_temp,
         ph_id, orp_id, ec_id, do_id, ammonia_id, multi_us_id, single_us_id, 0,
         (unsigned long)g_uptime_seconds,
+        s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
         s_relay_json);
