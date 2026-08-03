@@ -79,7 +79,7 @@ void vApplicationMallocFailedHook(void) {
  *  Falls back to safe defaults if magic is wrong.
  * ====================================================================== */
 static void Load_Config_From_Flash(void) {
-    #define CONFIG_MAGIC 0xC01D0001U
+    #define CONFIG_MAGIC CONFIG_MAGIC_CURRENT
     Gateway_Config_t *flash_cfg = (Gateway_Config_t *)0x080E0000U;
 
     if (flash_cfg->magic == CONFIG_MAGIC) {

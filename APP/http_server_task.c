@@ -87,68 +87,84 @@ static wiz_NetInfo         s_ni;
 /* ======================================================================
  *  JSON helpers (no dynamic allocation, snprintf into tx_buf)
  * ====================================================================== */
+static const char *SensorTypeName(uint8_t type) {
+    switch (type) {
+        case 1: return "ph";
+        case 2: return "orp";
+        case 3: return "ec";
+        case 4: return "do";
+        case 5: return "ammonia";
+        case 6: return "ultrasonic";
+        case 7: return "multi_us";
+        default: return "unknown";
+    }
+}
+
 static int JSON_StatusResponse(char *buf, int buflen) {
     /* Use static storage — keeps stack frames shallow and prevents
      * the HTTPServer task from overflowing its stack on every API call. */
     Get_Shared_Sensor_Data(&s_sd);
     Get_Shared_Config(&s_cfg);
 
-    /* Build relay JSON array into static buffer */
-    int rpos = 0;
-    rpos += snprintf(s_relay_json + rpos, sizeof(s_relay_json) - rpos, "[");
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        rpos += snprintf(s_relay_json + rpos, sizeof(s_relay_json) - rpos,
-            "{\"id\":%d,\"state\":%d,\"pin\":\"P%c%u\",\"nc\":%d}%s",
-            i, relayStates[i],
+    int pos = 0;
+
+    /* --- sensors (dynamic) --- */
+    pos += snprintf(buf + pos, buflen - pos, "{\"sensors\":[");
+    for (uint8_t i = 0; i < s_sd.readings_count && i < MAX_SENSORS; i++) {
+        const SensorReading_t *r = &s_sd.readings[i];
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"%s\",\"id\":%u,\"value\":%.2f,\"temp\":%.2f,\"valid\":%u}%s",
+            SensorTypeName(r->type), r->id,
+            (r->value < -900.0f) ? -1000.0f : r->value,
+            (r->temp  < -900.0f) ? -1000.0f : r->temp,
+            r->valid,
+            (i < s_sd.readings_count - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "],");
+
+    /* --- multi-us boards --- */
+    pos += snprintf(buf + pos, buflen - pos, "\"multi_us\":[");
+    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiUS_t *m = &s_sd.multi_us[i];
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"id\":%u,\"dist\":[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f],"
+            "\"avg\":%.0f,\"comp\":%.0f,\"temp\":%.1f}%s",
+            m->id,
+            m->dist[0], m->dist[1], m->dist[2], m->dist[3],
+            m->dist[4], m->dist[5], m->dist[6], m->dist[7],
+            m->avg, m->comp, m->temp,
+            (i < s_sd.multi_us_count - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "],");
+
+    /* --- relays (dynamic) --- */
+    pos += snprintf(buf + pos, buflen - pos, "\"relays\":[");
+    for (uint8_t i = 0; i < s_cfg.relay_count && i < MAX_RELAYS; i++) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"id\":%u,\"state\":%u,\"pin\":\"P%c%u\",\"nc\":%u,\"name\":\"%s\"}%s",
+            i,
+            relayStates[i],
             'A' + s_cfg.relays[i].port_id, s_cfg.relays[i].pin_num,
             s_cfg.relays[i].is_nc,
-            (i < MAX_RELAYS - 1) ? "," : "");
+            s_cfg.relays[i].name[0] ? s_cfg.relays[i].name : "Relay",
+            (i < s_cfg.relay_count - 1) ? "," : "");
     }
-    rpos += snprintf(s_relay_json + rpos, sizeof(s_relay_json) - rpos, "]");
+    pos += snprintf(buf + pos, buflen - pos, "],");
 
     ctlnetwork(CN_GET_NETINFO, &s_ni);
 
-    uint8_t ph_id = (s_cfg.sensor_ids[0] == 0 || s_cfg.sensor_ids[0] == 0xFF) ? 1 : s_cfg.sensor_ids[0];
-    uint8_t orp_id = (s_cfg.sensor_ids[1] == 0 || s_cfg.sensor_ids[1] == 0xFF) ? 2 : s_cfg.sensor_ids[1];
-    uint8_t ec_id = (s_cfg.sensor_ids[2] == 0 || s_cfg.sensor_ids[2] == 0xFF) ? 3 : s_cfg.sensor_ids[2];
-    uint8_t do_id = (s_cfg.sensor_ids[3] == 0 || s_cfg.sensor_ids[3] == 0xFF) ? 4 : s_cfg.sensor_ids[3];
-    uint8_t ammonia_id = (s_cfg.sensor_ids[4] == 0 || s_cfg.sensor_ids[4] == 0xFF) ? 5 : s_cfg.sensor_ids[4];
-    uint8_t ultra_id = (s_cfg.sensor_ids[5] == 0 || s_cfg.sensor_ids[5] == 0xFF) ? 10 : s_cfg.sensor_ids[5];
-    uint8_t multi_us_id = s_cfg.sensor_ids[5];
-    uint8_t single_us_id = s_cfg.sensor_ids[6];
-
-    return snprintf(buf, buflen,
-        "{\"ph\":%.2f,\"ph_temp\":%.2f,"
-        "\"orp\":%.2f,\"orp_temp\":%.2f,"
-        "\"ec\":%.2f,\"ec_temp\":%.2f,"
-        "\"do_val\":%.2f,\"do_temp\":%.2f,"
-        "\"ammonia\":%.2f,\"ammonia_temp\":%.2f,"
-        "\"ultra_dist\":%.2f,\"ultra_temp\":%.2f,"
-        "\"us1\":%.0f,\"us2\":%.0f,\"us3\":%.0f,\"us4\":%.0f,"
-        "\"us5\":%.0f,\"us6\":%.0f,\"us7\":%.0f,\"us8\":%.0f,"
-        "\"us_avg\":%.0f,\"us_comp\":%.0f,\"us_temp\":%.1f,"
-        "\"sensor_ids\":[%u,%u,%u,%u,%u,%u,%u,%u],"
+    pos += snprintf(buf + pos, buflen - pos,
         "\"uptime_s\":%lu,"
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
         "\"serial\":\"KX-%02X%02X%02X%02X%02X%02X\","
         "\"ip\":\"%d.%d.%d.%d\","
-        "\"fw\":\"v2.0.0\","
-        "\"relays\":%s}",
-        s_sd.ph, s_sd.ph_temp,
-        s_sd.orp, s_sd.orp_temp,
-        s_sd.ec, s_sd.ec_temp,
-        s_sd.do_val, s_sd.do_temp,
-        s_sd.ammonia, s_sd.ammonia_temp,
-        s_sd.ultrasonic_dist, s_sd.ultrasonic_temp,
-        s_sd.us_multi[0], s_sd.us_multi[1], s_sd.us_multi[2], s_sd.us_multi[3],
-        s_sd.us_multi[4], s_sd.us_multi[5], s_sd.us_multi[6], s_sd.us_multi[7],
-        s_sd.us_avg, s_sd.us_comp, s_sd.us_multi_temp,
-        ph_id, orp_id, ec_id, do_id, ammonia_id, multi_us_id, single_us_id, 0,
+        "\"fw\":\"v2.0.0\"}",
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
-        s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
-        s_relay_json);
+        s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3]);
+
+    return pos;
 }
 
 /* ======================================================================
@@ -329,7 +345,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (strncmp(line, "POST /api/relay?", 16) == 0) {
         int id    = ParseQueryInt(line, "id");
         int state = ParseQueryInt(line, "state");
-        if (id >= 0 && id < MAX_RELAYS && state >= 0) {
+        Gateway_Config_t rcfg;
+        Get_Shared_Config(&rcfg);
+        if (id >= 0 && id < (int)rcfg.relay_count && id < MAX_RELAYS && state >= 0) {
             Relay_SetState((uint8_t)id, (uint8_t)state);
         }
         snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"id\":%d,\"state\":%d}", id, relayStates[id]);
@@ -351,7 +369,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
-     * POST /api/config/relays  → Update relay pin/NC config from JSON body
+     * POST /api/config/relays  → Full replace: {"relays":[{"name","pin","nc"},...]}
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/config/relays", 23) == 0) {
         char *body = strstr(line, "\r\n\r\n");
@@ -361,54 +379,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         Gateway_Config_t cfg;
         Get_Shared_Config(&cfg);
 
-        /* Temp variables for validation */
         uint8_t temp_ports[MAX_RELAYS];
         uint8_t temp_pins[MAX_RELAYS];
+        uint8_t temp_nc[MAX_RELAYS];
+        char    temp_names[MAX_RELAYS][20];
+        uint8_t relay_count = 0;
 
-        /* Initialize temp arrays from current config */
-        for (int i = 0; i < MAX_RELAYS; i++) {
-            temp_ports[i] = cfg.relays[i].port_id;
-            temp_pins[i]  = cfg.relays[i].pin_num;
-        }
-
-        /* First pass: parse and validate all items */
-        for (int i = 0; i < MAX_RELAYS; i++) {
-            char id_key[16]; snprintf(id_key, sizeof(id_key), "\"id\":%d", i);
-            char *entry = strstr(body, id_key);
-            if (!entry) continue;
-
-            char pin_str[16] = {0};
-            JSON_ReadStr(entry, "pin", pin_str, sizeof(pin_str));
-            
-            uint8_t port_id = 0xFF;
-            uint8_t pin_num = 0xFF;
-            Parse_Pin_String(pin_str, &port_id, &pin_num);
-
-            if (Is_Pin_Reserved(port_id, pin_num)) {
-                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is reserved by system hardware.\"}", pin_str);
-                Send_Response(sn, HTTP_200_JSON, tx_buf);
-                return;
-            }
-
-            /* Check duplicates */
-            for (int j = 0; j < MAX_RELAYS; j++) {
-                if (j != i && temp_ports[j] == port_id && temp_pins[j] == pin_num) {
-                    snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is already assigned to Relay R%d.\"}", pin_str, j + 1);
-                    Send_Response(sn, HTTP_200_JSON, tx_buf);
-                    return;
-                }
-            }
-
-            temp_ports[i] = port_id;
-            temp_pins[i]  = pin_num;
-        }
-
-        /* Retrieve current config to de-assert old pins before applying new ones */
-        Gateway_Config_t old_cfg;
-        Get_Shared_Config(&old_cfg);
-        for (int i = 0; i < MAX_RELAYS; i++) {
-            uint8_t old_port = old_cfg.relays[i].port_id;
-            uint8_t old_pin  = old_cfg.relays[i].pin_num;
+        /* De-assert old pins first (release them from output drive) */
+        for (int i = 0; i < (int)cfg.relay_count && i < MAX_RELAYS; i++) {
+            uint8_t old_port = cfg.relays[i].port_id;
+            uint8_t old_pin  = cfg.relays[i].pin_num;
             if (old_port <= 4 && old_pin <= 15) {
                 GPIO_TypeDef *gpio = GPIO_Ports[old_port];
                 gpio->MODER &= ~(3U << (old_pin * 2)); /* Reset to Input mode (00) */
@@ -416,35 +396,89 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
         }
 
-        /* Second pass: apply and save config since all validation passed */
-        for (int i = 0; i < MAX_RELAYS; i++) {
-            char id_key[16]; snprintf(id_key, sizeof(id_key), "\"id\":%d", i);
-            char *entry = strstr(body, id_key);
-            if (!entry) continue;
+        /* Parse list: items are "{"name":"...","pin":"Pxy","nc":n}," */
+        const char *cursor = body;
+        while (relay_count < MAX_RELAYS) {
+            const char *obj = strstr(cursor, "\"pin\":");
+            if (!obj) break;
+            /* back up to start of this object */
+            const char *obj_start = obj;
+            while (obj_start > body && *obj_start != '{') obj_start--;
 
-            cfg.relays[i].port_id = temp_ports[i];
-            cfg.relays[i].pin_num  = temp_pins[i];
+            char pin_str[16] = {0};
+            JSON_ReadStr(obj_start, "pin", pin_str, sizeof(pin_str));
 
-            int nc = JSON_ReadInt(entry, "nc");
-            if (nc >= 0) cfg.relays[i].is_nc = (uint8_t)nc;
+            uint8_t port_id = 0xFF, pin_num = 0xFF;
+            Parse_Pin_String(pin_str, &port_id, &pin_num);
+
+            if (port_id > 4 || pin_num > 15) {
+                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Invalid pin %s.\"}", pin_str);
+                Send_Response(sn, HTTP_200_JSON, tx_buf);
+                return;
+            }
+            if (Is_Pin_Reserved(port_id, pin_num)) {
+                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is reserved by system hardware.\"}", pin_str);
+                Send_Response(sn, HTTP_200_JSON, tx_buf);
+                return;
+            }
+            for (int j = 0; j < relay_count; j++) {
+                if (temp_ports[j] == port_id && temp_pins[j] == pin_num) {
+                    snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is assigned twice.\"}", pin_str);
+                    Send_Response(sn, HTTP_200_JSON, tx_buf);
+                    return;
+                }
+            }
+
+            temp_ports[relay_count]  = port_id;
+            temp_pins[relay_count]   = pin_num;
+            int nc = JSON_ReadInt(obj_start, "nc");
+            temp_nc[relay_count]     = (nc == 1) ? 1 : 0;
+            char nm[20] = {0};
+            JSON_ReadStr(obj_start, "name", nm, sizeof(nm));
+            snprintf(temp_names[relay_count], sizeof(temp_names[relay_count]),
+                     nm[0] ? "%s" : "Relay%u", nm[0] ? nm : (const char *)"", relay_count + 1);
+            relay_count++;
+
+            /* advance past this object */
+            const char *close = strchr(obj_start, '}');
+            if (!close) break;
+            cursor = close + 1;
         }
 
-        cfg.magic = 0xC01D0001U; /* Ensure CONFIG_MAGIC is saved */
-        Update_Shared_Config(&cfg);
+        if (relay_count == 0) {
+            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"No relays provided.\"}");
+            Send_Response(sn, HTTP_200_JSON, tx_buf);
+            return;
+        }
 
-        /* Configure hardware GPIO registers for all updated pins */
-        for (int i = 0; i < MAX_RELAYS; i++) {
-            uint8_t port = cfg.relays[i].port_id;
-            uint8_t pin  = cfg.relays[i].pin_num;
+        /* Build new config */
+        Gateway_Config_t ncfg;
+        Get_Shared_Config(&ncfg);
+        ncfg.relay_count = relay_count;
+        memset(ncfg.relays, 0, sizeof(ncfg.relays));
+        for (int i = 0; i < relay_count; i++) {
+            ncfg.relays[i].port_id = temp_ports[i];
+            ncfg.relays[i].pin_num = temp_pins[i];
+            ncfg.relays[i].is_nc   = temp_nc[i];
+            ncfg.relays[i].state   = 0;
+            snprintf(ncfg.relays[i].name, sizeof(ncfg.relays[i].name), "%s", temp_names[i]);
+        }
+        ncfg.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&ncfg);
+
+        /* Configure GPIO + apply OFF state for each new relay */
+        for (int i = 0; i < relay_count; i++) {
+            uint8_t port = ncfg.relays[i].port_id;
+            uint8_t pin  = ncfg.relays[i].pin_num;
             if (port <= 4 && pin <= 15) {
                 GPIO_InitOutput(GPIO_Ports[port], pin);
-                Relay_SetState((uint8_t)i, relayStates[i]); /* Re-apply current state to new pin */
+                Relay_SetState((uint8_t)i, 0);
             }
         }
 
         /* Persist to flash emulated EEPROM (Sector 11 = last 16KB at 0x080E0000) */
         FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&ncfg, sizeof(Gateway_Config_t));
 
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         return;
@@ -485,7 +519,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
-     * POST /api/config/sensors  → Update sensor Modbus IDs
+     * POST /api/config/sensors  → Full replace:
+     *   {"sensors":[{"type":"ph","id":2}, {"type":"do","id":9}, ...]}
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/config/sensors", 24) == 0) {
         char *body = strstr(line, "\r\n\r\n");
@@ -495,25 +530,73 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         Gateway_Config_t cfg;
         Get_Shared_Config(&cfg);
 
-        int ph_val = JSON_ReadInt(body, "ph");
-        int orp_val = JSON_ReadInt(body, "orp");
-        int ec_val = JSON_ReadInt(body, "ec");
-        int do_val = JSON_ReadInt(body, "do");
-        int ammonia_val = JSON_ReadInt(body, "ammonia");
-        int ultra_val = JSON_ReadInt(body, "ultra");
-        int multi_us_val = JSON_ReadInt(body, "multi_us");
-        int single_us_val = JSON_ReadInt(body, "single_us");
+        uint8_t s_types[MAX_SENSORS];
+        uint8_t s_ids[MAX_SENSORS];
+        uint8_t s_count = 0;
 
-        if (multi_us_val >= 1 && multi_us_val <= 247) cfg.sensor_ids[5] = (uint8_t)multi_us_val;
-        else if (ultra_val >= 1 && ultra_val <= 247) cfg.sensor_ids[5] = (uint8_t)ultra_val;
-        if (single_us_val >= 1 && single_us_val <= 247) cfg.sensor_ids[6] = (uint8_t)single_us_val;
-        if (ph_val >= 1 && ph_val <= 247) cfg.sensor_ids[0] = (uint8_t)ph_val;
-        if (orp_val >= 1 && orp_val <= 247) cfg.sensor_ids[1] = (uint8_t)orp_val;
-        if (ec_val >= 1 && ec_val <= 247) cfg.sensor_ids[2] = (uint8_t)ec_val;
-        if (do_val >= 1 && do_val <= 247) cfg.sensor_ids[3] = (uint8_t)do_val;
-        if (ammonia_val >= 1 && ammonia_val <= 247) cfg.sensor_ids[4] = (uint8_t)ammonia_val;
+        /* Parse list of {"type":"...","id":N} objects */
+        const char *cursor = body;
+        while (s_count < MAX_SENSORS) {
+            const char *obj = strstr(cursor, "\"type\":");
+            if (!obj) break;
+            const char *obj_start = obj;
+            while (obj_start > body && *obj_start != '{') obj_start--;
 
-        cfg.magic = 0xC01D0001U;
+            char type_str[16] = {0};
+            JSON_ReadStr(obj_start, "type", type_str, sizeof(type_str));
+
+            uint8_t type = 0;
+            if (strcmp(type_str, "ph") == 0)        type = 1;
+            else if (strcmp(type_str, "orp") == 0)  type = 2;
+            else if (strcmp(type_str, "ec") == 0)   type = 3;
+            else if (strcmp(type_str, "do") == 0)   type = 4;
+            else if (strcmp(type_str, "ammonia") == 0) type = 5;
+            else if (strcmp(type_str, "ultrasonic") == 0) type = 6;
+            else if (strcmp(type_str, "multi_us") == 0)  type = 7;
+
+            if (type < 1 || type > 7) {
+                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Unknown sensor type %s.\"}", type_str);
+                Send_Response(sn, HTTP_200_JSON, tx_buf);
+                return;
+            }
+
+            int id = JSON_ReadInt(obj_start, "id");
+            if (id < 1 || id > 247) {
+                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Sensor id must be 1..247.\"}");
+                Send_Response(sn, HTTP_200_JSON, tx_buf);
+                return;
+            }
+            for (int j = 0; j < s_count; j++) {
+                if (s_ids[j] == (uint8_t)id) {
+                    snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Modbus id %d is assigned twice.\"}", id);
+                    Send_Response(sn, HTTP_200_JSON, tx_buf);
+                    return;
+                }
+            }
+
+            s_types[s_count] = type;
+            s_ids[s_count]   = (uint8_t)id;
+            s_count++;
+
+            const char *close = strchr(obj_start, '}');
+            if (!close) break;
+            cursor = close + 1;
+        }
+
+        if (s_count == 0) {
+            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"No sensors provided.\"}");
+            Send_Response(sn, HTTP_200_JSON, tx_buf);
+            return;
+        }
+
+        cfg.sensors.count = s_count;
+        memset(cfg.sensors.entries, 0, sizeof(cfg.sensors.entries));
+        for (int i = 0; i < s_count; i++) {
+            cfg.sensors.entries[i].type = s_types[i];
+            cfg.sensors.entries[i].id   = s_ids[i];
+        }
+
+        cfg.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&cfg);
 
         /* Persist */

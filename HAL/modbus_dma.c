@@ -12,25 +12,7 @@
 /* التعريفات العالمية المطلوبة للمشروع */
 osMutexId_t         sensorMutex = NULL;
 osMutexId_t         configMutex = NULL;
-Modbus_SensorData_t sharedSensorData = {
-    .ph = -1000.0f,
-    .ph_temp = -1000.0f,
-    .orp = -1000.0f,
-    .orp_temp = -1000.0f,
-    .ec = -1000.0f,
-    .ec_temp = -1000.0f,
-    .do_val = -1000.0f,
-    .do_temp = -1000.0f,
-    .ammonia = -1000.0f,
-    .ammonia_temp = -1000.0f,
-    .ultrasonic_dist = -1000.0f,
-    .ultrasonic_temp = -1000.0f,
-    .us_multi = {-1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f},
-    .us_avg = -1000.0f,
-    .us_comp = -1000.0f,
-    .us_multi_temp = -1000.0f,
-    .last_update_time = 0
-};
+Modbus_SensorData_t sharedSensorData = { .last_update_time = 0 };
 Gateway_Config_t    sharedConfig;
 uint8_t             relayStates[MAX_RELAYS];
 volatile ModbusScanStatus_t g_scan_status = {0};
@@ -78,7 +60,19 @@ void Modbus_DMA_Init(void) {
     MAX485_RX();
     USART3->BRR = 0x0683;
     USART3->CR2 = 0;
-    USART3->CR1 = (1U << 13) | (1U << 3) | (1U << 2); 
+    USART3->CR1 = (1U << 13) | (1U << 3) | (1U << 2);
+
+    /* Default config: empty sensor list (user adds via Auto-Scan / UI) + default relays */
+    Gateway_Config_t cfg;
+    Get_Shared_Config(&cfg);
+    if (cfg.magic != CONFIG_MAGIC_CURRENT) {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        cfg.sensors.count = 0;
+        cfg.relay_count = 0;
+        cfg.mqtt_port = 1883;
+        Update_Shared_Config(&cfg);
+    }
 }
 
 static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc, uint16_t reg, uint8_t num, uint16_t *out) {
@@ -115,58 +109,103 @@ static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc, uint16_t reg, 
 
 void Modbus_DMA_PollSensors(void) {
     Modbus_SensorData_t local;
-    Get_Shared_Sensor_Data(&local); 
+    Get_Shared_Sensor_Data(&local);
     Gateway_Config_t cfg;
     Get_Shared_Config(&cfg);
     uint16_t rs[12];
 
-    uint8_t ph_id  = cfg.sensor_ids[0] ? cfg.sensor_ids[0] : 1;
-    uint8_t orp_id = cfg.sensor_ids[1] ? cfg.sensor_ids[1] : 2;
-    uint8_t ec_id  = cfg.sensor_ids[2] ? cfg.sensor_ids[2] : 3;
-    uint8_t do_id  = cfg.sensor_ids[3] ? cfg.sensor_ids[3] : 4;
-    uint8_t nh3_id = cfg.sensor_ids[4] ? cfg.sensor_ids[4] : 5;
-    uint8_t mu_id  = cfg.sensor_ids[5] ? cfg.sensor_ids[5] : 10;
-    uint8_t su_id  = cfg.sensor_ids[6];
+    local.readings_count = 0;
+    local.multi_us_count = 0;
+    memset(local.readings, 0, sizeof(local.readings));
+    memset(local.multi_us, 0, sizeof(local.multi_us));
 
-    if(Modbus_Safe_Transaction(ph_id, 0x03, 0, 2, rs)) { local.ph = rs[0]/100.0f; local.ph_temp = rs[1]/100.0f; }
-    osDelay(50);
-    if(Modbus_Safe_Transaction(ec_id, 0x03, 0, 2, rs)) { local.ec = rs[0]/10.0f; local.ec_temp = rs[1]/100.0f; }
-    osDelay(50);
-    if(Modbus_Safe_Transaction(do_id, 0x03, 0x2600, 6, rs)) {
-        local.do_temp = Decode_Float_DCBA(rs[0], rs[1]);
-        local.do_val  = Decode_Float_DCBA(rs[4], rs[5]);
-    }
-    osDelay(50);
-    if(Modbus_Safe_Transaction(nh3_id, 0x03, 0, 2, rs)) { local.ammonia = (float)rs[0]; local.ammonia_temp = rs[1]/100.0f; }
-    osDelay(50);
-    if(Modbus_Safe_Transaction(orp_id, 0x03, 0, 2, rs)) { local.orp = (float)rs[0]; local.orp_temp = rs[1]/100.0f; }
-    osDelay(50);
+    for (uint8_t s = 0; s < cfg.sensors.count && s < MAX_SENSORS; s++) {
+        uint8_t type = cfg.sensors.entries[s].type;
+        uint8_t sid  = cfg.sensors.entries[s].id;
+        SensorReading_t *rd = &local.readings[local.readings_count];
+        rd->type = type;
+        rd->id   = sid;
+        rd->valid = 0;
 
-    if(mu_id) {
-        uint32_t sum = 0; uint8_t valid = 0;
-        for(uint8_t i = 0; i < 8; i++) {
-            if(Modbus_Safe_Transaction(mu_id, 0x03, i * 0x10, 3, rs)) {
-                local.us_multi[i] = (float)rs[0];
-                sum += rs[0]; valid++;
-            } else {
-                local.us_multi[i] = -1000.0f;
-            }
-            osDelay(20);
+        switch (type) {
+            case 1: /* pH  */
+                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+                    rd->value = rs[0] / 100.0f;
+                    rd->temp  = rs[1] / 100.0f;
+                    rd->valid = 1;
+                }
+                break;
+            case 2: /* ORP */
+                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+                    rd->value = (float)rs[0];
+                    rd->temp  = rs[1] / 100.0f;
+                    rd->valid = 1;
+                }
+                break;
+            case 3: /* EC  */
+                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+                    rd->value = rs[0] / 10.0f;
+                    rd->temp  = rs[1] / 100.0f;
+                    rd->valid = 1;
+                }
+                break;
+            case 4: /* DO  */
+                if (Modbus_Safe_Transaction(sid, 0x03, 0x2600, 6, rs)) {
+                    rd->temp  = Decode_Float_DCBA(rs[0], rs[1]);
+                    rd->value = Decode_Float_DCBA(rs[4], rs[5]);
+                    rd->valid = 1;
+                }
+                break;
+            case 5: /* Ammonia */
+                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+                    rd->value = (float)rs[0];
+                    rd->temp  = rs[1] / 100.0f;
+                    rd->valid = 1;
+                }
+                break;
+            case 6: /* Ultrasonic (single) */
+                if (Modbus_Safe_Transaction(sid, 0x03, 0, 10, rs)) {
+                    rd->temp  = rs[8] / 10.0f;
+                    rd->value = rs[9] / 10.0f;
+                    rd->valid = 1;
+                }
+                break;
+            case 7: /* Multi-US board */
+                if (local.multi_us_count < MAX_MULTI_US) {
+                    MultiUS_t *mu = &local.multi_us[local.multi_us_count];
+                    memset(mu, 0, sizeof(*mu));
+                    mu->id = sid;
+                    uint32_t sum = 0; uint8_t valid = 0;
+                    for (uint8_t i = 0; i < 8; i++) {
+                        if (Modbus_Safe_Transaction(sid, 0x03, i * 0x10, 3, rs)) {
+                            mu->dist[i] = (float)rs[0];
+                            sum += rs[0]; valid++;
+                        } else {
+                            mu->dist[i] = -1000.0f;
+                        }
+                        osDelay(20);
+                    }
+                    if (valid) mu->avg = (float)(sum / valid);
+                    if (Modbus_Safe_Transaction(sid, 0x03, 0x0080, 3, rs)) {
+                        mu->temp = rs[0] / 10.0f;
+                    }
+                    if (Modbus_Safe_Transaction(sid, 0x04, 0x0000, 3, rs)) {
+                        mu->comp = (float)rs[2];
+                        if (!valid) mu->avg = (float)rs[0];
+                        if (valid == 0) mu->temp = rs[1] / 10.0f;
+                    }
+                    local.multi_us_count++;
+                    rd->value = mu->avg;
+                    rd->temp  = mu->temp;
+                    rd->valid = valid;
+                }
+                break;
+            default:
+                break;
         }
-        if(valid) local.us_avg = (float)(sum / valid);
-        if(Modbus_Safe_Transaction(mu_id, 0x03, 0x0080, 3, rs)) {
-            local.us_multi_temp = rs[0] / 10.0f;
-        }
-        if(Modbus_Safe_Transaction(mu_id, 0x04, 0x0000, 3, rs)) {
-            local.us_comp = (float)rs[2];
-            if(!valid) local.us_avg = (float)rs[0];
-            if(valid == 0) local.us_multi_temp = rs[1] / 10.0f;
-        }
-    }
 
-    if(su_id && Modbus_Safe_Transaction(su_id, 0x03, 0, 10, rs)) {
-        local.ultrasonic_temp = rs[8] / 10.0f;
-        local.ultrasonic_dist = rs[9] / 10.0f;
+        if (rd->valid) local.readings_count++;
+        osDelay(50);
     }
 
     local.last_update_time = osKernelGetTickCount();

@@ -56,18 +56,23 @@ void vApplicationTickHook(void) {
 
 /* Default relay pin table (mirrors web_assets.h JS initial state) */
 /* Format: {port_id, pin_num}  A=0 B=1 C=2 D=3 E=4 */
-static const struct { uint8_t port; uint8_t pin; } relay_defaults[MAX_RELAYS] = {
-    {4, 2},  /* R1  PE2 */
-    {4, 4},  /* R2  PE4 */
-    {4, 6},  /* R3  PE6 */
-    {2, 0},  /* R4  PC0 */
-    {2, 2},  /* R5  PC2 */
-    {0, 0},  /* R6  PA0 */
-    {0, 2},  /* R7  PA2 */
-    {0, 4},  /* R8  PA4 */
-    /* R9 intentionally disabled by default; assign a free pin via config UI. */
-    {0xFF, 0xFF},
-    {3, 8},  /* R10 PD8 */
+static const struct { uint8_t port; uint8_t pin; const char *name; } relay_defaults[MAX_RELAYS] = {
+    {4, 2,  "Relay1"},  /* R1  PE2 */
+    {4, 4,  "Relay2"},  /* R2  PE4 */
+    {4, 6,  "Relay3"},  /* R3  PE6 */
+    {2, 0,  "Relay4"},  /* R4  PC0 */
+    {2, 2,  "Relay5"},  /* R5  PC2 */
+    {0, 0,  "Relay6"},  /* R6  PA0 */
+    {0, 2,  "Relay7"},  /* R7  PA2 */
+    {0, 4,  "Relay8"},  /* R8  PA4 */
+    {0xFF, 0xFF, "Relay9"},   /* R9 disabled by default */
+    {3, 8,  "Relay10"}, /* R10 PD8 */
+    {0xFF, 0xFF, ""},   /* R11+ unused */
+    {0xFF, 0xFF, ""},
+    {0xFF, 0xFF, ""},
+    {0xFF, 0xFF, ""},
+    {0xFF, 0xFF, ""},
+    {0xFF, 0xFF, ""},
 };
 
 static uint8_t Relay_Pin_Is_Reserved(uint8_t port, uint8_t pin) {
@@ -87,20 +92,30 @@ void Relay_Init(void) {
     Gateway_Config_t cfg;
     Get_Shared_Config(&cfg);
 
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        /* If config hasn't been persisted yet, load from defaults */
-        if (cfg.relays[i].port_id == 0 && cfg.relays[i].pin_num == 0 &&
-            cfg.relays[i].is_nc == 0 && cfg.relays[i].state == 0) {
+    if (cfg.magic != CONFIG_MAGIC_CURRENT) {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        cfg.sensors.count = 0;
+        cfg.relay_count = 10;
+        cfg.mqtt_port = 1883;
+        for (int i = 0; i < MAX_RELAYS; i++) {
             cfg.relays[i].port_id = relay_defaults[i].port;
             cfg.relays[i].pin_num = relay_defaults[i].pin;
+            cfg.relays[i].is_nc   = 0;
+            cfg.relays[i].state   = 0;
+            strncpy(cfg.relays[i].name, relay_defaults[i].name, sizeof(cfg.relays[i].name) - 1);
         }
+        Update_Shared_Config(&cfg);
+    }
 
+    for (int i = 0; i < (int)cfg.relay_count && i < MAX_RELAYS; i++) {
         uint8_t port = cfg.relays[i].port_id;
         uint8_t pin  = cfg.relays[i].pin_num;
 
         if (Relay_Pin_Is_Reserved(port, pin)) {
-            printf("[Relay] R%d pin P%c%u is reserved; relay disabled\r\n",
-                   i + 1, (port <= 4) ? ('A' + port) : '?', pin);
+            printf("[Relay] %s pin P%c%u is reserved; relay disabled\r\n",
+                   cfg.relays[i].name[0] ? cfg.relays[i].name : "Relay",
+                   (port <= 4) ? ('A' + port) : '?', pin);
             continue;
         }
 
@@ -119,10 +134,6 @@ void Relay_Init(void) {
         /* Initialise to OFF state (deenergised) */
         Relay_SetState((uint8_t)i, 0);
     }
-
-    /* Persist defaults back if config was uninitialised */
-    cfg.magic = 0xC01D0001U;
-    Update_Shared_Config(&cfg);
 }
 
 /* ======================================================================
@@ -168,25 +179,7 @@ static void Task_ControlEngine(void *arg) {
     TickType_t   xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod   = pdMS_TO_TICKS(1); /* 1ms */
 
-    Modbus_SensorData_t sd = {
-        .ph = -1000.0f,
-        .ph_temp = -1000.0f,
-        .orp = -1000.0f,
-        .orp_temp = -1000.0f,
-        .ec = -1000.0f,
-        .ec_temp = -1000.0f,
-        .do_val = -1000.0f,
-        .do_temp = -1000.0f,
-        .ammonia = -1000.0f,
-        .ammonia_temp = -1000.0f,
-        .ultrasonic_dist = -1000.0f,
-        .ultrasonic_temp = -1000.0f,
-        .us_multi = {-1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f},
-        .us_avg = -1000.0f,
-        .us_comp = -1000.0f,
-        .us_multi_temp = -1000.0f,
-        .last_update_time = 0
-    };
+    Modbus_SensorData_t sd = { .last_update_time = 0 };
 
     for (;;) {
         /* --- Read latest sensor snapshot (mutex-protected, non-blocking) --- */
