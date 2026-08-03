@@ -79,7 +79,6 @@ static uint8_t ota_page_buf[OTA_PAGE_SIZE];
  *  Keeping these off the task stack prevents stack overflow on the
  *  2KB (now 4KB) HTTPServer stack when snprintf + structs are called.
  * ====================================================================== */
-static char               s_relay_json[512];
 static Modbus_SensorData_t s_sd;
 static Gateway_Config_t    s_cfg;
 static wiz_NetInfo         s_ni;
