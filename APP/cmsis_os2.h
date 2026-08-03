@@ -40,6 +40,17 @@ typedef enum {
 /* Timeout value definition */
 #define osWaitForever       0xFFFFFFFFU ///< Wait forever timeout value.
 
+/* Kernel state values */
+typedef enum {
+    osKernelInactive    = 0,   ///< Kernel not initialized.
+    osKernelReady       = 1,   ///< Kernel initialized and ready.
+    osKernelRunning     = 2,   ///< Kernel running.
+    osKernelLocked      = 3,   ///< Kernel locked.
+    osKernelSuspended   = 4,   ///< Kernel suspended.
+    osKernelError       = -1,  ///< Kernel error state.
+    osKernelReserved    = 0x7FFFFFFF ///< Prevents enum down-size compiler optimization.
+} osKernelState_t;
+
 /* Thread ID placeholder */
 typedef TaskHandle_t osThreadId_t;
 
@@ -85,6 +96,7 @@ typedef struct {
 /* Kernel Management */
 osStatus_t osKernelInitialize(void);
 osStatus_t osKernelStart(void);
+osKernelState_t osKernelGetState(void);
 uint32_t osKernelGetTickCount(void);
 
 /* Thread Management */

@@ -6,6 +6,8 @@
 
 #define MAX_RELAYS 10
 
+#define SENSOR_TYPE_MULTI_US 7
+
 /* Shared Sensor Data Structure */
 typedef struct {
     float ph;
@@ -20,6 +22,10 @@ typedef struct {
     float ammonia_temp;
     float ultrasonic_dist;
     float ultrasonic_temp;
+    float us_multi[8];
+    float us_avg;
+    float us_comp;
+    float us_multi_temp;
     uint32_t last_update_time;
 } Modbus_SensorData_t;
 
@@ -40,15 +46,14 @@ typedef struct {
     char mqtt_client_id[32];
     char mqtt_username[32];
     char mqtt_password[32];
-    uint8_t sensor_ids[6]; // [0]=ph, [1]=orp, [2]=ec, [3]=do, [4]=ammonia, [5]=ultrasonic
-    uint8_t padding[2];
+    uint8_t sensor_ids[8]; // [0]=ph, [1]=orp, [2]=ec, [3]=do, [4]=ammonia, [5]=multi-us, [6]=single-us, [7]=spare
     uint32_t checksum;
 } Gateway_Config_t;
 
 #define SCAN_MAX_DEVICES 32
 typedef struct {
     uint8_t id;
-    uint8_t type; // 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 255=Unknown Device
+    uint8_t type; // 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US, 255=Unknown
 } ScannedDevice_t;
 
 typedef struct {

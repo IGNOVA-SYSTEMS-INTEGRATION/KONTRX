@@ -65,21 +65,17 @@ static const struct { uint8_t port; uint8_t pin; } relay_defaults[MAX_RELAYS] = 
     {0, 0},  /* R6  PA0 */
     {0, 2},  /* R7  PA2 */
     {0, 4},  /* R8  PA4 */
-    /* PC4 is the W5500 reset line, so it must never be configured as a relay.
-     * R9 is intentionally disabled until a board-specific, non-reserved pin is
-     * assigned from the configuration UI. */
+    /* R9 intentionally disabled by default; assign a free pin via config UI. */
     {0xFF, 0xFF},
     {3, 8},  /* R10 PD8 */
 };
 
-/* These pins are owned by fixed hardware functions.  In particular, allowing
- * a persisted relay configuration to drive PC4 low holds the W5500 in reset. */
 static uint8_t Relay_Pin_Is_Reserved(uint8_t port, uint8_t pin) {
     if (port > 4 || pin > 15) return 1;
 
     if (port == 0 && (pin == 6 || pin == 9 || pin == 10)) return 1;  /* LED, USART1 */
     if (port == 1 && pin >= 10 && pin <= 15) return 1;                /* Modbus, W5500 SPI */
-    if (port == 2 && (pin == 4 || pin == 6 || pin == 7)) return 1;    /* W5500 RST, USART6 */
+    if (port == 2 && (pin == 6 || pin == 7)) return 1;                /* USART6 */
     if (port == 3 && (pin == 2 || pin == 3)) return 1;                /* MAX485 RE#/DE */
     return 0;
 }
@@ -172,7 +168,25 @@ static void Task_ControlEngine(void *arg) {
     TickType_t   xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod   = pdMS_TO_TICKS(1); /* 1ms */
 
-    Modbus_SensorData_t sd;
+    Modbus_SensorData_t sd = {
+        .ph = -1000.0f,
+        .ph_temp = -1000.0f,
+        .orp = -1000.0f,
+        .orp_temp = -1000.0f,
+        .ec = -1000.0f,
+        .ec_temp = -1000.0f,
+        .do_val = -1000.0f,
+        .do_temp = -1000.0f,
+        .ammonia = -1000.0f,
+        .ammonia_temp = -1000.0f,
+        .ultrasonic_dist = -1000.0f,
+        .ultrasonic_temp = -1000.0f,
+        .us_multi = {-1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f, -1000.0f},
+        .us_avg = -1000.0f,
+        .us_comp = -1000.0f,
+        .us_multi_temp = -1000.0f,
+        .last_update_time = 0
+    };
 
     for (;;) {
         /* --- Read latest sensor snapshot (mutex-protected, non-blocking) --- */
@@ -182,33 +196,17 @@ static void Task_ControlEngine(void *arg) {
             sd = sharedSensorData;
             osMutexRelease(sensorMutex);
         }
+
+        if (sd.last_update_time == 0) {
+            vTaskDelayUntil(&xLastWakeTime, xPeriod);
+            continue;
+        }
         /* If mutex was unavailable, we proceed with the last known snapshot — 
          * this is intentional; the control engine never stalls for sensor data. */
 
-        /* ================================================================
+/* ================================================================
          * --- CONTROL LOGIC ZONE (user-defined) ---
-         * Insert threshold logic, PID computations, relay decision trees here.
-         * All operations on sd (float reads) are safe — no external dependencies.
          * ================================================================ */
-
-        /* Example: Auto-dose relay R0 when pH drops below 6.5 */
-        if (sd.ph > -900.0f && sd.ph < 6.5f) {
-            /* pH too low — activate R0 (acid dosing pump) */
-            /* NOTE: Relay_SetState acquires a mutex; calling from here is
-             * acceptable because Update_Shared_Config is fast.
-             * For truly hard-RT requirements, cache desired state and
-             * let a lower-priority task apply it. */
-            if (relayStates[0] == 0) Relay_SetState(0, 1);
-        } else if (sd.ph > 7.2f) {
-            if (relayStates[0] == 1) Relay_SetState(0, 0);
-        }
-
-        /* Example: Aeration pump (R1) ON when DO < 5.0 mg/L */
-        if (sd.do_val > -900.0f && sd.do_val < 5.0f) {
-            if (relayStates[1] == 0) Relay_SetState(1, 1);
-        } else if (sd.do_val > 6.5f) {
-            if (relayStates[1] == 1) Relay_SetState(1, 0);
-        }
 
         /* ================================================================ */
 
@@ -223,22 +221,24 @@ static void Task_ControlEngine(void *arg) {
  * ====================================================================== */
 static void Task_ModbusSensorPoll(void *arg) {
     (void)arg;
-
+    osDelay(2000); // انتظر ثانيتين قبل بدء أول عملية Modbus
+    
     printf("[Task] ModbusSensorPoll starting...\r\n");
 
     /* One-time driver init */
     Modbus_DMA_Init();
-    
+        osDelay(1000); 
+
     printf("[Task] ModbusSensorPoll entering main loop\r\n");
 
     for (;;) {
         if (g_scan_status.is_scanning) {
             printf("[Task] Scan mode active\r\n");
             Modbus_DMA_PerformScan();
+            osDelay(2000);
         } else {
             Modbus_DMA_PollSensors();
-            /* Poll round-trip typically 150..200ms; extra delay pads to ~250ms */
-            osDelay(50);
+            osDelay(500);
         }
     }
 }
@@ -250,26 +250,19 @@ static void Task_ModbusSensorPoll(void *arg) {
 void RTOS_Tasks_Init(void) {
     osThreadAttr_t attr = {0};
 
-    /* Task 1 — Control Engine — REALTIME priority, tiny stack */
+    /* Task 1 — Control Engine */
     attr.name       = "ControlEng";
-    attr.stack_size = 512;
+    attr.stack_size = 2048; // زدناها من 512 إلى 2048 لضمان الاستقرار
     attr.priority   = osPriorityRealtime;
     osThreadNew(Task_ControlEngine, NULL, &attr);
 
     /* Task 2 — Modbus Sensor Poll */
     attr.name       = "ModbusPoll";
-    attr.stack_size = 1024;
+    attr.stack_size = 4096; 
     attr.priority   = osPriorityAboveNormal;
     osThreadNew(Task_ModbusSensorPoll, NULL, &attr);
 
-    /* Task 3 — HTTP Server
-     * Stack budget:
-     *   - FreeRTOS task frame           ~  64 B
-     *   - Dispatch_Request frame        ~ 128 B
-     *   - WIZnet ioLibrary call chain   ~ 256 B
-     *   - JSON handler locals           ~ 128 B
-     *   - Safety margin                 ~3520 B
-     *   TOTAL allocated                 4096 B */
+    /* Task 3 — HTTP Server */
     attr.name       = "HTTPServer";
     attr.stack_size = 4096;
     attr.priority   = osPriorityNormal;
@@ -277,13 +270,9 @@ void RTOS_Tasks_Init(void) {
 
     /* Task 4 — OTA Background */
     attr.name       = "OTAUpdate";
-    attr.stack_size = 1024;
+    attr.stack_size = 2048; // زدناها من 1024 إلى 2048
     attr.priority   = osPriorityLow;
     osThreadNew(Task_OTAUpdate, NULL, &attr);
 
-    /* Start the scheduler — does not return */
-    vTaskStartScheduler();
-
-    /* Should never reach here */
-    while (1);
+    osKernelStart();
 }

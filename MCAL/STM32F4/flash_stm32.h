@@ -9,6 +9,10 @@
 #define OTA_STATUS_PENDING   0xA5A5A5A5U
 #define OTA_STATUS_SUCCESS   0x5A5A5A5AU
 
+/* Config EEPROM — last 16KB of Sector 7 (valid on 512KB STM32F407VET6) */
+#define CONFIG_EEPROM_ADDR   0x0807C000U
+#define CONFIG_EEPROM_SIZE   256U
+
 typedef struct {
     uint32_t magic;
     uint32_t status;

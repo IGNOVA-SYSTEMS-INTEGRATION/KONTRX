@@ -1,13 +1,21 @@
 #include "cmsis_os2.h"
 
+static osKernelState_t g_kernel_state = osKernelInactive;
+
 /* Kernel Management */
 osStatus_t osKernelInitialize(void) {
+    g_kernel_state = osKernelReady;
     return osOK;
 }
 
 osStatus_t osKernelStart(void) {
+    g_kernel_state = osKernelRunning;
     vTaskStartScheduler();
     return osOK;
+}
+
+osKernelState_t osKernelGetState(void) {
+    return g_kernel_state;
 }
 
 uint32_t osKernelGetTickCount(void) {
