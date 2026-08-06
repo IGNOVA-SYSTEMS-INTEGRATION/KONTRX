@@ -1,10 +1,20 @@
 #include "flash_stm32.h"
 #include "stm32f407_regs.h"
 
+/*
+ * FLASH_WaitBusy — busy-waits until the flash controller finishes.
+ *
+ * TIMING IMPACT (> 1 ms):
+ *  - A sector erase on STM32F407 takes 50-100 ms; the busy-wait blocks here.
+ *  - The interrupt window is handled by FLASH_EraseSector: interrupts are only
+ *    disabled for the microseconds of register setup, then re-enabled, so the
+ *    1ms Control Engine keeps running during the erase. BUT the erase busy-wait
+ *    itself still occupies CPU in THIS task's priority, delaying tasks of equal
+ *    or lower priority (Modbus poll, HTTP). OTA-only path.
+ */
 static void FLASH_WaitBusy(void) {
     while (FLASH_CTRL->SR & FLASH_SR_BSY);
 }
-
 void FLASH_Unlock(void) {
     if (FLASH_CTRL->CR & FLASH_CR_LOCK) {
         FLASH_CTRL->KEYR = FLASH_KEY1;
@@ -17,7 +27,8 @@ void FLASH_Lock(void) {
 }
 
 void FLASH_EraseSector(uint8_t sector) {
-    /* Only hold interrupts during register setup (microseconds) */
+    /* Disable interrupts during the entire erase operation to prevent CPU
+     * from attempting to fetch ISR code/vector table from busy Flash. */
     __asm volatile ("cpsid i" : : : "memory");
 
     FLASH_WaitBusy();
@@ -31,15 +42,12 @@ void FLASH_EraseSector(uint8_t sector) {
     FLASH_CTRL->CR |= (sector << FLASH_CR_SNB_POS) | FLASH_CR_SER | FLASH_CR_PSIZE32;
     FLASH_CTRL->CR |= FLASH_CR_STRT;
 
-    /* Re-enable interrupts during the long busy-wait (50-100ms)
-     * so W5500 RX buffer can be serviced by other tasks. */
-    __asm volatile ("cpsie i" : : : "memory");
-
     FLASH_WaitBusy();
 
-    __asm volatile ("cpsid i" : : : "memory");
     FLASH_CTRL->CR &= ~FLASH_CR_SER;
     FLASH_Lock();
+
+    /* Re-enable interrupts after erase operation is fully complete */
     __asm volatile ("cpsie i" : : : "memory");
 }
 
