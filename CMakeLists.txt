@@ -11,7 +11,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -O0 -g -Wall -Wextra -D_WIZ
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${CPU_FLAGS} -g")
 
 # Include Directories
-include_directories(HAL APP MCAL/STM32F4 ioLibrary_Driver/Ethernet ioLibrary_Driver/Ethernet/W5500 ioLibrary_Driver/Internet/DHCP)
+include_directories(HAL APP MCAL/STM32F4 ioLibrary_Driver/Ethernet ioLibrary_Driver/Ethernet/W5500 ioLibrary_Driver/Internet/DHCP ioLibrary_Driver/Internet/MQTT ioLibrary_Driver/Internet/MQTT/MQTTPacket/src)
 include_directories(. FreeRTOS/include FreeRTOS/portable/GCC/ARM_CM4F)
 
 # Common MCAL Sources
@@ -53,9 +53,19 @@ set(FREERTOS_SOURCES
 set(RTOS_APP_SOURCES
     APP/cmsis_os2.c
     APP/freertos_tasks.c
+    APP/sparkplug_b_enc.c
     APP/http_server_task.c
     APP/ota_task.c
     HAL/modbus_dma.c
+    ioLibrary_Driver/Internet/MQTT/MQTTClient.c
+    ioLibrary_Driver/Internet/MQTT/mqtt_interface.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTConnectClient.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTDeserializePublish.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTFormat.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTPacket.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSerializePublish.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSubscribeClient.c
+    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTUnsubscribeClient.c
 )
 
 # -------------------------------------------------------------------

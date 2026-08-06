@@ -43,6 +43,7 @@
 #include "mqtt_interface.h"
 #include "wizchip_conf.h"
 #include "socket.h"
+#include "cmsis_os2.h"
 
 unsigned long MilliTimer;
 
@@ -126,12 +127,19 @@ void NewNetwork(Network* n, int sn) {
     @retval received data length or SOCKERR code
 */
 int w5x00_read(Network* n, unsigned char* buffer, int len, long time) {
+    uint32_t start = osKernelGetTickCount();
+    do {
+        uint8_t sr = getSn_SR(n->my_socket);
+        if (sr != SOCK_ESTABLISHED && sr != SOCK_CLOSE_WAIT) {
+            return SOCK_ERROR;
+        }
+        if (getSn_RX_RSR(n->my_socket) > 0) {
+            return recv(n->my_socket, buffer, len);
+        }
+        osDelay(1);
+    } while ((osKernelGetTickCount() - start) < (uint32_t)time);
 
-    if ((getSn_SR(n->my_socket) == SOCK_ESTABLISHED) && (getSn_RX_RSR(n->my_socket) > 0)) {
-        return recv(n->my_socket, buffer, len);
-    }
-
-    return SOCK_ERROR;
+    return 0; /* Timeout: no data read, but socket is still healthy */
 }
 
 /*
@@ -168,7 +176,7 @@ void w5x00_disconnect(Network* n) {
     @retval SOCKOK code or SOCKERR code
 */
 int ConnectNetwork(Network* n, uint8_t* ip, uint16_t port) {
-    uint16_t myport = 12345;
+    uint16_t myport = 0; /* Use dynamic random port allocation to avoid port conflicts */
 
     if (socket(n->my_socket, Sn_MR_TCP, myport, 0) != n->my_socket) {
         return SOCK_ERROR;

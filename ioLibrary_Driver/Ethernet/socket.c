@@ -483,6 +483,17 @@ static int8_t connect_IO_6(uint8_t sn, uint8_t * addr, uint16_t port, uint8_t ad
         if (getSn_SR(sn) == SOCK_CLOSED) {
             return SOCKERR_SOCKCLOSED;
         }
+
+        /* Yield 1ms so higher-priority tasks (HTTP server, Control Engine)
+         * can run while we wait for the TCP handshake / ARP to complete.
+         * Without this yield the W5500 ARP timeout (~3s) starves all other
+         * tasks and drops the web browser connection. */
+        {
+#ifdef USE_FREERTOS
+            extern void osDelay(uint32_t);
+            osDelay(1);
+#endif
+        }
     }
 
     return SOCK_OK;
@@ -503,6 +514,12 @@ int8_t disconnect(uint8_t sn) {
             if (getSn_IR(sn) & Sn_IR_TIMEOUT) {
                 close(sn);
                 return SOCKERR_TIMEOUT;
+            }
+            {
+#ifdef USE_FREERTOS
+                extern void osDelay(uint32_t);
+                osDelay(1);
+#endif
             }
         }
     }
