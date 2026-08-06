@@ -72,6 +72,7 @@ void Modbus_DMA_Init(void) {
         cfg.relay_count = 0;
         cfg.serial = 1; /* default serial for a fresh device */
         cfg.mqtt_port = 1883;
+        cfg.mqtt_send_mode = 0;
         Update_Shared_Config(&cfg);
     }
 }
@@ -94,153 +95,339 @@ void Modbus_DMA_Init(void) {
  *   snapshot and never touches UART. The HTTP/OTA tasks (priority 1-2) are
  *   the ones starved during the busy-wait, which is acceptable.
  */
-static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc, uint16_t reg, uint8_t num, uint16_t *out) {
+/*
+ * Modbus_Safe_Transaction — one blocking RS485 read (polling, no DMA).
+ *
+ * timeout_ms: how long to wait for the slave's first byte.
+ *   Fast sensors (pH/ORP/EC/Ammonia/Ultrasonic): 80ms  — respond in <50ms
+ *   Slow sensors (DO KWS-630):                  300ms  — response can take >100ms
+ *   Multi-US per channel:                        80ms  — each channel is fast
+ *
+ * WHY timeout matters for stability:
+ *   Old code used a fixed 250ms for ALL sensors. A dead sensor wastes 250ms
+ *   before the next poll starts. With 5 configured sensors and 2 missing:
+ *   2 × 250ms = 500ms wasted per cycle, causing data to look stale and the
+ *   MQTT payload to always be incomplete.
+ */
+static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
+                                          uint16_t reg, uint8_t num,
+                                          uint16_t *out, uint32_t timeout_ms) {
     uint8_t f[8] = {slave, fc, reg>>8, reg&0xFF, 0, num, 0, 0};
     uint16_t crc = Modbus_CRC16(f, 6);
     f[6] = crc & 0xFF; f[7] = crc >> 8;
 
-    volatile uint32_t sr = USART3->SR; volatile uint32_t dr = USART3->DR; (void)sr; (void)dr;
+    /* 1. Flush any stale bytes from UART RX buffer to guarantee a clean start */
+    while (USART3->SR & (1U << 5)) {
+        volatile uint32_t junk = USART3->DR;
+        (void)junk;
+    }
+    /* Clear error flags */
+    if (USART3->SR & 0x0F) {
+        volatile uint32_t junk_dr = USART3->DR;
+        (void)junk_dr;
+    }
 
+    /* 2. Switch MAX485 to TX mode and settle without yielding the CPU */
     MAX485_TX();
-    osDelay(2); /* 2ms: settle time for MAX485 direction switch (RE#/DE via PD2/PD3).
-                 * Fixed by transceiver physics — the driver needs this before
-                 * the first TX byte, otherwise the request is truncated. */
+    for (volatile int d = 0; d < 2000; d++); /* microsecond settle delay */
+
+    /* 3. Send Modbus query */
     for(int i=0; i<8; i++) {
-        while(!(USART3->SR & (1U << 7)));
+        uint32_t tx_timeout = 10000;
+        while(!(USART3->SR & (1U << 7)) && --tx_timeout);
         USART3->DR = f[i];
     }
     uint32_t tc_timeout = 20000;
     while(!(USART3->SR & (1U << 6)) && --tc_timeout);
+
+    /* 4. Switch back to RX mode immediately */
     MAX485_RX();
 
+    /* 5. Read response with noise rejection state machine */
     uint8_t rx[50]; int received = 0;
     uint32_t start = osKernelGetTickCount();
-    /* RX wait window: up to 100ms. This is the single biggest per-transaction
-     * blocker. It must be large enough to cover the slave's reply latency
-     * (most Modbus slaves take 10-100ms to answer). Cannot be 1ms. */
-    while((osKernelGetTickCount() - start) < 100) {
+    
+    static uint32_t yield_ctr = 0;
+    while((osKernelGetTickCount() - start) < timeout_ms) {
         if(USART3->SR & (1U << 5)) {
-            if(received < 50) rx[received++] = (uint8_t)USART3->DR;
-            if(received >= (3 + num*2 + 2)) break;
+            uint8_t b = (uint8_t)USART3->DR;
+            yield_ctr = 0; /* reset yield counter on every received byte */
+
+            /* Reject leading noise: first byte must be the target slave ID */
+            if (received == 0 && b != slave) {
+                continue;
+            }
+            
+            /* Reject frame shift: second byte must match function code */
+            if (received == 1 && b != fc) {
+                received = 0;
+                if (b == slave) {
+                    rx[received++] = b;
+                }
+                continue;
+            }
+            
+            if(received < 50) {
+                rx[received++] = b;
+            }
+            
+            /* Check if we got the expected packet length */
+            if(received >= (3 + num*2 + 2)) {
+                break;
+            }
+        } else {
+            /* No byte yet — yield every ~500 iterations so lower-priority tasks
+             * (HTTP dashboard, MQTT client) can still respond while we wait for
+             * a slow or absent sensor. The 1ms ControlEngine is unaffected by
+             * this: its priority (5) > Modbus (3), so it preempts us on the tick
+             * regardless. */
+            if (++yield_ctr >= 500) {
+                yield_ctr = 0;
+                taskYIELD();
+            }
         }
-        if(USART3->SR & 0x0F) { volatile uint32_t d = USART3->DR; (void)d; }
+        
+        /* Clean any hardware errors (Overrun, Framing, Noise) on the fly */
+        if(USART3->SR & 0x0F) {
+            volatile uint32_t d = USART3->DR;
+            (void)d;
+        }
     }
+    
     if(received < 5 || rx[0] != slave || rx[1] != fc) return 0;
     if(Modbus_CRC16(rx, received-2) != (rx[received-2]|(rx[received-1]<<8))) return 0;
+    
     for(int i=0; i<num; i++) out[i] = (rx[3+i*2]<<8) | rx[4+i*2];
     return 1;
 }
 
+/* Backward-compatible wrapper with optimized 40ms default */
+static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc,
+                                        uint16_t reg, uint8_t num,
+                                        uint16_t *out) {
+    return Modbus_Safe_Transaction_T(slave, fc, reg, num, out, 40);
+}
+
 void Modbus_DMA_PollSensors(void) {
+    /* ----------------------------------------------------------------
+     * Latency & Timing Optimization:
+     * - Fast sensors (pH/EC/ORP/Ammonia) use 40ms timeout.
+     * - DO KWS-630 uses 150ms timeout.
+     * - We read only ONE Multi-US channel or ONE slow sensor sub-step
+     *   per poll cycle, OR we limit Multi-US polling to avoid starvation.
+     *   Since Multi-US has 8 channels, polling them all at once takes too
+     *   long. We now poll 2 channels of the Multi-US board per cycle,
+     *   distributing the 8 channels over 4 cycles.
+     * ---------------------------------------------------------------- */
     Modbus_SensorData_t local;
     Get_Shared_Sensor_Data(&local);
     Gateway_Config_t cfg;
     Get_Shared_Config(&cfg);
     uint16_t rs[12];
 
-    local.readings_count = 0;
-    local.multi_us_count = 0;
-    memset(local.readings, 0, sizeof(local.readings));
-    memset(local.multi_us, 0, sizeof(local.multi_us));
+    /* Keep track of Multi-US channel index across poll cycles to distribute load */
+    static uint8_t multi_us_channel_offset = 0;
+
+    /* Sync the slot count to match the current config.
+     * Carry over values for slots that match by (type, id). */
+    if (local.readings_count != cfg.sensors.count) {
+        Modbus_SensorData_t tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.multi_us_count = 0;
+
+        for (uint8_t s = 0; s < cfg.sensors.count && s < MAX_SENSORS; s++) {
+            uint8_t t = cfg.sensors.entries[s].type;
+            uint8_t id = cfg.sensors.entries[s].id;
+            tmp.readings[s].type  = t;
+            tmp.readings[s].id    = id;
+            tmp.readings[s].stale = 1;
+            tmp.readings[s].valid = 0;
+
+            for (uint8_t k = 0; k < local.readings_count; k++) {
+                if (local.readings[k].type == t && local.readings[k].id == id) {
+                    tmp.readings[s].value      = local.readings[k].value;
+                    tmp.readings[s].temp       = local.readings[k].temp;
+                    tmp.readings[s].last_ok_ms = local.readings[k].last_ok_ms;
+                    tmp.readings[s].stale      = local.readings[k].stale;
+                    break;
+                }
+            }
+        }
+        tmp.readings_count = cfg.sensors.count;
+        local = tmp;
+    }
+
+    uint8_t mu_idx = 0;
 
     for (uint8_t s = 0; s < cfg.sensors.count && s < MAX_SENSORS; s++) {
         uint8_t type = cfg.sensors.entries[s].type;
         uint8_t sid  = cfg.sensors.entries[s].id;
-        SensorReading_t *rd = &local.readings[local.readings_count];
+        SensorReading_t *rd = &local.readings[s];
+
         rd->type = type;
         rd->id   = sid;
-        rd->valid = 0;
+
+        uint8_t ok = 0;
 
         switch (type) {
-            case 1: /* pH  */
-                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+            case 1: /* pH — fast sensor, 40ms timeout */
+                if (Modbus_Safe_Transaction_T(sid, 0x03, 0, 2, rs, 40)) {
                     rd->value = rs[0] / 100.0f;
                     rd->temp  = rs[1] / 100.0f;
-                    rd->valid = 1;
+                    ok = 1;
                 }
                 break;
-            case 2: /* ORP */
-                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+
+            case 2: /* ORP — fast, 40ms */
+                if (Modbus_Safe_Transaction_T(sid, 0x03, 0, 2, rs, 40)) {
                     rd->value = (float)rs[0];
                     rd->temp  = rs[1] / 100.0f;
-                    rd->valid = 1;
+                    ok = 1;
                 }
                 break;
-            case 3: /* EC  */
-                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+
+            case 3: /* EC — fast, 40ms */
+                if (Modbus_Safe_Transaction_T(sid, 0x03, 0, 2, rs, 40)) {
                     rd->value = rs[0] / 10.0f;
                     rd->temp  = rs[1] / 100.0f;
-                    rd->valid = 1;
+                    ok = 1;
                 }
                 break;
-            case 4: /* DO  */
-                if (Modbus_Safe_Transaction(sid, 0x03, 0x2600, 6, rs)) {
+
+            case 4: /* DO (KWS-630) — slow sensor, 150ms timeout */
+                if (Modbus_Safe_Transaction_T(sid, 0x03, 0x2600, 6, rs, 150)) {
                     rd->temp  = Decode_Float_DCBA(rs[0], rs[1]);
                     rd->value = Decode_Float_DCBA(rs[4], rs[5]);
-                    rd->valid = 1;
+                    ok = 1;
                 }
                 break;
-            case 5: /* Ammonia */
-                if (Modbus_Safe_Transaction(sid, 0x03, 0, 2, rs)) {
+
+            case 5: /* Ammonia — fast, 40ms */
+                if (Modbus_Safe_Transaction_T(sid, 0x03, 0, 2, rs, 40)) {
                     rd->value = (float)rs[0];
                     rd->temp  = rs[1] / 100.0f;
-                    rd->valid = 1;
+                    ok = 1;
                 }
                 break;
-            case 6: /* Ultrasonic (single) */
-                if (Modbus_Safe_Transaction(sid, 0x03, 0, 10, rs)) {
+
+            case 6: /* Ultrasonic single — fast, 40ms */
+                if (Modbus_Safe_Transaction_T(sid, 0x03, 0, 10, rs, 40)) {
                     rd->temp  = rs[8] / 10.0f;
                     rd->value = rs[9] / 10.0f;
-                    rd->valid = 1;
+                    ok = 1;
                 }
                 break;
-            case 7: /* Multi-US board */
-                if (local.multi_us_count < MAX_MULTI_US) {
-                    MultiUS_t *mu = &local.multi_us[local.multi_us_count];
-                    memset(mu, 0, sizeof(*mu));
+
+            case 7: /* Multi-US board — 8 channels */
+                if (mu_idx < MAX_MULTI_US) {
+                    MultiUS_t *mu = &local.multi_us[mu_idx];
+                    
+                    /* Restore previous board metadata */
+                    for (uint8_t k = 0; k < local.multi_us_count; k++) {
+                        if (local.multi_us[k].id == sid) {
+                            *mu = local.multi_us[k];
+                            break;
+                        }
+                    }
                     mu->id = sid;
+
+                    /* Poll 2 channels of the 8 in this cycle to avoid blocking the bus */
+                    for (uint8_t c = 0; c < 2; c++) {
+                        uint8_t ch = (multi_us_channel_offset + c) % 8;
+                        if (Modbus_Safe_Transaction_T(sid, 0x03, ch * 0x10, 3, rs, 40)) {
+                            mu->dist[ch] = (float)rs[0];
+                        }
+                        osDelay(15); /* 15ms inter-channel gap for line discharge */
+                    }
+
+                    /* Calculate average from all channels that have valid values */
                     uint32_t sum = 0; uint8_t valid = 0;
                     for (uint8_t i = 0; i < 8; i++) {
-                        if (Modbus_Safe_Transaction(sid, 0x03, i * 0x10, 3, rs)) {
-                            mu->dist[i] = (float)rs[0];
-                            sum += rs[0]; valid++;
-                        } else {
-                            mu->dist[i] = -1000.0f;
+                        if (mu->dist[i] > 0.0f && mu->dist[i] < 10000.0f) {
+                            sum += (uint32_t)mu->dist[i];
+                            valid++;
                         }
-                        osDelay(20); /* 20ms between the 8 distance reads of one
-                                      * Multi-US board: gives the board time to
-                                      * refresh each channel + Modbus gap. A full
-                                      * board costs 8x(transaction ~21ms + 20ms). */
                     }
-                    if (valid) mu->avg = (float)(sum / valid);
-                    if (Modbus_Safe_Transaction(sid, 0x03, 0x0080, 3, rs)) {
-                        mu->temp = rs[0] / 10.0f;
+                    if (valid > 0) {
+                        mu->avg = (float)(sum / valid);
+                        ok = 1;
                     }
-                    if (Modbus_Safe_Transaction(sid, 0x04, 0x0000, 3, rs)) {
-                        mu->comp = (float)rs[2];
-                        if (!valid) mu->avg = (float)rs[0];
-                        if (valid == 0) mu->temp = rs[1] / 10.0f;
+
+                    /* Poll temp & config compensation once in a while */
+                    if (multi_us_channel_offset == 0) {
+                        if (Modbus_Safe_Transaction_T(sid, 0x03, 0x0080, 3, rs, 40)) {
+                            mu->temp = rs[0] / 10.0f;
+                        }
+                        if (Modbus_Safe_Transaction_T(sid, 0x04, 0x0000, 3, rs, 40)) {
+                            mu->comp = (float)rs[2];
+                        }
                     }
-                    local.multi_us_count++;
+
+                    if (mu_idx >= local.multi_us_count) local.multi_us_count = mu_idx + 1;
+                    mu_idx++;
                     rd->value = mu->avg;
                     rd->temp  = mu->temp;
-                    rd->valid = valid;
                 }
                 break;
+
             default:
                 break;
         }
 
-        if (rd->valid) local.readings_count++;
-        osDelay(50); /* 50ms gap AFTER each sensor: spacing between consecutive
-                      * RS485 transactions so a slow sensor's reply never
-                      * collides with the next poll. With N configured sensors,
-                      * one full cycle = N x (transaction ~21ms + 50ms). This is
-                      * the "Modbus poll cycle" — it is inherently >> 1ms. */
+        if (ok) {
+            rd->valid      = 1;
+            rd->stale      = 0;
+            rd->last_ok_ms = osKernelGetTickCount();
+        } else {
+            /* Keep last-known-good value; mark as not valid THIS cycle */
+            rd->valid = 0;
+            /* stale = 1 only if we've NEVER had a good read */
+            if (rd->last_ok_ms > 0) rd->stale = 0;
+        }
+
+        /* 35ms inter-sensor gap (was 15ms) — guarantees line settle time between different devices */
+        osDelay(35);
     }
+
+    /* Advance the distributed channel offset for the next poll cycle */
+    multi_us_channel_offset = (multi_us_channel_offset + 2) % 8;
 
     local.last_update_time = osKernelGetTickCount();
     Update_Shared_Sensor_Data(&local);
+}
+
+void Modbus_DMA_ConsumeBatch(TelemetryBatch_t *dest) {
+    if (!dest) return;
+
+    if (osKernelGetState() != osKernelRunning || sensorMutex == NULL) {
+        dest->count = sharedSensorData.readings_count;
+        for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
+            SensorReading_t *rd = &sharedSensorData.readings[i];
+            dest->records[i].type = rd->type;
+            dest->records[i].id   = rd->id;
+            dest->records[i].avg_value         = rd->value;
+            dest->records[i].avg_temp          = rd->temp;
+            dest->records[i].samples_collected = 1;
+            dest->records[i].valid             = rd->valid;
+        }
+        return;
+    }
+
+    if (osMutexAcquire(sensorMutex, 50) == osOK) {
+        dest->count = sharedSensorData.readings_count;
+        for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
+            SensorReading_t *rd = &sharedSensorData.readings[i];
+            dest->records[i].type = rd->type;
+            dest->records[i].id   = rd->id;
+            dest->records[i].avg_value         = rd->value;
+            dest->records[i].avg_temp          = rd->temp;
+            dest->records[i].samples_collected = 1;
+            dest->records[i].valid             = rd->valid;
+        }
+        osMutexRelease(sensorMutex);
+    } else {
+        dest->count = 0;
+    }
 }
 
 void Modbus_DMA_PerformScan(void) {
@@ -285,9 +472,12 @@ void Get_Shared_Sensor_Data(Modbus_SensorData_t *dest) {
         return;
     }
 
-    if(osMutexAcquire(sensorMutex, 100) == osOK) {
+    if(osMutexAcquire(sensorMutex, 10) == osOK) { /* 10ms timeout — copy is fast */
         memcpy(dest, &sharedSensorData, sizeof(Modbus_SensorData_t));
         osMutexRelease(sensorMutex);
+    } else {
+        /* Timeout: return stale copy rather than blocking the caller */
+        memcpy(dest, &sharedSensorData, sizeof(Modbus_SensorData_t));
     }
 }
 
@@ -297,10 +487,11 @@ void Update_Shared_Sensor_Data(const Modbus_SensorData_t *src) {
         return;
     }
 
-    if(osMutexAcquire(sensorMutex, 100) == osOK) {
+    if(osMutexAcquire(sensorMutex, 10) == osOK) { /* 10ms timeout — copy is fast */
         memcpy(&sharedSensorData, src, sizeof(Modbus_SensorData_t));
         osMutexRelease(sensorMutex);
     }
+    /* On timeout: drop the update rather than stalling; Modbus will retry next cycle */
 }
 
 void Get_Shared_Config(Gateway_Config_t *dest) {

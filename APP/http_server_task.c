@@ -24,6 +24,7 @@
  */
 
 #include "http_server_task.h"
+#include "freertos_tasks.h"
 #include "web_assets.h"
 #include "modbus_dma.h"
 #include "flash_stm32.h"
@@ -32,6 +33,8 @@
 #include "gpio_stm32.h"
 #include "socket.h"
 #include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "portable.h"   /* xPortGetFreeHeapSize, configTOTAL_HEAP_SIZE */
 #include <string.h>
 #include <stdio.h>
 
@@ -43,6 +46,7 @@ volatile uint32_t ota_content_length  = 0;
 volatile uint8_t  ota_otp_validated   = 0;
 volatile uint8_t  ota_write_done      = 0;
 volatile uint8_t  ota_write_ok        = 0;
+volatile OTA_Debug_t g_ota_debug      = {0};
 
 osSemaphoreId_t   sem_ota_start = NULL;
 osSemaphoreId_t   sem_ota_done  = NULL;
@@ -68,11 +72,15 @@ void Relay_SetState(uint8_t idx, uint8_t state);
  *  Buffer — kept static to avoid stack pressure
  * ====================================================================== */
 static uint8_t rx_buf[RX_BUF_SIZE];
-static char    tx_buf[4096];
+static char    tx_buf[6144];  /* Sized for max /api/status JSON:
+                               *   16 sensors × ~80B = 1280B
+                               *   16 relays  × ~60B =  960B
+                               *   mqtt/ota/sys fields  ~800B
+                               *   HTTP header          ~200B
+                               *   headroom            ~904B
+                               *   Total ≈ 4244B → 6144B safe margin */
 
-/* OTA page buffer — drains W5500 before flash erase to prevent RX overflow */
-#define OTA_PAGE_SIZE 7168U
-static uint8_t ota_page_buf[OTA_PAGE_SIZE];
+
 
 /* ======================================================================
  *  Static working buffers for JSON_StatusResponse
@@ -86,7 +94,7 @@ static wiz_NetInfo         s_ni;
 /* ======================================================================
  *  JSON helpers (no dynamic allocation, snprintf into tx_buf)
  * ====================================================================== */
-static const char *SensorTypeName(uint8_t type) {
+const char *SensorTypeName(uint8_t type) {
     switch (type) {
         case 1: return "ph";
         case 2: return "orp";
@@ -117,9 +125,15 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         uint8_t valid = 0;
         for (uint8_t j = 0; j < s_sd.readings_count && j < MAX_SENSORS; j++) {
             if (s_sd.readings[j].type == type && s_sd.readings[j].id == id) {
-                val = s_sd.readings[j].value;
-                tmp = s_sd.readings[j].temp;
-                valid = s_sd.readings[j].valid;
+                val   = s_sd.readings[j].value;
+                tmp   = s_sd.readings[j].temp;
+                /* valid=1 if we EVER had a good reading (last_ok_ms>0).
+                 * This prevents the sensor card from flickering/disappearing
+                 * on every Modbus polling cycle that happens to miss a response.
+                 * The per-cycle readings[j].valid is only 1 for the exact cycle
+                 * a response arrived, so using it directly causes the dashboard
+                 * to show no value for most of the time between polls. */
+                valid = (s_sd.readings[j].last_ok_ms > 0) ? 1 : 0;
                 break;
             }
         }
@@ -167,11 +181,74 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
         "\"serial\":\"KX-%07lu\","
         "\"ip\":\"%d.%d.%d.%d\","
-        "\"fw\":\"" FW_VERSION "\"}",
+        "\"fw\":\"" FW_VERSION "\","
+        "\"device_id\":\"%s\","
+        "\"provision_status\":\"%s\","
+        "\"provision_message\":\"%s\","
+        "\"sparkplug_topic\":\"%s\","
+        "\"pending_sparkplug_topic\":\"%s\","
+        "\"mqtt\":{"
+          "\"connected\":%u,"
+          "\"interval\":%lu,"
+          "\"send_mode\":%u,"
+          "\"active_topic\":\"%s\","
+          "\"broker\":\"%s\","
+          "\"port\":%u,"
+          "\"client_id\":\"%s\","
+          "\"username\":\"%s\","
+          "\"log\":["
+        ,
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         (unsigned long)s_cfg.serial,
-        s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3]);
+        s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
+        s_cfg.device_id, s_cfg.provision_status, s_cfg.provision_message, s_cfg.sparkplug_topic,
+        s_cfg.pending_sparkplug_topic,
+        g_mqtt_status.connected, (unsigned long)s_cfg.mqtt_interval, s_cfg.mqtt_send_mode, g_mqtt_status.active_topic,
+        s_cfg.mqtt_broker, s_cfg.mqtt_port, s_cfg.mqtt_client_id, s_cfg.mqtt_username);
+
+    for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"topic\":\"%s\",\"success\":%u,\"time\":%lu}%s",
+            g_mqtt_status.log[i].topic,
+            g_mqtt_status.log[i].success,
+            (unsigned long)g_mqtt_status.log[i].timestamp,
+            (i < g_mqtt_status.log_count - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]},\"ota_debug\":{"
+        "\"fw_size\":%lu,"
+        "\"computed_crc\":\"0x%08lX\","
+        "\"staged_sp\":\"0x%08lX\","
+        "\"sp_valid\":%u,"
+        "\"meta_magic\":\"0x%08lX\","
+        "\"meta_status\":\"0x%08lX\","
+        "\"meta_size\":%lu,"
+        "\"meta_crc32\":\"0x%08lX\","
+        "\"meta_ok\":%u,"
+        "\"write_ok\":%u,"
+        "\"step\":%lu"
+        "}",          /* close ota_debug only — root object still open */
+        (unsigned long)g_ota_debug.fw_size,
+        (unsigned long)g_ota_debug.computed_crc,
+        (unsigned long)g_ota_debug.staged_sp,
+        g_ota_debug.sp_valid,
+        (unsigned long)g_ota_debug.meta_magic,
+        (unsigned long)g_ota_debug.meta_status,
+        (unsigned long)g_ota_debug.meta_size,
+        (unsigned long)g_ota_debug.meta_crc32,
+        g_ota_debug.meta_ok,
+        g_ota_debug.write_ok,
+        (unsigned long)g_ota_debug.step);
+
+    /* CPU and RAM (Heap) stats — appended inside root object, then close it */
+    size_t heap_free  = xPortGetFreeHeapSize();
+    size_t heap_total = configTOTAL_HEAP_SIZE;
+    pos += snprintf(buf + pos, buflen - pos,
+        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u}}",
+        /* ↑ note trailing }} : closes sys object AND root object         */
+        (unsigned)g_cpu_usage_pct,
+        (unsigned)heap_free,
+        (unsigned)heap_total);
 
     return pos;
 }
@@ -313,6 +390,44 @@ static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
 }
 
 /* ======================================================================
+ *  Flash Aligned Writer Helper (prevents unaligned programming errors)
+ * ====================================================================== */
+typedef struct {
+    uint32_t write_addr;
+    uint8_t  cache[4];
+    uint8_t  cache_len;
+} Flash_Aligned_Writer_t;
+
+static void Flash_Writer_Init(Flash_Aligned_Writer_t *w, uint32_t start_addr) {
+    w->write_addr = start_addr;
+    w->cache_len  = 0;
+}
+
+static void Flash_Writer_Write(Flash_Aligned_Writer_t *w, const uint8_t *data, uint32_t len) {
+    for (uint32_t i = 0; i < len; i++) {
+        w->cache[w->cache_len++] = data[i];
+        if (w->cache_len == 4) {
+            uint32_t word = *(const uint32_t *)w->cache;
+            FLASH_WriteWord(w->write_addr, word);
+            w->write_addr += 4;
+            w->cache_len = 0;
+        }
+    }
+}
+
+static void Flash_Writer_Flush(Flash_Aligned_Writer_t *w) {
+    if (w->cache_len > 0) {
+        uint32_t word = 0xFFFFFFFFU;
+        for (uint8_t i = 0; i < w->cache_len; i++) {
+            ((uint8_t *)&word)[i] = w->cache[i];
+        }
+        FLASH_WriteWord(w->write_addr, word);
+        w->write_addr += 4;
+        w->cache_len = 0;
+    }
+}
+
+/* ======================================================================
  *  Request dispatcher
  * ====================================================================== */
 static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
@@ -345,8 +460,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/status", 15) == 0) {
         int n = JSON_StatusResponse(tx_buf, sizeof(tx_buf));
-        send(sn, (uint8_t *)HTTP_200_JSON, strlen(HTTP_200_JSON));
-        send(sn, (uint8_t *)tx_buf, (uint16_t)n);
+        char status_hdr[160];
+        snprintf(status_hdr, sizeof(status_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            n);
+        send(sn, (uint8_t *)status_hdr, (uint16_t)strlen(status_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
         return;
     }
 
@@ -499,6 +622,72 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
+     * POST /api/config/mqtt/confirm_topic  → Confirm pending topic from API
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/mqtt/confirm_topic", 35) == 0) {
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+        if (cfg.pending_sparkplug_topic[0] != '\0') {
+            strncpy(cfg.sparkplug_topic, cfg.pending_sparkplug_topic, sizeof(cfg.sparkplug_topic) - 1);
+            cfg.sparkplug_topic[sizeof(cfg.sparkplug_topic) - 1] = '\0';
+            cfg.pending_sparkplug_topic[0] = '\0';
+            cfg.magic = CONFIG_MAGIC_CURRENT;
+            Update_Shared_Config(&cfg);
+
+            /* Persist to flash */
+            FLASH_EraseSector(11);
+            FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        }
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/config/mqtt/reject_topic  → Reject pending topic from API
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/mqtt/reject_topic", 34) == 0) {
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+        cfg.pending_sparkplug_topic[0] = '\0';
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&cfg);
+
+        /* Persist to flash */
+        FLASH_EraseSector(11);
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/config/mqtt/delete  → Clear MQTT broker settings & disconnect
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/mqtt/delete", 28) == 0) {
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+        
+        memset(cfg.mqtt_broker, 0, sizeof(cfg.mqtt_broker));
+        cfg.mqtt_port = 1883;
+        memset(cfg.mqtt_client_id, 0, sizeof(cfg.mqtt_client_id));
+        memset(cfg.mqtt_username, 0, sizeof(cfg.mqtt_username));
+        memset(cfg.mqtt_password, 0, sizeof(cfg.mqtt_password));
+        memset(cfg.sparkplug_topic, 0, sizeof(cfg.sparkplug_topic));
+        cfg.mqtt_interval = 5;
+        cfg.mqtt_send_mode = 0;
+        
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&cfg);
+
+        /* Persist to flash */
+        FLASH_EraseSector(11);
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
      * POST /api/config/mqtt  → MQTT broker config
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/config/mqtt", 21) == 0) {
@@ -513,6 +702,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         JSON_ReadStr(body, "client_id", cfg.mqtt_client_id, sizeof(cfg.mqtt_client_id));
         JSON_ReadStr(body, "username",  cfg.mqtt_username,  sizeof(cfg.mqtt_username));
         JSON_ReadStr(body, "password",  cfg.mqtt_password,  sizeof(cfg.mqtt_password));
+        JSON_ReadStr(body, "sparkplug_topic", cfg.sparkplug_topic, sizeof(cfg.sparkplug_topic));
 
         const char *port_v = JSON_FindValue(body, "port");
         if (port_v) {
@@ -521,10 +711,143 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cfg.mqtt_port = p;
         }
 
+        const char *int_v = JSON_FindValue(body, "interval");
+        if (int_v) {
+            uint32_t iv = 0;
+            while (*int_v >= '0' && *int_v <= '9') { iv = iv * 10 + (*int_v - '0'); int_v++; }
+            if (iv > 0) cfg.mqtt_interval = iv;
+        }
+
+        const char *sm_v = JSON_FindValue(body, "send_mode");
+        if (sm_v && *sm_v >= '0' && *sm_v <= '9') {
+            cfg.mqtt_send_mode = (uint8_t)(*sm_v - '0');
+        }
+
         cfg.magic = CONFIG_MAGIC_CURRENT; /* Ensure CONFIG_MAGIC is saved */
         Update_Shared_Config(&cfg);
 
         /* Persist */
+        FLASH_EraseSector(11);
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/provision/delete  → Clear provisioning data
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/provision/delete", 26) == 0) {
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+        
+        memset(cfg.device_id, 0, sizeof(cfg.device_id));
+        memset(cfg.provision_status, 0, sizeof(cfg.provision_status));
+        memset(cfg.provision_message, 0, sizeof(cfg.provision_message));
+        memset(cfg.sparkplug_topic, 0, sizeof(cfg.sparkplug_topic));
+        memset(cfg.pending_sparkplug_topic, 0, sizeof(cfg.pending_sparkplug_topic));
+        
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&cfg);
+
+        /* Persist to flash */
+        FLASH_EraseSector(11);
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/provision/manual  → Manually provision device
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/provision/manual", 26) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
+        body += 4;
+
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+        
+        JSON_ReadStr(body, "device_id", cfg.device_id, sizeof(cfg.device_id));
+        JSON_ReadStr(body, "sparkplug_topic", cfg.sparkplug_topic, sizeof(cfg.sparkplug_topic));
+        
+        /* If manual topic is empty, generate standard Sparkplug B topic path */
+        if (cfg.sparkplug_topic[0] == '\0') {
+            snprintf(cfg.sparkplug_topic, sizeof(cfg.sparkplug_topic), "spBv1.0/KontrxGroup/DDATA/%s", cfg.device_id);
+        }
+        
+        strncpy(cfg.provision_status, "Active", sizeof(cfg.provision_status) - 1);
+        cfg.provision_status[sizeof(cfg.provision_status) - 1] = '\0';
+        
+        snprintf(cfg.provision_message, sizeof(cfg.provision_message), "Manually provisioned via Web UI");
+        
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&cfg);
+
+        /* Persist to flash */
+        FLASH_EraseSector(11);
+        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/provision  → Receive provisioning data from mobile app
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/provision", 19) == 0 ||
+        strncmp(line, "POST /api/config/provision", 26) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
+        body += 4;
+
+        Gateway_Config_t cfg;
+        Get_Shared_Config(&cfg);
+
+        JSON_ReadStr(body, "deviceId",       cfg.device_id,         sizeof(cfg.device_id));
+        JSON_ReadStr(body, "status",         cfg.provision_status,  sizeof(cfg.provision_status));
+        JSON_ReadStr(body, "message",        cfg.provision_message, sizeof(cfg.provision_message));
+
+        /* Parse MQTT Broker IP — try all field name variants from mobile app */
+        char broker[64] = {0};
+        JSON_ReadStr(body, "mqttBroker", broker, sizeof(broker));
+        if (broker[0] == '\0') JSON_ReadStr(body, "brokerUrl", broker, sizeof(broker));
+        if (broker[0] == '\0') JSON_ReadStr(body, "broker",    broker, sizeof(broker));
+        if (broker[0] != '\0') {
+            strncpy(cfg.mqtt_broker, broker, sizeof(cfg.mqtt_broker) - 1);
+            cfg.mqtt_broker[sizeof(cfg.mqtt_broker) - 1] = '\0';
+        }
+
+        /* Parse broker port — default to 1883 (standard MQTT) if not provided */
+        const char *port_v = JSON_FindValue(body, "port");
+        if (port_v && *port_v >= '0' && *port_v <= '9') {
+            uint16_t p = 0;
+            while (*port_v >= '0' && *port_v <= '9') { p = p * 10 + (*port_v - '0'); port_v++; }
+            if (p > 0) cfg.mqtt_port = p;
+        }
+        if (cfg.mqtt_port == 0) {
+            cfg.mqtt_port = 1883; /* default MQTT port */
+        }
+
+        /* Parse MQTT topic from provisioning — saves to pending_sparkplug_topic for user confirmation */
+        {
+            char prov_topic[128] = {0};
+            JSON_ReadStr(body, "topic", prov_topic, sizeof(prov_topic));
+            if (prov_topic[0] == '\0')
+                JSON_ReadStr(body, "sparkplugTopic", prov_topic, sizeof(prov_topic));
+            if (prov_topic[0] == '\0')
+                JSON_ReadStr(body, "mqttTopic", prov_topic, sizeof(prov_topic));
+            if (prov_topic[0] != '\0') {
+                strncpy(cfg.pending_sparkplug_topic, prov_topic, sizeof(cfg.pending_sparkplug_topic) - 1);
+                cfg.pending_sparkplug_topic[sizeof(cfg.pending_sparkplug_topic) - 1] = '\0';
+            }
+        }
+
+        cfg.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&cfg);
+
+        /* Persist to Flash sector 11 */
         FLASH_EraseSector(11);
         FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
 
@@ -718,11 +1041,47 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         return;
     }
 
+
+
+    /* -----------------------------------------------------------------
+     * POST /api/ota/prepare  → Erase staging sectors for OTA
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/ota/prepare", 21) == 0) {
+        printf("[OTA] Sending prepare response...\r\n");
+        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nConnection:close\r\n\r\n{\"status\":\"preparing\"}";
+        send(sn, (uint8_t *)resp, strlen(resp));
+        
+        /* Give W5500 and TCP stack 100ms to transmit the HTTP response
+         * before we force disconnect/close and execute the blocking flash erase.
+         * Otherwise, the client receives a connection reset ("Failed to fetch"). */
+        osDelay(100);
+        disconnect(sn);
+        close(sn);
+
+        printf("[OTA] Preparing flash: Erasing sectors 6 and 7...\r\n");
+        
+        /* Suspend Modbus and MQTT tasks during blocking Flash erase to prevent CPU
+         * starvation, watchdog resets, or W5500 SPI contention while CPU is stalled. */
+        extern osThreadId_t g_tid_modbus;
+        extern osThreadId_t g_tid_mqtt;
+        if (g_tid_modbus) vTaskSuspend((TaskHandle_t)g_tid_modbus);
+        if (g_tid_mqtt)   vTaskSuspend((TaskHandle_t)g_tid_mqtt);
+
+        FLASH_EraseSector(6);
+        FLASH_EraseSector(7);
+
+        /* Resume suspended tasks after flash operation finishes */
+        if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
+        if (g_tid_mqtt)   vTaskResume((TaskHandle_t)g_tid_mqtt);
+
+        printf("[OTA] Flash erase complete.\r\n");
+        return;
+    }
+
     /* -----------------------------------------------------------------
      * POST /update  → OTA binary upload
      * Check OTP header, then stream body to staging flash area.
-     * The actual write loop is done here (Task_HTTPServer context) so
-     * the OTA task only handles CRC verification + metadata write.
+     * Staging sectors are already erased via prepare endpoint.
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /update", 12) == 0) {
 
@@ -744,62 +1103,21 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
 
-        /* --- PHASE 1: Drain W5500 RX buffer into page buffer before
-         * erasing flash. This prevents RX buffer overflow during the long
-         * sector erase (50-100ms per sector). --- */
-        uint32_t page_filled = 0;
-
-        uint32_t write_addr    = STAGING_ADDR;
+        Flash_Aligned_Writer_t writer;
+        Flash_Writer_Init(&writer, STAGING_ADDR);
         uint32_t total_written = 0;
 
-        /* Drain the first body chunk (already in rx_buf after headers) */
+        /* Write the first body chunk (already in rx_buf after headers) */
         uint32_t first_body_len = (uint32_t)(len - (uint32_t)(body - (char *)req));
         if (first_body_len > 0 && total_written < content_length) {
             uint32_t to_copy = content_length - total_written;
             if (first_body_len < to_copy) to_copy = first_body_len;
-            if (to_copy > OTA_PAGE_SIZE - page_filled) to_copy = OTA_PAGE_SIZE - page_filled;
-            memcpy(ota_page_buf + page_filled, body, to_copy);
-            page_filled    += to_copy;
-            total_written  += to_copy;
+            Flash_Writer_Write(&writer, (const uint8_t *)body, to_copy);
+            total_written += to_copy;
         }
 
-        /* Drain remaining W5500 data into page buffer */
+        /* Stream remaining chunks with proper recv checking */
         uint32_t timeout_cnt = 0;
-        while (total_written < content_length && page_filled < OTA_PAGE_SIZE) {
-            uint16_t chunk = getSn_RX_RSR(sn);
-            if (chunk > 0) {
-                timeout_cnt = 0;
-                uint32_t remaining = content_length - total_written;
-                uint32_t buf_space = OTA_PAGE_SIZE - page_filled;
-                if ((uint32_t)chunk > remaining) chunk = (uint16_t)remaining;
-                if ((uint32_t)chunk > buf_space) chunk = (uint16_t)buf_space;
-                int32_t recvd = recv(sn, ota_page_buf + page_filled, chunk);
-                if (recvd > 0) {
-                    page_filled   += (uint32_t)recvd;
-                    total_written += (uint32_t)recvd;
-                }
-            } else {
-                if (getSn_SR(sn) != SOCK_ESTABLISHED) break;
-                osDelay(1);
-                timeout_cnt++;
-                if (timeout_cnt > 10000) break;
-            }
-        }
-
-        /* --- PHASE 2: Erase staging. W5500 buffer is now mostly empty,
-         * giving maximum headroom for data arriving during the erase. --- */
-        FLASH_EraseSector(6);
-        FLASH_EraseSector(7);
-
-        /* Write drained data to flash */
-        if (page_filled > 0) {
-            FLASH_WriteBuffer(write_addr, ota_page_buf, page_filled);
-            write_addr   += page_filled;
-            page_filled   = 0;
-        }
-
-        /* --- PHASE 3: Stream remaining chunks with proper recv checking --- */
-        timeout_cnt = 0;
         while (total_written < content_length) {
             uint16_t chunk = getSn_RX_RSR(sn);
             if (chunk > 0) {
@@ -809,19 +1127,19 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 if ((uint32_t)chunk > remaining) chunk = (uint16_t)remaining;
                 int32_t recvd = recv(sn, rx_buf, chunk);
                 if (recvd > 0) {
-                    FLASH_WriteBuffer(write_addr, rx_buf, (uint32_t)recvd);
-                    write_addr    += (uint32_t)recvd;
+                    Flash_Writer_Write(&writer, rx_buf, (uint32_t)recvd);
                     total_written += (uint32_t)recvd;
                 }
             } else {
                 if (getSn_SR(sn) != SOCK_ESTABLISHED) break;
-                osDelay(1);  /* 1ms wait for more OTA bytes — W5500 RX empty.
-                              * Keeps HTTP task non-busy so Control Engine (1ms)
-                              * and Modbus polling are serviced between chunks. */
+                osDelay(1);  /* 1ms wait for more OTA bytes — W5500 RX empty. */
                 timeout_cnt++;
                 if (timeout_cnt > 10000) break;
             }
         }
+
+        /* Flush remaining bytes in writer cache */
+        Flash_Writer_Flush(&writer);
 
         /* Signal OTA task to verify + write metadata */
         ota_content_length   = total_written;
@@ -864,25 +1182,34 @@ void Task_HTTPServer(void *arg) {
         switch (getSn_SR(HTTP_SOCK)) {
 
         /* ---------------------------------------------------------------
-         * CLOSED → create TCP socket and prepare to listen
+         * CLOSED → create TCP socket and prepare to listen.
+         * After socket() the W5500 needs a few ms to allocate the
+         * socket and transition to SOCK_INIT.  5ms is sufficient.
          * -------------------------------------------------------------- */
         case SOCK_CLOSED:
             if (socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
                 printf("[HTTP] Socket open failed\r\n");
-                osDelay(100); /* 100ms backoff before retrying W5500 socket open.
-                               * W5500 needs this to release the socket struct.
-                               * One-shot; does not touch the 1ms path. */
+                osDelay(100); /* backoff on W5500 socket allocation failure */
+            } else {
+                osDelay(5);   /* let W5500 settle to SOCK_INIT state */
             }
             break;
 
         /* ---------------------------------------------------------------
-         * INIT → start listening for incoming connections
-         * -------------------------------------------------------------- */
+         * INIT → start listening for incoming connections.
+         * After listen() the W5500 needs a few ms to transition its
+         * internal state machine from SOCK_INIT to SOCK_LISTEN.  Without
+         * the delay getSn_SR() still returns SOCK_INIT on the very next
+         * 1ms loop tick, so listen() is called (and printed) again and
+         * again.  10ms is more than enough for the W5500 to settle.
+         * --------------------------------------------------------------- */
         case SOCK_INIT:
             if (listen(HTTP_SOCK) != SOCK_OK) {
                 printf("[HTTP] Listen failed\r\n");
+                osDelay(100);
             } else {
                 printf("[HTTP] Listening on port %u\r\n", HTTP_PORT);
+                osDelay(10);  /* let W5500 settle to SOCK_LISTEN state */
             }
             break;
 
@@ -922,6 +1249,11 @@ void Task_HTTPServer(void *arg) {
                         size = (uint16_t)(sizeof(rx_buf) - 1);
                     recv(HTTP_SOCK, rx_buf, size);
                     Dispatch_Request(HTTP_SOCK, rx_buf, size);
+                    /* Give W5500 TX buffer 20ms to flush all response bytes
+                     * to the browser before we send FIN (disconnect).
+                     * Without this the final TCP segment can be lost when
+                     * the socket transitions too quickly to TIME_WAIT/CLOSED. */
+                    osDelay(20);
                     disconnect(HTTP_SOCK);
                 }
             }
@@ -936,15 +1268,15 @@ void Task_HTTPServer(void *arg) {
 
         /* ---------------------------------------------------------------
          * FIN_WAIT / CLOSING / TIME_WAIT
-         * Force-close the socket instead of waiting for the OS TCP timer.
-         * The W5500 close() command sends RST + recycles the socket to
-         * SOCK_CLOSED immediately, allowing the next browser request
-         * to connect without waiting for TIME_WAIT to expire (~30s).
+         * Force-close the socket so W5500 recycles it to SOCK_CLOSED
+         * immediately — without this, the socket stays stuck and the
+         * server cannot accept any new connections (page refuses to load).
+         * The browser handles the RST cleanly on reconnect.
          * -------------------------------------------------------------- */
         case SOCK_FIN_WAIT:
         case SOCK_CLOSING:
         case SOCK_TIME_WAIT:
-            close(HTTP_SOCK);   /* W5500 close(): forces SOCK_CLOSED */
+            close(HTTP_SOCK);
             break;
 
         default:

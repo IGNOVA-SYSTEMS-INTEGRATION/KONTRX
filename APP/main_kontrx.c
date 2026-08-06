@@ -36,8 +36,36 @@
 #include "wizchip_conf.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "cmsis_os2.h"
 #include <stdio.h>
 #include <string.h>
+
+/* ======================================================================
+ *  W5500 SPI mutex — shared between all tasks that call WIZnet library
+ *  functions (HTTP server socket 0, MQTT client socket 1).  Must be
+ *  acquired before every multi-byte SPI transaction and released after,
+ *  otherwise concurrent access corrupts the W5500 register state and
+ *  causes random ERR_CONNECTION_TIMED_OUT drops in the browser.
+ *
+ *  IMPORTANT: Created with xSemaphoreCreateMutex() (not osMutexNew()) so
+ *  it can be created BEFORE osKernelStart(). osMutexNew() is a CMSIS-RTOS2
+ *  wrapper that internally calls OS services unavailable before the scheduler
+ *  starts, resulting in a NULL handle and an unprotected SPI bus.
+ * ====================================================================== */
+#include "semphr.h"
+SemaphoreHandle_t spiMutex = NULL;
+
+static void SPI_CritEnter(void) {
+    if (spiMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        xSemaphoreTakeRecursive(spiMutex, portMAX_DELAY);
+    }
+}
+static void SPI_CritExit(void) {
+    if (spiMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        xSemaphoreGiveRecursive(spiMutex);
+    }
+}
+
 
 /* ======================================================================
  *  printf → Debug USART1 bridge
@@ -117,6 +145,17 @@ int main(void) {
     /* (Hard reset already done by bootloader's W5500_BootReset() via SPI,
      * so we only need the software reset + init here.) */
 
+    /* Create SPI mutex BEFORE registering WIZnet callbacks.
+     * Use xSemaphoreCreateRecursiveMutex() so that nested critical section
+     * entry (which is extremely common inside WIZnet ioLibrary functions like
+     * high-level socket APIs calling low-level register writes) does not deadlock the task. */
+    spiMutex = xSemaphoreCreateRecursiveMutex();
+    if (!spiMutex) {
+        printf("[SPI] FATAL: spiMutex creation failed!\r\n");
+        while (1);  /* halt — SPI bus would be unprotected */
+    }
+
+    reg_wizchip_cris_cbfunc(SPI_CritEnter, SPI_CritExit); /* SPI bus mutex */
     reg_wizchip_cs_cbfunc(W5500_CS_Select, W5500_CS_Deselect);
     reg_wizchip_spi_cbfunc(W5500_SPI_ReadByte, W5500_SPI_WriteByte);
 
@@ -196,6 +235,7 @@ int main(void) {
     printf("[SYS] Hardware init complete. Starting RTOS...\r\n\r\n");
 
     /* ---- 10. Launch RTOS — does not return ---- */
+    KontrxDWT_Init();   /* Start DWT cycle counter for CPU usage measurement */
     RTOS_Tasks_Init();
 
     /* Unreachable */

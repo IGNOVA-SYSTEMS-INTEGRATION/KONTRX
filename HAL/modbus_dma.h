@@ -10,9 +10,8 @@
 #define MAX_MULTI_US   4
 
 #define SENSOR_TYPE_MULTI_US 7
-/* Bumped 0xC01D0002 -> 0xC01D0003: Gateway_Config_t gained the `serial`
- * field (layout change), so old flash configs must re-init to defaults. */
-#define CONFIG_MAGIC_CURRENT 0xC01D0003U
+/* Bumped 0xC01D0004 -> 0xC01D0005: Added mqtt_interval to Gateway_Config_t. */
+#define CONFIG_MAGIC_CURRENT 0xC01D0005U
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. (beta 1.0.1) */
@@ -35,7 +34,14 @@ typedef struct {
     uint8_t id;
     float   value;
     float   temp;
-    uint8_t valid;
+    uint8_t valid;        /* 1 = last read was good */
+    uint8_t stale;        /* 1 = no successful read yet in this session */
+    uint32_t last_ok_ms;  /* osKernelGetTickCount() of last good read */
+
+    /* Accumulators for sample-count averaging */
+    float    sum_value;
+    float    sum_temp;
+    uint32_t sample_count;
 } SensorReading_t;
 
 /* Multi-US board: 8 distances + avg/comp/temp */
@@ -55,6 +61,21 @@ typedef struct {
     uint8_t  multi_us_count;
     uint32_t last_update_time;
 } Modbus_SensorData_t;
+
+/* Batch Record for MQTT transmission */
+typedef struct {
+    uint8_t  type;
+    uint8_t  id;
+    float    avg_value;
+    float    avg_temp;
+    uint32_t samples_collected;
+    uint8_t  valid;
+} BatchRecord_t;
+
+typedef struct {
+    BatchRecord_t records[MAX_SENSORS];
+    uint8_t       count;
+} TelemetryBatch_t;
 
 /* Relay State Configuration */
 typedef struct {
@@ -78,6 +99,13 @@ typedef struct {
     char mqtt_client_id[32];
     char mqtt_username[32];
     char mqtt_password[32];
+    char device_id[40];
+    char provision_status[24];
+    char provision_message[128];
+    char sparkplug_topic[128];
+    char pending_sparkplug_topic[128]; /* New topic received via /api/provision awaiting confirmation */
+    uint32_t mqtt_interval;       /* MQTT publish interval in seconds */
+    uint8_t mqtt_send_mode;       /* 0 = On Interval (Periodic), 1 = On Change (CoV) */
     uint32_t checksum;
 } Gateway_Config_t;
 
@@ -106,6 +134,7 @@ extern volatile ModbusScanStatus_t g_scan_status;
 void Modbus_DMA_Init(void);
 void Modbus_DMA_PollSensors(void);
 void Modbus_DMA_PerformScan(void);
+void Modbus_DMA_ConsumeBatch(TelemetryBatch_t *dest);
 
 /* Helper Primitives to safely read/write states */
 void Get_Shared_Sensor_Data(Modbus_SensorData_t *dest);
