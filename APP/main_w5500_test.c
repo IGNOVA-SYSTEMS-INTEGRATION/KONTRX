@@ -41,6 +41,10 @@ static void Delay_ms(uint32_t ms) {
     while ((millis() - start) < ms) __asm__("nop");
 }
 
+void osDelay(uint32_t ms) {
+    Delay_ms(ms);
+}
+
 /* ================================================================== */
 /*  SPI Wrappers for WIZnet ioLibrary                                 */
 /* ================================================================== */

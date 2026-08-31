@@ -21,6 +21,7 @@
 #define USART3_BASE       (APB1PERIPH_BASE + 0x4800U)
 #define USART1_BASE       (APB2PERIPH_BASE + 0x1000U)
 #define USART6_BASE       (APB2PERIPH_BASE + 0x1400U)
+#define SPI1_BASE         (APB2PERIPH_BASE + 0x3000U)
 
 #define SYSTICK_BASE      (0xE000E010U)
 
@@ -98,6 +99,7 @@ typedef struct {
 #define USART3  ((USART_TypeDef *)USART3_BASE)
 #define USART6  ((USART_TypeDef *)USART6_BASE)
 
+#define SPI1    ((SPI_TypeDef *)SPI1_BASE)
 #define SPI2    ((SPI_TypeDef *)SPI2_BASE)
 
 /* ------------------------------------------------------------------ */

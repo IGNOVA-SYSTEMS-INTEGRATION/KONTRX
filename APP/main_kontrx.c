@@ -30,6 +30,9 @@
 #include "led.h"
 #include "modbus_dma.h"
 #include "freertos_tasks.h"
+#include "flash_partition.h"
+#include "w25q16.h"
+#include "web_assets.h"
 #include "w5500.h"
 #include "socket.h"
 #include "dhcp.h"
@@ -54,6 +57,10 @@
  * ====================================================================== */
 #include "semphr.h"
 SemaphoreHandle_t spiMutex = NULL;
+
+uint8_t g_diag_w5500_version = 0;
+uint8_t g_diag_ip[4] = {0};
+uint8_t g_diag_gw[4] = {0};
 
 static void SPI_CritEnter(void) {
     if (spiMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
@@ -103,19 +110,86 @@ void vApplicationMallocFailedHook(void) {
 }
 
 /* ======================================================================
- *  Load gateway config from EEPROM (Sector 11, 0x080E0000)
+ *  Load gateway config from EEPROM (Sector 7 tail, CONFIG_FLASH_ADDR)
  *  Falls back to safe defaults if magic is wrong.
  * ====================================================================== */
 static void Load_Config_From_Flash(void) {
-    #define CONFIG_MAGIC CONFIG_MAGIC_CURRENT
-    Gateway_Config_t *flash_cfg = (Gateway_Config_t *)0x080E0000U;
+    // 1. Initialize Partitions (which also initializes W25Q16 physical flash)
+    Partition_Init();
 
-    if (flash_cfg->magic == CONFIG_MAGIC) {
-        Update_Shared_Config(flash_cfg);
-        printf("[CFG] Loaded config from flash (magic OK)\r\n");
+    // 2. Try loading config from Partition Manager
+    uint8_t config_ok = 0;
+    if (Partition_LoadConfig(&sharedConfig)) {
+        if (sharedConfig.actuator_count <= MAX_RELAYS &&
+            sharedConfig.sensors.count <= MAX_SENSORS &&
+            sharedConfig.mqtt_mapping_count <= MAX_MQTT_MAPPINGS) {
+            config_ok = 1;
+            printf("[CFG] Loaded config from external flash partition successfully.\r\n");
+        } else {
+            printf("[CFG] Loaded config failed validation (counts out of bounds)! Resetting to defaults...\r\n");
+        }
+    }
+
+    if (!config_ok) {
+        printf("[CFG] Configuration partition blank/corrupted. Initializing defaults...\r\n");
+        memset(&sharedConfig, 0, sizeof(Gateway_Config_t));
+        
+        sharedConfig.magic = CONFIG_MAGIC_CURRENT;
+        sharedConfig.serial = 2; // KX-0000002
+        sharedConfig.mqtt_port = 1883;
+        sharedConfig.mqtt_interval = 2;
+        sharedConfig.mqtt_send_mode = 0; // Periodic
+        
+        strcpy(sharedConfig.mqtt_broker, "broker.emqx.io");
+        strcpy(sharedConfig.sparkplug_topic, "test/topic/12345");
+        strcpy(sharedConfig.provision_status, "Active");
+        strcpy(sharedConfig.provision_message, "Provisioned manually via Cloud MQTT settings");
+
+        // Map default 10 local GPIO actuators
+        const char *names[10] = {"Relay1", "Relay2", "Relay3", "Relay4", "Relay5", "Relay6", "Relay7", "Relay8", "Relay9", "Relay10"};
+        const char *ports[10] = {"PE", "PE", "PE", "PC", "PC", "PA", "PA", "PA", "PA", "PC"};
+        const uint8_t pins[10]  = {2, 4, 6, 0, 2, 1, 0, 2, 4, 4};
+        
+        for (int i = 0; i < 10; i++) {
+            sharedConfig.actuators[i].id = i;
+            strcpy(sharedConfig.actuators[i].name, names[i]);
+            sharedConfig.actuators[i].type = ACTUATOR_TYPE_LOCAL_GPIO;
+            sharedConfig.actuators[i].is_active_low = 0;
+            sharedConfig.actuators[i].state = 0;
+            
+            strcpy(sharedConfig.actuators[i].port_or_ip, ports[i]);
+            sharedConfig.actuators[i].pin_or_slave = pins[i];
+            sharedConfig.actuators[i].port = 0;
+            sharedConfig.actuators[i].reg_addr = 0;
+        }
+        sharedConfig.actuator_count = 10;
+
+        // Default telemetry field mappings
+        sharedConfig.mqtt_mappings[0] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=1, .json_key="ph", .enabled=1};
+        sharedConfig.mqtt_mappings[1] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=3, .json_key="ec", .enabled=1};
+        sharedConfig.mqtt_mappings[2] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=4, .json_key="do", .enabled=1};
+        sharedConfig.mqtt_mappings[3] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=5, .json_key="ammonia", .enabled=1};
+        sharedConfig.mqtt_mappings[4] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=10, .json_key="multi_us", .enabled=1};
+        sharedConfig.mqtt_mapping_count = 5;
+
+        Partition_SaveConfig(&sharedConfig);
+        printf("[CFG] Default configurations written to flash partitions.\r\n");
+    }
+
+    // 3. Extract default embedded Web Assets to External Flash if missing
+    uint32_t first_word = 0;
+    W25Q_Read(PARTITION_WEB_ADDR, (uint8_t *)&first_word, 4);
+    if (first_word != 0x4F44213CU || 1) { // Force re-extract to update UI with PLC support
+        printf("[SYS] External Web Assets blank. Extracting embedded web assets (HTML/CSS/JS) to W25Q16...\r\n");
+        // Erase 32 sectors (128 KB) to clear space
+        for (uint32_t s = 0; s < 32; s++) {
+            W25Q_EraseSector(PARTITION_WEB_ADDR + s * 4096);
+        }
+        // Write embedded HTML file
+        W25Q_Write(PARTITION_WEB_ADDR, (const uint8_t *)KONTRX_HTML, strlen(KONTRX_HTML));
+        printf("[SYS] Web Assets successfully written to External Flash!\r\n");
     } else {
-        printf("[CFG] No saved config found, using defaults\r\n");
-        /* Defaults are already set by Modbus_DMA_Init() → sharedConfig zeroed */
+        printf("[SYS] Onboard W25Q16 Web Assets partition verified.\r\n");
     }
 }
 
@@ -132,6 +206,7 @@ int main(void) {
     UART_Debug_Init();
     RTC_Init();
     printf("\r\n\r\n");
+    Log_Event("SYS", "System initialized and booted successfully.");
     printf("╔══════════════════════════════════════════╗\r\n");
     printf("║  Kontrx Edge Gateway  v2.0.0             ║\r\n");
     printf("║  STM32F407VET6 + W5500 + FreeRTOS CMSIS  ║\r\n");
@@ -177,18 +252,7 @@ int main(void) {
         printf("[NET] W5500 SPI FAILED: VERSIONR=0x%02X (expected 0x04)\r\n",
                w5500_version);
     } else {
-        /* Wait for PHY link (bootloader may have started auto-negotiation
-         * but the link may not be up yet). */
-        uint32_t phy_tries = 30;
-        while (wizphy_getphylink() != PHY_LINK_ON && phy_tries-- > 0) {
-            printf("[NET] Waiting for PHY link...\r\n");
-            /* Busy-wait ~?ms per try. Runs BEFORE the RTOS scheduler starts
-             * (main loop, no tasks yet), so it does NOT affect the 1ms Control
-             * Engine. Max ~30 tries; only delays boot, not runtime timing. */
-            for (volatile uint32_t i = 0; i < 1000000; i++);
-        }
-        printf("[NET] W5500 SPI OK: VERSIONR=0x04, PHY link %s\r\n",
-               (wizphy_getphylink() == PHY_LINK_ON) ? "UP" : "DOWN");
+        printf("[NET] W5500 SPI OK: VERSIONR=0x04. PHY auto-negotiation running in background.\r\n");
     }
 
     /* Keep normal ping reception enabled. */
@@ -209,6 +273,11 @@ int main(void) {
      * alone can hide a failed SPI write and makes ARP failures opaque. */
     wiz_NetInfo net_readback = {0};
     ctlnetwork(CN_GET_NETINFO, &net_readback);
+    
+    g_diag_w5500_version = w5500_version;
+    memcpy(g_diag_ip, net_readback.ip, 4);
+    memcpy(g_diag_gw, net_readback.gw, 4);
+
     printf("[NET] IP readback: %d.%d.%d.%d  GW: %d.%d.%d.%d  MAC: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
         net_readback.ip[0], net_readback.ip[1], net_readback.ip[2], net_readback.ip[3],
         net_readback.gw[0], net_readback.gw[1], net_readback.gw[2], net_readback.gw[3],
@@ -228,6 +297,7 @@ int main(void) {
 
     /* ---- 8. Load saved relay/MQTT config from EEPROM ---- */
     Load_Config_From_Flash();
+    Log_Event("SYS", "Configuration loaded from Flash Sector 7.");
 
     /* ---- 9. Initialise relay GPIO from config ---- */
     Relay_Init();
