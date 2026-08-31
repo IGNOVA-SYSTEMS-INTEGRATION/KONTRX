@@ -576,12 +576,7 @@ static void Task_ControlEngine(void *arg) {
         static RuleConfig_t localRules;
         uint8_t has_rules = 0;
         if (osMutexAcquire(rulesMutex, 0) == osOK) {
-            if (strcmp(localRules.version_id, activeRules.version_id) != 0 || localRules.rule_count != activeRules.rule_count) {
-                printf("[ControlEngine] Active rules configuration changed to: version '%s' (%lu rules)\r\n", 
-                       activeRules.version_id[0] ? activeRules.version_id : "empty", 
-                       (unsigned long)activeRules.rule_count);
-                localRules = activeRules;
-            }
+            localRules = activeRules;
             has_rules = (localRules.rule_count > 0);
             osMutexRelease(rulesMutex);
         }
