@@ -721,11 +721,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]");
 
-        char hist_hdr[256];
+        char hist_hdr[320];
         snprintf(hist_hdr, sizeof(hist_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
@@ -767,11 +768,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
 
-        char rules_hdr[256];
+        char rules_hdr[320];
         snprintf(rules_hdr, sizeof(rules_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
@@ -921,10 +923,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cJSON *act = cJSON_GetObjectItemCaseSensitive(rule_obj, "action");
 
             if (!r_id || !cJSON_IsString(r_id) ||
-                !in_id || !cJSON_IsString(in_id) ||
+                !in_id || (!cJSON_IsString(in_id) && !cJSON_IsNumber(in_id)) ||
                 !op || !cJSON_IsString(op) ||
                 !thresh || !cJSON_IsNumber(thresh) ||
-                !out_id || !cJSON_IsString(out_id) ||
+                !out_id || (!cJSON_IsString(out_id) && !cJSON_IsNumber(out_id)) ||
                 !act || !cJSON_IsString(act)) {
                 cJSON_Delete(root);
                 Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule field missing or invalid type\"}");
@@ -932,10 +934,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
 
             strncpy(tempRules.rules[i].rule_id, r_id->valuestring, sizeof(tempRules.rules[i].rule_id) - 1);
-            strncpy(tempRules.rules[i].input_id, in_id->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
+            if (cJSON_IsString(in_id)) {
+                strncpy(tempRules.rules[i].input_id, in_id->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
+            } else {
+                snprintf(tempRules.rules[i].input_id, sizeof(tempRules.rules[i].input_id), "%d", in_id->valueint);
+            }
             strncpy(tempRules.rules[i].operator, op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
             tempRules.rules[i].threshold = (float)thresh->valuedouble;
-            strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
+            if (cJSON_IsString(out_id)) {
+                strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
+            } else {
+                snprintf(tempRules.rules[i].output_id, sizeof(tempRules.rules[i].output_id), "%d", out_id->valueint);
+            }
             strncpy(tempRules.rules[i].action, act->valuestring, sizeof(tempRules.rules[i].action) - 1);
             tempRules.rules[i].active = 1;
             tempRules.rule_count++;
@@ -995,11 +1005,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/status", 15) == 0) {
         int n = JSON_StatusResponse(tx_buf, sizeof(tx_buf));
-        char status_hdr[240];
+        char status_hdr[320];
         snprintf(status_hdr, sizeof(status_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
