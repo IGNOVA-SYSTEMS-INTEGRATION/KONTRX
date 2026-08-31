@@ -798,6 +798,9 @@ static void Task_MQTTClient(void *arg) {
 
         /* Default port to 1883 if unset */
         if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
+        if (s_tasks_cfg.mqtt_interval == 0 || s_tasks_cfg.mqtt_interval > 86400) {
+            s_tasks_cfg.mqtt_interval = 5;
+        }
         
         if (s_tasks_cfg.mqtt_broker[0] == '\0') {
             static uint32_t last_empty_print = 0;
@@ -1037,6 +1040,9 @@ static void Task_MQTTClient(void *arg) {
                             Get_Shared_Config(&s_tasks_cfg);
                             local_mqtt_version = g_config_version;
                             if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
+                            if (s_tasks_cfg.mqtt_interval == 0 || s_tasks_cfg.mqtt_interval > 86400) {
+                                s_tasks_cfg.mqtt_interval = 5;
+                            }
                         }
 
                         /* Refresh active topic from latest config */
