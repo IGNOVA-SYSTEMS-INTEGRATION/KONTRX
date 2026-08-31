@@ -55,6 +55,10 @@
 #include "socket.h"
 #include "dns.h"
 
+#ifdef USE_FREERTOS
+#include "cmsis_os2.h"
+#endif
+
 #ifdef _DNS_DEBUG_
 #include <stdio.h>
 #endif
@@ -556,6 +560,9 @@ int8_t DNS_run(uint8_t * dns_ip, uint8_t * name, uint8_t * ip_from_dns) {
 #endif
 
     while (1) {
+#ifdef USE_FREERTOS
+        osDelay(1);
+#endif
         if ((len = getSn_RX_RSR(DNS_SOCKET)) > 0) {
             if (len > MAX_DNS_BUF_SIZE) {
                 len = MAX_DNS_BUF_SIZE;

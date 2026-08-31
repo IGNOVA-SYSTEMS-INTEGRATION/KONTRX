@@ -136,7 +136,7 @@ int w5x00_read(Network* n, unsigned char* buffer, int len, long time) {
         if (getSn_RX_RSR(n->my_socket) > 0) {
             return recv(n->my_socket, buffer, len);
         }
-        osDelay(1);
+        osDelay(10);  /* 10ms poll interval — checks ~100 times/sec, saves 90% CPU vs 1ms */
     } while ((osKernelGetTickCount() - start) < (uint32_t)time);
 
     return 0; /* Timeout: no data read, but socket is still healthy */

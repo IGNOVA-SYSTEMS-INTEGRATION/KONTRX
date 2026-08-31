@@ -77,23 +77,50 @@ typedef struct {
     uint8_t       count;
 } TelemetryBatch_t;
 
-/* Relay State Configuration */
+/* Actuator Protocol & State Configuration */
+typedef enum {
+    ACTUATOR_TYPE_LOCAL_GPIO = 0,   // Local onboard Relays (PA0, PE2, etc.)
+    ACTUATOR_TYPE_MODBUS_TCP,       // Modbus TCP remote PLC Port
+    ACTUATOR_TYPE_OPC_UA_CLIENT     // Direct OPC UA Client Write Node
+} ActuatorType_t;
+
 typedef struct {
-    uint8_t port_id;  // 0=A, 1=B, 2=C, 3=D, 4=E
-    uint8_t pin_num;  // 0..15
-    uint8_t is_nc;    // 0 = NO, 1 = NC
-    uint8_t state;    // 0 = Off, 1 = On
-    char    name[20]; // editable label
-} Relay_Config_t;
+    uint8_t  id;                    // Actuator ID (0 to 9)
+    char     name[16];              // e.g. "PLC_Valve_1", "LocalRelay1"
+    uint8_t  type;                  // ActuatorType_t
+    uint8_t  is_active_low;         // 1 = Active Low (NC), 0 = Active High (NO)
+    uint8_t  state;                 // 0 = Off, 1 = On
+    
+    /* Connection details (flat for binary serialization safety) */
+    char     port_or_ip[16];        // GPIO: "PA", "PC", "PE" / PLC: IP (e.g. "192.168.1.50")
+    uint16_t port;                  // PLC/OPC UA Port (e.g. 502 or 4840)
+    uint8_t  pin_or_slave;          // GPIO: Pin index (0-15) / PLC: Slave ID
+    uint16_t reg_addr;              // PLC register/coil address
+    char     opc_node_id[32];       // OPC UA Node Identifier string
+} Actuator_Config_t;
+
+/* Dynamic MQTT Payload Mapping */
+typedef enum {
+    MAP_SOURCE_SENSOR = 0,
+    MAP_SOURCE_ACTUATOR
+} MapSourceType_t;
+
+typedef struct {
+    uint8_t  source_type;        // MapSourceType_t
+    uint8_t  source_id;          // ID of target sensor/actuator
+    char     json_key[24];       // Target JSON key in the published MQTT message
+    uint8_t  enabled;            // 1 = Active, 0 = Disabled
+} Mqtt_Field_Mapping_t;
+
+#define MAX_MQTT_MAPPINGS 16
 
 /* Entire System State Config */
 typedef struct {
     uint32_t magic;
     SensorList_t sensors;
-    Relay_Config_t relays[MAX_RELAYS];
-    uint8_t relay_count;
-    uint32_t serial;              /* Sequential device serial, e.g. 1 => "KX-0000001".
-                                   * Stored in flash, editable from the web UI. */
+    Actuator_Config_t actuators[MAX_RELAYS];
+    uint8_t actuator_count;
+    uint32_t serial;              /* Device serial number */
     char mqtt_broker[64];
     uint16_t mqtt_port;
     char mqtt_client_id[32];
@@ -103,11 +130,19 @@ typedef struct {
     char provision_status[24];
     char provision_message[128];
     char sparkplug_topic[128];
-    char pending_sparkplug_topic[128]; /* New topic received via /api/provision awaiting confirmation */
+    char pending_sparkplug_topic[128];
     uint32_t mqtt_interval;       /* MQTT publish interval in seconds */
     uint8_t mqtt_send_mode;       /* 0 = On Interval (Periodic), 1 = On Change (CoV) */
+    
+    /* Dynamic Schema Mapping */
+    Mqtt_Field_Mapping_t mqtt_mappings[MAX_MQTT_MAPPINGS];
+    uint8_t              mqtt_mapping_count;
+
     uint32_t checksum;
 } Gateway_Config_t;
+
+#define CONFIG_FLASH_SECTOR     7
+#define CONFIG_FLASH_ADDR       0x0807C000U
 
 #define SCAN_MAX_DEVICES 32
 typedef struct {

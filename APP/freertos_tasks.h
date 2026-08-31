@@ -61,6 +61,25 @@ typedef struct {
     uint8_t log_count;
 } MqttStatus_t;
 
+#define LOG_BUFFER_SIZE 16384  // 16 KB circular byte buffer
+
+typedef struct {
+    uint32_t timestamp;
+    uint8_t category_id;  // 0:SYS, 1:MQTT, 2:MODBUS, 3:RELAY, 4:OTA, 0xFF:Padding/Wrap
+    uint8_t msg_len;
+} LogHeader_t;
+
+extern uint8_t g_log_ring[LOG_BUFFER_SIZE];
+extern volatile uint32_t g_log_head;
+extern volatile uint32_t g_log_tail;
+extern volatile uint32_t g_total_logs_written;
+extern volatile uint32_t g_sys_log_count;
+extern volatile uint8_t g_sys_log_full;
+
+void Log_Event(const char *category, const char *message);
+
+#include "flash_partition.h"
+
 extern volatile MqttStatus_t g_mqtt_status;
 
 extern osThreadId_t g_tid_modbus;
@@ -69,5 +88,10 @@ extern osThreadId_t g_tid_mqtt;
 /* W5500 SPI bus mutex — protects concurrent socket access from HTTP + MQTT tasks.
  * Declared as SemaphoreHandle_t so it can be created before osKernelStart(). */
 extern SemaphoreHandle_t spiMutex;
+
+extern RuleConfig_t activeRules;
+extern osMutexId_t rulesMutex;
+extern volatile uint32_t rulesTestTicks;
+extern volatile uint8_t rulesTesting;
 
 #endif /* FREERTOS_TASKS_H */

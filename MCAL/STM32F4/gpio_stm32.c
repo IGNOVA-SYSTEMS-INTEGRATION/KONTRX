@@ -149,3 +149,10 @@ uint8_t GPIO_Read_PE4(void) {
     // Return 1 if pressed (assuming active low with pull-up)
     return (GPIOE->IDR & (1U << 4)) == 0 ? 1 : 0;
 }
+
+int GPIO_GetPortId(const char *port_str) {
+    if (port_str[0] == 'P' && port_str[1] >= 'A' && port_str[1] <= 'E') {
+        return port_str[1] - 'A';
+    }
+    return -1;
+}

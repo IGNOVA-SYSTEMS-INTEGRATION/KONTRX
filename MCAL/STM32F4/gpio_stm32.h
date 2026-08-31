@@ -10,6 +10,7 @@ extern GPIO_TypeDef * const GPIO_Ports[5];
 // Generic GPIO Functions
 void GPIO_InitOutput(GPIO_TypeDef* port, uint8_t pin);
 void GPIO_TogglePin(GPIO_TypeDef* port, uint8_t pin);
+int GPIO_GetPortId(const char *port_str);
 
 // Specific hardware initializations for this project
 void GPIO_Init_USART1_Pins(void);

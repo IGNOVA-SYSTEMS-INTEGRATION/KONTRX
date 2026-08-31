@@ -25,8 +25,11 @@
 
 #include "http_server_task.h"
 #include "freertos_tasks.h"
+#include "cJSON.h"
 #include "web_assets.h"
 #include "modbus_dma.h"
+#include "w25q16.h"
+#include "flash_partition.h"
 #include "flash_stm32.h"
 #include "rtc_stm32.h"
 #include "stm32f407_regs.h"
@@ -61,8 +64,13 @@ osSemaphoreId_t   sem_ota_done  = NULL;
 #define OTA_OTP_SECRET   "KontrxOTA2026"
 #define STAGING_ADDR     0x08040000U
 
-/* Uptime counter (incremented by tick hook, not by this task) */
 extern volatile uint32_t g_uptime_seconds;
+extern uint8_t g_log_ring[LOG_BUFFER_SIZE];
+extern volatile uint32_t g_log_head;
+extern volatile uint32_t g_log_tail;
+extern volatile uint32_t g_total_logs_written;
+extern volatile uint32_t g_sys_log_count;
+extern volatile uint8_t  g_sys_log_full;
 
 /* External: relay GPIO driver */
 extern uint8_t relayStates[MAX_RELAYS];
@@ -87,6 +95,8 @@ static char    tx_buf[6144];  /* Sized for max /api/status JSON:
  *  Keeping these off the task stack prevents stack overflow on the
  *  2KB (now 4KB) HTTPServer stack when snprintf + structs are called.
  * ====================================================================== */
+static Gateway_Config_t s_http_cfg_temp;  /* Shared config scratch for all HTTP handlers */
+
 static Modbus_SensorData_t s_sd;
 static Gateway_Config_t    s_cfg;
 static wiz_NetInfo         s_ni;
@@ -105,6 +115,123 @@ const char *SensorTypeName(uint8_t type) {
         case 7: return "multi_us";
         default: return "unknown";
     }
+}
+
+static void Send_JSON_Logs(uint8_t sn) {
+    // Send HTTP Header first
+    const char *hdr = "HTTP/1.1 200 OK\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Connection: close\r\n"
+                      "\r\n"
+                      "{\"logs\":[";
+    send(sn, (uint8_t *)hdr, strlen(hdr));
+
+    taskENTER_CRITICAL();
+    uint32_t count = g_sys_log_count;
+    uint32_t temp_tail = g_log_tail;
+    taskEXIT_CRITICAL();
+
+    uint32_t processed = 0;
+    uint32_t printed = 0;
+    char line_buf[128];
+
+    while (processed < count) {
+        taskENTER_CRITICAL();
+        // Check if we need to wrap at the end of the buffer
+        if (temp_tail + sizeof(LogHeader_t) > LOG_BUFFER_SIZE) {
+            temp_tail = 0;
+            taskEXIT_CRITICAL();
+            continue;
+        }
+
+        LogHeader_t *l_hdr = (LogHeader_t *)&g_log_ring[temp_tail];
+        if (l_hdr->category_id == 0xFF) {
+            temp_tail = 0;
+            taskEXIT_CRITICAL();
+            continue;
+        }
+
+        uint32_t s = l_hdr->timestamp;
+        uint8_t cat_id = l_hdr->category_id;
+        uint8_t msg_len = l_hdr->msg_len;
+
+        // Copy message string safely while in critical section
+        char msg_temp[64];
+        uint32_t copy_len = msg_len;
+        if (copy_len >= sizeof(msg_temp)) copy_len = sizeof(msg_temp) - 1;
+        memcpy(msg_temp, &g_log_ring[temp_tail + sizeof(LogHeader_t)], copy_len);
+        msg_temp[copy_len] = '\0';
+
+        // Advance tail for the next loop
+        temp_tail += sizeof(LogHeader_t) + msg_len;
+        taskEXIT_CRITICAL();
+
+        uint32_t hrs = s / 3600;
+        uint32_t mins = (s % 3600) / 60;
+        uint32_t secs = s % 60;
+
+        const char *cat_str = "SYS";
+        if (cat_id == 1) cat_str = "MQTT";
+        else if (cat_id == 2) cat_str = "MODBUS";
+        else if (cat_id == 3) cat_str = "RELAY";
+        else if (cat_id == 4) cat_str = "OTA";
+
+        int n = snprintf(line_buf, sizeof(line_buf),
+                         "%s{\"time\":\"%02lu:%02lu:%02lu\",\"cat\":\"%s\",\"msg\":\"%s\"}",
+                         (printed > 0) ? "," : "",
+                         (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
+                         cat_str, msg_temp);
+
+        send(sn, (uint8_t *)line_buf, n);
+        printed++;
+        processed++;
+        
+        // 1ms yield to prevent task starvation of the 1ms control loop during long transmissions
+        osDelay(1);
+    }
+
+    const char *footer = "]}";
+    send(sn, (uint8_t *)footer, strlen(footer));
+}
+
+static int JSON_HardwareResponse(char *buf, int buflen) {
+    Get_Shared_Config(&s_cfg);
+    int pos = 0;
+    pos += snprintf(buf + pos, buflen - pos, "{\"sensors\":[");
+    for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
+        uint8_t type = s_cfg.sensors.entries[i].type;
+        uint8_t id   = s_cfg.sensors.entries[i].id;
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"id\":%u,\"type\":%u,\"type_name\":\"%s\"}%s",
+            id, type, SensorTypeName(type),
+            (i < s_cfg.sensors.count - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "],\"relays\":[");
+    for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
+        char pin_val[32] = {0};
+        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+            snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
+        } else {
+            snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
+        }
+        const char *act_type_name = "unknown";
+        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) act_type_name = "GPIO";
+        else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_MODBUS_TCP) act_type_name = "Modbus TCP";
+        else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_OPC_UA_CLIENT) act_type_name = "OPC UA";
+
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"type_name\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"nc\":%u}%s",
+            i,
+            s_cfg.actuators[i].name[0] ? s_cfg.actuators[i].name : "Actuator",
+            s_cfg.actuators[i].type,
+            act_type_name,
+            relayStates[i],
+            pin_val,
+            s_cfg.actuators[i].is_active_low,
+            (i < s_cfg.actuator_count - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]}");
+    return pos;
 }
 
 static int JSON_StatusResponse(char *buf, int buflen) {
@@ -161,16 +288,30 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     pos += snprintf(buf + pos, buflen - pos, "],");
 
     /* --- relays (dynamic) --- */
+    /* --- actuators (dynamic) --- */
     pos += snprintf(buf + pos, buflen - pos, "\"relays\":[");
-    for (uint8_t i = 0; i < s_cfg.relay_count && i < MAX_RELAYS; i++) {
+    for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
+        char pin_val[32] = {0};
+        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+            snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
+        } else {
+            snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
+        }
+        
         pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"state\":%u,\"pin\":\"P%c%u\",\"nc\":%u,\"name\":\"%s\"}%s",
+            "{\"id\":%u,\"state\":%u,\"pin\":\"%s\",\"nc\":%u,\"name\":\"%s\","
+            "\"type\":%u,\"port\":%u,\"slave_id\":%u,\"reg_addr\":%u,\"opc_node_id\":\"%s\"}%s",
             i,
             relayStates[i],
-            'A' + s_cfg.relays[i].port_id, s_cfg.relays[i].pin_num,
-            s_cfg.relays[i].is_nc,
-            s_cfg.relays[i].name[0] ? s_cfg.relays[i].name : "Relay",
-            (i < s_cfg.relay_count - 1) ? "," : "");
+            pin_val,
+            s_cfg.actuators[i].is_active_low,
+            s_cfg.actuators[i].name[0] ? s_cfg.actuators[i].name : "Actuator",
+            s_cfg.actuators[i].type,
+            s_cfg.actuators[i].port,
+            s_cfg.actuators[i].pin_or_slave,
+            s_cfg.actuators[i].reg_addr,
+            s_cfg.actuators[i].opc_node_id,
+            (i < s_cfg.actuator_count - 1) ? "," : "");
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
 
@@ -244,11 +385,12 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
     pos += snprintf(buf + pos, buflen - pos,
-        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u}}",
+        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u}}",
         /* ↑ note trailing }} : closes sys object AND root object         */
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
-        (unsigned)heap_total);
+        (unsigned)heap_total,
+        (unsigned)g_sys_log_full);
 
     return pos;
 }
@@ -379,6 +521,7 @@ static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
         int32_t result = send(sn, (uint8_t *)(data + sent), chunk);
         if (result > 0) {
             sent += (uint32_t)result;
+            osDelay(1);   /* 1ms yield between successful chunk writes to prevent SPI lock starvation */
         } else if (result == SOCK_BUSY) {
             osDelay(1);   /* 1ms yield — W5500 TX buffer full; wait a tick and
                              retry. Allows other tasks (incl. 1ms Control Engine)
@@ -428,48 +571,345 @@ static void Flash_Writer_Flush(Flash_Aligned_Writer_t *w) {
 }
 
 /* ======================================================================
+ *  Safe Config Flash Writer
+ *  Suspends background tasks to prevent SPI conflicts, MCU freezes, or
+ *  race conditions while erasing and writing Sector 7 emulated EEPROM.
+ * ====================================================================== */
+static void Safe_Write_Config_To_Flash(const Gateway_Config_t *cfg_in, const char *action_desc) {
+    Partition_SaveConfig(cfg_in);
+
+    char log_msg[64];
+    snprintf(log_msg, sizeof(log_msg), "Saved %s configuration to external flash.", action_desc);
+    Log_Event("SYS", log_msg);
+}
+
+static void Stream_Web_Asset(uint8_t sn) {
+    uint32_t html_len = strlen(KONTRX_HTML);
+    printf("[HTTP] Streaming web asset: %lu bytes\r\n", (unsigned long)html_len);
+    char hdr[200];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Content-Length: %lu\r\n"
+        "Cache-Control: public, max-age=31536000\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        (unsigned long)html_len);
+    send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
+
+    // Stream from W25Q16 in 512-byte chunks with send() retry
+    uint8_t chunk_buf[512];
+    uint32_t addr = PARTITION_WEB_ADDR;
+    uint32_t remaining = html_len;
+    uint32_t last_progress_print = 0;
+    while (remaining > 0) {
+        uint32_t read_len = (remaining > 512) ? 512 : remaining;
+        W25Q_Read(addr, chunk_buf, read_len);
+        int32_t result = send(sn, chunk_buf, (uint16_t)read_len);
+        if (result > 0) {
+            addr += read_len;
+            remaining -= read_len;
+            if (html_len - remaining - last_progress_print >= 10240 || remaining == 0) {
+                printf("[HTTP] Streaming: %lu/%lu bytes sent\r\n", 
+                       (unsigned long)(html_len - remaining), (unsigned long)html_len);
+                last_progress_print = html_len - remaining;
+            }
+        } else if (result == SOCK_BUSY) {
+            osDelay(1);  // TX buffer full, retry next tick
+        } else {
+            printf("[HTTP] Streaming socket error, aborting stream! (result=%ld)\r\n", (long)result);
+            break;  // Socket error, abort
+        }
+        osDelay(1); // Yield to other tasks
+    }
+}
+
+/* ======================================================================
  *  Request dispatcher
  * ====================================================================== */
 static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     req[len] = '\0';
     char *line = (char *)req;
+    
+    char first_line[64] = {0};
+    char *newline = strchr(line, '\r');
+    if (!newline) newline = strchr(line, '\n');
+    if (newline) {
+        int first_len = newline - line;
+        if (first_len > 63) first_len = 63;
+        strncpy(first_line, line, first_len);
+    } else {
+        strncpy(first_line, line, sizeof(first_line) - 1);
+    }
+    printf("[HTTP] Dispatch_Request: %s\r\n", first_line);
 
-    /* -----------------------------------------------------------------
-     * GET /
-     * Serve the full SPA HTML page
-     * ----------------------------------------------------------------- */
-    if (strncmp(line, "GET / ", 6) == 0 || strncmp(line, "GET /index", 10) == 0) {
-        /* Send headers with Content-Length so browser knows total size */
-        uint32_t html_len = sizeof(KONTRX_HTML) - 1;
-        char hdr[160];
-        snprintf(hdr, sizeof(hdr),
+    /* OPTIONS check for CORS pre-flight requests */
+    if (strncmp(line, "OPTIONS ", 8) == 0) {
+        char cors_hdr[] =
             "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=UTF-8\r\n"
-            "Content-Length: %lu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
-            "\r\n",
-            (unsigned long)html_len);
-        send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
-        /* Stream HTML in 1KB chunks */
-        Send_Chunked(sn, (const uint8_t *)KONTRX_HTML, html_len);
+            "\r\n";
+        send(sn, (uint8_t *)cors_hdr, (uint16_t)strlen(cors_hdr));
         return;
     }
 
     /* -----------------------------------------------------------------
-     * GET /api/status  → JSON sensor + relay snapshot
+     * GET /
+     * Serve the full SPA HTML page from W25Q16 with Cache-Control headers
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET / ", 6) == 0 || strncmp(line, "GET /index", 10) == 0) {
+        Stream_Web_Asset(sn);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/hardware  → JSON list of available peripherals (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/hardware", 17) == 0) {
+        int n = JSON_HardwareResponse(tx_buf, sizeof(tx_buf));
+        char hw_hdr[240];
+        snprintf(hw_hdr, sizeof(hw_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            n);
+        send(sn, (uint8_t *)hw_hdr, (uint16_t)strlen(hw_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/rules/history  → List historical rule versions (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/rules/history", 22) == 0) {
+        RuleConfig_t temp_rules;
+        
+        int pos = 0;
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "[");
+        uint8_t added = 0;
+        char prim_version[36] = {0};
+
+        // Read Primary
+        W25Q_Read(RULES_PRIMARY_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
+        uint32_t prim_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
+        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == prim_crc) {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
+                temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
+            strncpy(prim_version, temp_rules.version_id, sizeof(prim_version) - 1);
+            added = 1;
+        }
+
+        // Read Backup
+        W25Q_Read(RULES_BACKUP_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
+        uint32_t back_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
+        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == back_crc) {
+            if (!added || strcmp(prim_version, temp_rules.version_id) != 0) {
+                pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                    "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
+                    added ? "," : "",
+                    temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
+            }
+        }
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]");
+
+        char hist_hdr[256];
+        snprintf(hist_hdr, sizeof(hist_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            pos);
+        send(sn, (uint8_t *)hist_hdr, (uint16_t)strlen(hist_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules  → Receive and save rules + version_id & timestamp (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules", 15) == 0 || strncmp(line, "POST /api/rules/update", 22) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) {
+            Send_Response(sn, HTTP_400, "{\"status\":\"error\",\"error\":\"No body\"}");
+            return;
+        }
+        body += 4;
+
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Invalid JSON syntax\"}");
+            return;
+        }
+
+        cJSON *version_item = cJSON_GetObjectItemCaseSensitive(root, "version_id");
+        cJSON *timestamp_item = cJSON_GetObjectItemCaseSensitive(root, "timestamp");
+        cJSON *rules_arr = cJSON_GetObjectItemCaseSensitive(root, "rules");
+
+        if (!version_item || !cJSON_IsString(version_item) ||
+            !timestamp_item || !cJSON_IsString(timestamp_item) ||
+            !rules_arr || !cJSON_IsArray(rules_arr)) {
+            cJSON_Delete(root);
+            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Missing version_id, timestamp, or rules array\"}");
+            return;
+        }
+
+        int rules_count = cJSON_GetArraySize(rules_arr);
+        printf("[HTTP] POST /api/rules: Parsing %d rules, version '%s'\r\n", rules_count, version_item->valuestring);
+        if (rules_count > MAX_RULES) {
+            cJSON_Delete(root);
+            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule count exceeds MAX_RULES\"}");
+            return;
+        }
+
+        // Allocate temporary structure on the stack
+        RuleConfig_t tempRules;
+        memset(&tempRules, 0, sizeof(tempRules));
+        tempRules.magic = RULES_MAGIC_CURRENT;
+        strncpy(tempRules.version_id, version_item->valuestring, sizeof(tempRules.version_id) - 1);
+        strncpy(tempRules.timestamp, timestamp_item->valuestring, sizeof(tempRules.timestamp) - 1);
+        tempRules.rule_count = 0;
+        tempRules.rules_valid = 0; // Starts unvalidated
+
+        for (int i = 0; i < rules_count; i++) {
+            cJSON *rule_obj = cJSON_GetArrayItem(rules_arr, i);
+            if (!cJSON_IsObject(rule_obj)) {
+                cJSON_Delete(root);
+                Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule item must be an object\"}");
+                return;
+            }
+
+            cJSON *r_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "rule_id");
+            cJSON *in_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "input_id");
+            cJSON *op = cJSON_GetObjectItemCaseSensitive(rule_obj, "operator");
+            cJSON *thresh = cJSON_GetObjectItemCaseSensitive(rule_obj, "threshold");
+            cJSON *out_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "output_id");
+            cJSON *act = cJSON_GetObjectItemCaseSensitive(rule_obj, "action");
+
+            if (!r_id || !cJSON_IsString(r_id) ||
+                !in_id || !cJSON_IsString(in_id) ||
+                !op || !cJSON_IsString(op) ||
+                !thresh || !cJSON_IsNumber(thresh) ||
+                !out_id || !cJSON_IsString(out_id) ||
+                !act || !cJSON_IsString(act)) {
+                cJSON_Delete(root);
+                Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule field missing or invalid type\"}");
+                return;
+            }
+
+            strncpy(tempRules.rules[i].rule_id, r_id->valuestring, sizeof(tempRules.rules[i].rule_id) - 1);
+            strncpy(tempRules.rules[i].input_id, in_id->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
+            strncpy(tempRules.rules[i].operator, op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
+            tempRules.rules[i].threshold = (float)thresh->valuedouble;
+            strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
+            strncpy(tempRules.rules[i].action, act->valuestring, sizeof(tempRules.rules[i].action) - 1);
+            tempRules.rules[i].active = 1;
+            tempRules.rule_count++;
+        }
+
+        cJSON_Delete(root);
+
+        // Before writing, update the Backup partition with the current stable configuration
+        printf("[HTTP] POST /api/rules: Backing up current stable rules in flash...\r\n");
+        Partition_BackupCurrentRules();
+
+        // Write the unvalidated new rules to the Primary partition (Sector 130)
+        printf("[HTTP] POST /api/rules: Saving new rules to primary flash partition...\r\n");
+        Partition_SaveRules(&tempRules);
+
+        // Load rules into active memory structure safely
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            activeRules = tempRules;
+            
+            // Set up the watchdog timer (5 seconds stability test)
+            printf("[HTTP] POST /api/rules: Active rules updated in RAM. Activating 5-second stability watchdog...\r\n");
+            rulesTestTicks = osKernelGetTickCount() + pdMS_TO_TICKS(5000);
+            rulesTesting = 1;
+            
+            osMutexRelease(rulesMutex);
+        }
+
+        char update_log[128];
+        snprintf(update_log, sizeof(update_log), "New rules version %s applied (testing).", tempRules.version_id);
+        Log_Event("SYS", update_log);
+
+        // Build Response JSON and send with CORS headers
+        char resp_body[128];
+        int resp_len = snprintf(resp_body, sizeof(resp_body),
+            "{\"status\":\"success\",\"active_version\":\"%s\"}",
+            tempRules.version_id);
+
+        char resp_hdr[256];
+        snprintf(resp_hdr, sizeof(resp_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            resp_len);
+            
+        send(sn, (uint8_t *)resp_hdr, (uint16_t)strlen(resp_hdr));
+        send(sn, (uint8_t *)resp_body, (uint16_t)resp_len);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/status  → JSON sensor + relay snapshot (with CORS)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/status", 15) == 0) {
         int n = JSON_StatusResponse(tx_buf, sizeof(tx_buf));
-        char status_hdr[160];
+        char status_hdr[240];
         snprintf(status_hdr, sizeof(status_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             n);
         send(sn, (uint8_t *)status_hdr, (uint16_t)strlen(status_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+        return;
+    }
+
+    if (strncmp(line, "GET /api/logs", 13) == 0) {
+        Send_JSON_Logs(sn);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/logs/clear  → Clear log buffer
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/logs/clear", 20) == 0) {
+        taskENTER_CRITICAL();
+        g_sys_log_count = 0;
+        g_log_head = 0;
+        g_log_tail = 0;
+        g_total_logs_written = 0;
+        g_sys_log_full = 0;
+        memset(g_log_ring, 0, sizeof(g_log_ring));
+        taskEXIT_CRITICAL();
+
+        Log_Event("SYS", "Event log cleared. Resuming recording.");
+
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
     }
 
@@ -479,14 +919,29 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (strncmp(line, "POST /api/relay?", 16) == 0) {
         int id    = ParseQueryInt(line, "id");
         int state = ParseQueryInt(line, "state");
-        Gateway_Config_t rcfg;
-        Get_Shared_Config(&rcfg);
-        if (id >= 0 && id < (int)rcfg.relay_count && id < MAX_RELAYS && state >= 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (id >= 0 && id < (int)s_http_cfg_temp.actuator_count && id < MAX_RELAYS && state >= 0) {
+            char api_log[64];
+            snprintf(api_log, sizeof(api_log), "HTTP API: Actuator %d set to %s", id+1, state ? "ON" : "OFF");
+            Log_Event("SYS", api_log);
             Relay_SetState((uint8_t)id, (uint8_t)state);
         }
         snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"id\":%d,\"state\":%d}", id, relayStates[id]);
-        send(sn, (uint8_t *)HTTP_200_JSON, strlen(HTTP_200_JSON));
-        send(sn, (uint8_t *)tx_buf, strlen(tx_buf));
+        
+        // Include CORS headers in the response!
+        char api_hdr[240];
+        snprintf(api_hdr, sizeof(api_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            (int)strlen(tx_buf));
+        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
+        send(sn, (uint8_t *)tx_buf, (uint16_t)strlen(tx_buf));
         return;
     }
 
@@ -496,9 +951,26 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (strncmp(line, "POST /api/relay/all", 19) == 0) {
         int state = ParseQueryInt(line, "state");
         if (state >= 0) {
+            char api_log[64];
+            snprintf(api_log, sizeof(api_log), "HTTP API: All actuators set to %s", state ? "ON" : "OFF");
+            Log_Event("SYS", api_log);
             for (int i = 0; i < MAX_RELAYS; i++) Relay_SetState((uint8_t)i, (uint8_t)state);
         }
-        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        
+        char api_resp[] = "{\"ok\":true}";
+        char api_hdr[240];
+        snprintf(api_hdr, sizeof(api_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            (int)strlen(api_resp));
+        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
+        send(sn, (uint8_t *)api_resp, (uint16_t)strlen(api_resp));
         return;
     }
 
@@ -509,115 +981,145 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
+        Get_Shared_Config(&s_http_cfg_temp);
 
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
-
-        uint8_t temp_ports[MAX_RELAYS];
-        uint8_t temp_pins[MAX_RELAYS];
-        uint8_t temp_nc[MAX_RELAYS];
-        char    temp_names[MAX_RELAYS][20];
-        uint8_t relay_count = 0;
-
-        /* De-assert old pins first (release them from output drive) */
-        for (int i = 0; i < (int)cfg.relay_count && i < MAX_RELAYS; i++) {
-            uint8_t old_port = cfg.relays[i].port_id;
-            uint8_t old_pin  = cfg.relays[i].pin_num;
-            if (old_port <= 4 && old_pin <= 15) {
-                GPIO_TypeDef *gpio = GPIO_Ports[old_port];
-                gpio->MODER &= ~(3U << (old_pin * 2)); /* Reset to Input mode (00) */
-                gpio->PUPDR &= ~(3U << (old_pin * 2)); /* No pull */
+        /* De-assert old local pins first */
+        for (int i = 0; i < (int)s_http_cfg_temp.actuator_count && i < MAX_RELAYS; i++) {
+            if (s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+                int port = GPIO_GetPortId(s_http_cfg_temp.actuators[i].port_or_ip);
+                uint8_t pin = s_http_cfg_temp.actuators[i].pin_or_slave;
+                if (port >= 0 && port <= 4 && pin <= 15) {
+                    GPIO_TypeDef *gpio = GPIO_Ports[port];
+                    gpio->MODER &= ~(3U << (pin * 2));
+                    gpio->PUPDR &= ~(3U << (pin * 2));
+                }
             }
         }
 
-        /* Parse list: items are "{"name":"...","pin":"Pxy","nc":n}," */
+        uint8_t actuator_count = 0;
+        Actuator_Config_t temp_actuators[MAX_RELAYS];
+        memset(temp_actuators, 0, sizeof(temp_actuators));
+
         const char *cursor = body;
-        while (relay_count < MAX_RELAYS) {
-            const char *obj = strstr(cursor, "\"pin\":");
+        while (actuator_count < MAX_RELAYS) {
+            const char *obj = strstr(cursor, "\"name\":");
             if (!obj) break;
-            /* back up to start of this object */
             const char *obj_start = obj;
             while (obj_start > body && *obj_start != '{') obj_start--;
 
-            char pin_str[16] = {0};
-            JSON_ReadStr(obj_start, "pin", pin_str, sizeof(pin_str));
+            char name[16] = {0};
+            JSON_ReadStr(obj_start, "name", name, sizeof(name));
+            
+            // Read Type: 0 = GPIO, 1 = Modbus TCP, 2 = OPC UA
+            int type = JSON_ReadInt(obj_start, "type");
+            
+            temp_actuators[actuator_count].id = actuator_count;
+            strncpy(temp_actuators[actuator_count].name, name, sizeof(temp_actuators[actuator_count].name) - 1);
+            temp_actuators[actuator_count].type = (uint8_t)type;
+            
+            int active_low = JSON_ReadInt(obj_start, "nc");
+            if (active_low < 0) active_low = JSON_ReadInt(obj_start, "active_low");
+            temp_actuators[actuator_count].is_active_low = (active_low == 1) ? 1 : 0;
+            temp_actuators[actuator_count].state = 0;
 
-            uint8_t port_id = 0xFF, pin_num = 0xFF;
-            Parse_Pin_String(pin_str, &port_id, &pin_num);
-
-            if (port_id > 4 || pin_num > 15) {
-                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Invalid pin %s.\"}", pin_str);
-                Send_Response(sn, HTTP_200_JSON, tx_buf);
-                return;
-            }
-            if (Is_Pin_Reserved(port_id, pin_num)) {
-                snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is reserved by system hardware.\"}", pin_str);
-                Send_Response(sn, HTTP_200_JSON, tx_buf);
-                return;
-            }
-            for (int j = 0; j < relay_count; j++) {
-                if (temp_ports[j] == port_id && temp_pins[j] == pin_num) {
-                    snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is assigned twice.\"}", pin_str);
+            if (type == ACTUATOR_TYPE_LOCAL_GPIO) {
+                char pin_str[16] = {0};
+                JSON_ReadStr(obj_start, "pin", pin_str, sizeof(pin_str));
+                
+                uint8_t port_id = 0xFF, pin_num = 0xFF;
+                Parse_Pin_String(pin_str, &port_id, &pin_num);
+                if (port_id > 4 || pin_num > 15) {
+                    snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Invalid pin %s.\"}", pin_str);
                     Send_Response(sn, HTTP_200_JSON, tx_buf);
                     return;
                 }
+                if (Is_Pin_Reserved(port_id, pin_num)) {
+                    snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Pin %s is reserved by system hardware.\"}", pin_str);
+                    Send_Response(sn, HTTP_200_JSON, tx_buf);
+                    return;
+                }
+                
+                snprintf(temp_actuators[actuator_count].port_or_ip, sizeof(temp_actuators[actuator_count].port_or_ip), "P%c", 'A' + port_id);
+                temp_actuators[actuator_count].pin_or_slave = pin_num;
+            } 
+            else if (type == ACTUATOR_TYPE_MODBUS_TCP) {
+                char ip[16] = {0};
+                JSON_ReadStr(obj_start, "ip", ip, sizeof(ip));
+                int port = JSON_ReadInt(obj_start, "port");
+                int slave = JSON_ReadInt(obj_start, "slave_id");
+                int reg = JSON_ReadInt(obj_start, "reg_addr");
+                
+                if (port <= 0) port = 502;
+                if (slave < 0) slave = 1;
+                
+                strncpy(temp_actuators[actuator_count].port_or_ip, ip, sizeof(temp_actuators[actuator_count].port_or_ip) - 1);
+                temp_actuators[actuator_count].port = (uint16_t)port;
+                temp_actuators[actuator_count].pin_or_slave = (uint8_t)slave;
+                temp_actuators[actuator_count].reg_addr = (uint16_t)reg;
+            } 
+            else if (type == ACTUATOR_TYPE_OPC_UA_CLIENT) {
+                char endpoint[16] = {0};
+                JSON_ReadStr(obj_start, "ip", endpoint, sizeof(endpoint));
+                int port = JSON_ReadInt(obj_start, "port");
+                if (port <= 0) port = 4840;
+                
+                char node[32] = {0};
+                JSON_ReadStr(obj_start, "opc_node_id", node, sizeof(node));
+                
+                strncpy(temp_actuators[actuator_count].port_or_ip, endpoint, sizeof(temp_actuators[actuator_count].port_or_ip) - 1);
+                temp_actuators[actuator_count].port = (uint16_t)port;
+                strncpy(temp_actuators[actuator_count].opc_node_id, node, sizeof(temp_actuators[actuator_count].opc_node_id) - 1);
             }
 
-            temp_ports[relay_count]  = port_id;
-            temp_pins[relay_count]   = pin_num;
-            int nc = JSON_ReadInt(obj_start, "nc");
-            temp_nc[relay_count]     = (nc == 1) ? 1 : 0;
-            char nm[20] = {0};
-            JSON_ReadStr(obj_start, "name", nm, sizeof(nm));
-            if (nm[0]) {
-                snprintf(temp_names[relay_count], sizeof(temp_names[relay_count]), "%s", nm);
-            } else {
-                snprintf(temp_names[relay_count], sizeof(temp_names[relay_count]), "Relay%u", relay_count + 1);
-            }
-            relay_count++;
+            actuator_count++;
 
-            /* advance past this object */
             const char *close = strchr(obj_start, '}');
             if (!close) break;
             cursor = close + 1;
         }
 
-        if (relay_count == 0) {
-            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"No relays provided.\"}");
+        if (actuator_count == 0) {
+            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"No actuators provided.\"}");
             Send_Response(sn, HTTP_200_JSON, tx_buf);
             return;
         }
 
-        /* Build new config */
-        Gateway_Config_t ncfg;
-        Get_Shared_Config(&ncfg);
-        ncfg.relay_count = relay_count;
-        memset(ncfg.relays, 0, sizeof(ncfg.relays));
-        for (int i = 0; i < relay_count; i++) {
-            ncfg.relays[i].port_id = temp_ports[i];
-            ncfg.relays[i].pin_num = temp_pins[i];
-            ncfg.relays[i].is_nc   = temp_nc[i];
-            ncfg.relays[i].state   = 0;
-            snprintf(ncfg.relays[i].name, sizeof(ncfg.relays[i].name), "%s", temp_names[i]);
-        }
-        ncfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&ncfg);
+        /* Build and update new config */
+        Get_Shared_Config(&s_http_cfg_temp);
+        
+        s_http_cfg_temp.actuator_count = actuator_count;
+        memcpy(s_http_cfg_temp.actuators, temp_actuators, sizeof(s_http_cfg_temp.actuators));
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
-        /* Configure GPIO + apply OFF state for each new relay */
-        for (int i = 0; i < relay_count; i++) {
-            uint8_t port = ncfg.relays[i].port_id;
-            uint8_t pin  = ncfg.relays[i].pin_num;
-            if (port <= 4 && pin <= 15) {
-                GPIO_InitOutput(GPIO_Ports[port], pin);
-                Relay_SetState((uint8_t)i, 0);
+        /* Configure local GPIO pins for actuators of type GPIO */
+        for (int i = 0; i < actuator_count; i++) {
+            if (s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+                int port = GPIO_GetPortId(s_http_cfg_temp.actuators[i].port_or_ip);
+                uint8_t pin = s_http_cfg_temp.actuators[i].pin_or_slave;
+                if (port >= 0 && port <= 4 && pin <= 15) {
+                    GPIO_InitOutput(GPIO_Ports[port], pin);
+                    Relay_SetState((uint8_t)i, 0);
+                }
             }
         }
 
-        /* Persist to flash emulated EEPROM (Sector 11 = last 16KB at 0x080E0000) */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&ncfg, sizeof(Gateway_Config_t));
-
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "actuators");
+        
+        char api_resp[] = "{\"ok\":true}";
+        char api_hdr[240];
+        snprintf(api_hdr, sizeof(api_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            (int)strlen(api_resp));
+        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
+        send(sn, (uint8_t *)api_resp, (uint16_t)strlen(api_resp));
         return;
     }
 
@@ -625,18 +1127,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/config/mqtt/confirm_topic  → Confirm pending topic from API
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/config/mqtt/confirm_topic", 35) == 0) {
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
-        if (cfg.pending_sparkplug_topic[0] != '\0') {
-            strncpy(cfg.sparkplug_topic, cfg.pending_sparkplug_topic, sizeof(cfg.sparkplug_topic) - 1);
-            cfg.sparkplug_topic[sizeof(cfg.sparkplug_topic) - 1] = '\0';
-            cfg.pending_sparkplug_topic[0] = '\0';
-            cfg.magic = CONFIG_MAGIC_CURRENT;
-            Update_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.pending_sparkplug_topic[0] != '\0') {
+            strncpy(s_http_cfg_temp.sparkplug_topic, s_http_cfg_temp.pending_sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic) - 1);
+            s_http_cfg_temp.sparkplug_topic[sizeof(s_http_cfg_temp.sparkplug_topic) - 1] = '\0';
+            s_http_cfg_temp.pending_sparkplug_topic[0] = '\0';
+            s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+            Update_Shared_Config(&s_http_cfg_temp);
 
             /* Persist to flash */
-            FLASH_EraseSector(11);
-            FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+            Safe_Write_Config_To_Flash(&s_http_cfg_temp, "proposed topic approval");
+            Log_Event("SYS", "HTTP API: MQTT topic proposal approved.");
         }
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -646,15 +1147,14 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/config/mqtt/reject_topic  → Reject pending topic from API
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/config/mqtt/reject_topic", 34) == 0) {
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
-        cfg.pending_sparkplug_topic[0] = '\0';
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
+        s_http_cfg_temp.pending_sparkplug_topic[0] = '\0';
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist to flash */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "proposed topic rejection");
+        Log_Event("SYS", "HTTP API: MQTT topic proposal rejected.");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -664,24 +1164,26 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/config/mqtt/delete  → Clear MQTT broker settings & disconnect
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/config/mqtt/delete", 28) == 0) {
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
         
-        memset(cfg.mqtt_broker, 0, sizeof(cfg.mqtt_broker));
-        cfg.mqtt_port = 1883;
-        memset(cfg.mqtt_client_id, 0, sizeof(cfg.mqtt_client_id));
-        memset(cfg.mqtt_username, 0, sizeof(cfg.mqtt_username));
-        memset(cfg.mqtt_password, 0, sizeof(cfg.mqtt_password));
-        memset(cfg.sparkplug_topic, 0, sizeof(cfg.sparkplug_topic));
-        cfg.mqtt_interval = 5;
-        cfg.mqtt_send_mode = 0;
+        memset(s_http_cfg_temp.mqtt_broker, 0, sizeof(s_http_cfg_temp.mqtt_broker));
+        s_http_cfg_temp.mqtt_port = 1883;
+        memset(s_http_cfg_temp.mqtt_client_id, 0, sizeof(s_http_cfg_temp.mqtt_client_id));
+        memset(s_http_cfg_temp.mqtt_username, 0, sizeof(s_http_cfg_temp.mqtt_username));
+        memset(s_http_cfg_temp.mqtt_password, 0, sizeof(s_http_cfg_temp.mqtt_password));
+        memset(s_http_cfg_temp.sparkplug_topic, 0, sizeof(s_http_cfg_temp.sparkplug_topic));
+        s_http_cfg_temp.mqtt_interval = 5;
+        s_http_cfg_temp.mqtt_send_mode = 0;
         
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        memset(s_http_cfg_temp.provision_status, 0, sizeof(s_http_cfg_temp.provision_status));
+        memset(s_http_cfg_temp.provision_message, 0, sizeof(s_http_cfg_temp.provision_message));
+        
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist to flash */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "MQTT clear");
+        Log_Event("SYS", "HTTP API: Reset MQTT settings & disconnect.");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -694,41 +1196,50 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
+        Get_Shared_Config(&s_http_cfg_temp);
 
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
-
-        JSON_ReadStr(body, "broker",    cfg.mqtt_broker,    sizeof(cfg.mqtt_broker));
-        JSON_ReadStr(body, "client_id", cfg.mqtt_client_id, sizeof(cfg.mqtt_client_id));
-        JSON_ReadStr(body, "username",  cfg.mqtt_username,  sizeof(cfg.mqtt_username));
-        JSON_ReadStr(body, "password",  cfg.mqtt_password,  sizeof(cfg.mqtt_password));
-        JSON_ReadStr(body, "sparkplug_topic", cfg.sparkplug_topic, sizeof(cfg.sparkplug_topic));
+        JSON_ReadStr(body, "broker",    s_http_cfg_temp.mqtt_broker,    sizeof(s_http_cfg_temp.mqtt_broker));
+        JSON_ReadStr(body, "client_id", s_http_cfg_temp.mqtt_client_id, sizeof(s_http_cfg_temp.mqtt_client_id));
+        JSON_ReadStr(body, "username",  s_http_cfg_temp.mqtt_username,  sizeof(s_http_cfg_temp.mqtt_username));
+        JSON_ReadStr(body, "password",  s_http_cfg_temp.mqtt_password,  sizeof(s_http_cfg_temp.mqtt_password));
+        JSON_ReadStr(body, "sparkplug_topic", s_http_cfg_temp.sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic));
 
         const char *port_v = JSON_FindValue(body, "port");
         if (port_v) {
             uint16_t p = 0;
             while (*port_v >= '0' && *port_v <= '9') { p = p * 10 + (*port_v - '0'); port_v++; }
-            cfg.mqtt_port = p;
+            s_http_cfg_temp.mqtt_port = p;
         }
 
         const char *int_v = JSON_FindValue(body, "interval");
         if (int_v) {
             uint32_t iv = 0;
             while (*int_v >= '0' && *int_v <= '9') { iv = iv * 10 + (*int_v - '0'); int_v++; }
-            if (iv > 0) cfg.mqtt_interval = iv;
+            if (iv > 0) s_http_cfg_temp.mqtt_interval = iv;
         }
 
         const char *sm_v = JSON_FindValue(body, "send_mode");
         if (sm_v && *sm_v >= '0' && *sm_v <= '9') {
-            cfg.mqtt_send_mode = (uint8_t)(*sm_v - '0');
+            s_http_cfg_temp.mqtt_send_mode = (uint8_t)(*sm_v - '0');
         }
 
-        cfg.magic = CONFIG_MAGIC_CURRENT; /* Ensure CONFIG_MAGIC is saved */
-        Update_Shared_Config(&cfg);
+        if (s_http_cfg_temp.mqtt_broker[0] != '\0') {
+            strncpy(s_http_cfg_temp.provision_status, "Active", sizeof(s_http_cfg_temp.provision_status) - 1);
+            s_http_cfg_temp.provision_status[sizeof(s_http_cfg_temp.provision_status) - 1] = '\0';
+            snprintf(s_http_cfg_temp.provision_message, sizeof(s_http_cfg_temp.provision_message), "Provisioned manually via Cloud MQTT settings");
+            
+            if (s_http_cfg_temp.device_id[0] == '\0') {
+                strncpy(s_http_cfg_temp.device_id, s_http_cfg_temp.mqtt_client_id, sizeof(s_http_cfg_temp.device_id) - 1);
+                s_http_cfg_temp.device_id[sizeof(s_http_cfg_temp.device_id) - 1] = '\0';
+            }
+        }
+
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT; /* Ensure CONFIG_MAGIC is saved */
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "MQTT");
+        Log_Event("SYS", "HTTP API: Saved MQTT config.");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -738,21 +1249,19 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/provision/delete  → Clear provisioning data
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/provision/delete", 26) == 0) {
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
         
-        memset(cfg.device_id, 0, sizeof(cfg.device_id));
-        memset(cfg.provision_status, 0, sizeof(cfg.provision_status));
-        memset(cfg.provision_message, 0, sizeof(cfg.provision_message));
-        memset(cfg.sparkplug_topic, 0, sizeof(cfg.sparkplug_topic));
-        memset(cfg.pending_sparkplug_topic, 0, sizeof(cfg.pending_sparkplug_topic));
+        memset(s_http_cfg_temp.device_id, 0, sizeof(s_http_cfg_temp.device_id));
+        memset(s_http_cfg_temp.provision_status, 0, sizeof(s_http_cfg_temp.provision_status));
+        memset(s_http_cfg_temp.provision_message, 0, sizeof(s_http_cfg_temp.provision_message));
+        memset(s_http_cfg_temp.sparkplug_topic, 0, sizeof(s_http_cfg_temp.sparkplug_topic));
+        memset(s_http_cfg_temp.pending_sparkplug_topic, 0, sizeof(s_http_cfg_temp.pending_sparkplug_topic));
         
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist to flash */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "delete provisioning");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -765,29 +1274,26 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
-
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
         
-        JSON_ReadStr(body, "device_id", cfg.device_id, sizeof(cfg.device_id));
-        JSON_ReadStr(body, "sparkplug_topic", cfg.sparkplug_topic, sizeof(cfg.sparkplug_topic));
+        JSON_ReadStr(body, "device_id", s_http_cfg_temp.device_id, sizeof(s_http_cfg_temp.device_id));
+        JSON_ReadStr(body, "sparkplug_topic", s_http_cfg_temp.sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic));
         
         /* If manual topic is empty, generate standard Sparkplug B topic path */
-        if (cfg.sparkplug_topic[0] == '\0') {
-            snprintf(cfg.sparkplug_topic, sizeof(cfg.sparkplug_topic), "spBv1.0/KontrxGroup/DDATA/%s", cfg.device_id);
+        if (s_http_cfg_temp.sparkplug_topic[0] == '\0') {
+            snprintf(s_http_cfg_temp.sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic), "spBv1.0/KontrxGroup/DDATA/%s", s_http_cfg_temp.device_id);
         }
         
-        strncpy(cfg.provision_status, "Active", sizeof(cfg.provision_status) - 1);
-        cfg.provision_status[sizeof(cfg.provision_status) - 1] = '\0';
+        strncpy(s_http_cfg_temp.provision_status, "Active", sizeof(s_http_cfg_temp.provision_status) - 1);
+        s_http_cfg_temp.provision_status[sizeof(s_http_cfg_temp.provision_status) - 1] = '\0';
         
-        snprintf(cfg.provision_message, sizeof(cfg.provision_message), "Manually provisioned via Web UI");
+        snprintf(s_http_cfg_temp.provision_message, sizeof(s_http_cfg_temp.provision_message), "Manually provisioned via Web UI");
         
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist to flash */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "manual provisioning");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -801,13 +1307,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
+        Get_Shared_Config(&s_http_cfg_temp);
 
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
-
-        JSON_ReadStr(body, "deviceId",       cfg.device_id,         sizeof(cfg.device_id));
-        JSON_ReadStr(body, "status",         cfg.provision_status,  sizeof(cfg.provision_status));
-        JSON_ReadStr(body, "message",        cfg.provision_message, sizeof(cfg.provision_message));
+        JSON_ReadStr(body, "deviceId",       s_http_cfg_temp.device_id,         sizeof(s_http_cfg_temp.device_id));
+        JSON_ReadStr(body, "status",         s_http_cfg_temp.provision_status,  sizeof(s_http_cfg_temp.provision_status));
+        JSON_ReadStr(body, "message",        s_http_cfg_temp.provision_message, sizeof(s_http_cfg_temp.provision_message));
 
         /* Parse MQTT Broker IP — try all field name variants from mobile app */
         char broker[64] = {0};
@@ -815,8 +1319,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (broker[0] == '\0') JSON_ReadStr(body, "brokerUrl", broker, sizeof(broker));
         if (broker[0] == '\0') JSON_ReadStr(body, "broker",    broker, sizeof(broker));
         if (broker[0] != '\0') {
-            strncpy(cfg.mqtt_broker, broker, sizeof(cfg.mqtt_broker) - 1);
-            cfg.mqtt_broker[sizeof(cfg.mqtt_broker) - 1] = '\0';
+            strncpy(s_http_cfg_temp.mqtt_broker, broker, sizeof(s_http_cfg_temp.mqtt_broker) - 1);
+            s_http_cfg_temp.mqtt_broker[sizeof(s_http_cfg_temp.mqtt_broker) - 1] = '\0';
         }
 
         /* Parse broker port — default to 1883 (standard MQTT) if not provided */
@@ -824,10 +1328,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (port_v && *port_v >= '0' && *port_v <= '9') {
             uint16_t p = 0;
             while (*port_v >= '0' && *port_v <= '9') { p = p * 10 + (*port_v - '0'); port_v++; }
-            if (p > 0) cfg.mqtt_port = p;
+            if (p > 0) s_http_cfg_temp.mqtt_port = p;
         }
-        if (cfg.mqtt_port == 0) {
-            cfg.mqtt_port = 1883; /* default MQTT port */
+        if (s_http_cfg_temp.mqtt_port == 0) {
+            s_http_cfg_temp.mqtt_port = 1883; /* default MQTT port */
         }
 
         /* Parse MQTT topic from provisioning — saves to pending_sparkplug_topic for user confirmation */
@@ -839,17 +1343,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             if (prov_topic[0] == '\0')
                 JSON_ReadStr(body, "mqttTopic", prov_topic, sizeof(prov_topic));
             if (prov_topic[0] != '\0') {
-                strncpy(cfg.pending_sparkplug_topic, prov_topic, sizeof(cfg.pending_sparkplug_topic) - 1);
-                cfg.pending_sparkplug_topic[sizeof(cfg.pending_sparkplug_topic) - 1] = '\0';
+                strncpy(s_http_cfg_temp.pending_sparkplug_topic, prov_topic, sizeof(s_http_cfg_temp.pending_sparkplug_topic) - 1);
+                s_http_cfg_temp.pending_sparkplug_topic[sizeof(s_http_cfg_temp.pending_sparkplug_topic) - 1] = '\0';
             }
         }
 
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
-        /* Persist to Flash sector 11 */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        /* Persist to Flash */
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "mobile provisioning");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -878,16 +1381,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Send_Response(sn, HTTP_200_JSON, tx_buf);
             return;
         }
-
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
-        cfg.serial = s;
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
+        s_http_cfg_temp.serial = s;
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "serial");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -901,9 +1401,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
-
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
+        Get_Shared_Config(&s_http_cfg_temp);
 
         uint8_t s_types[MAX_SENSORS];
         uint8_t s_ids[MAX_SENSORS];
@@ -964,19 +1462,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             return;
         }
 
-        cfg.sensors.count = s_count;
-        memset(cfg.sensors.entries, 0, sizeof(cfg.sensors.entries));
+        s_http_cfg_temp.sensors.count = s_count;
+        memset(s_http_cfg_temp.sensors.entries, 0, sizeof(s_http_cfg_temp.sensors.entries));
         for (int i = 0; i < s_count; i++) {
-            cfg.sensors.entries[i].type = s_types[i];
-            cfg.sensors.entries[i].id   = s_ids[i];
+            s_http_cfg_temp.sensors.entries[i].type = s_types[i];
+            s_http_cfg_temp.sensors.entries[i].id   = s_ids[i];
         }
 
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        Update_Shared_Config(&cfg);
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist */
-        FLASH_EraseSector(11);
-        FLASH_WriteBuffer(0x080E0000U, (uint8_t *)&cfg, sizeof(Gateway_Config_t));
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "sensors");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -1067,8 +1564,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (g_tid_modbus) vTaskSuspend((TaskHandle_t)g_tid_modbus);
         if (g_tid_mqtt)   vTaskSuspend((TaskHandle_t)g_tid_mqtt);
 
+        /* Backup configuration from Sector 7 tail before it is erased */
+        Get_Shared_Config(&s_http_cfg_temp);
+
         FLASH_EraseSector(6);
         FLASH_EraseSector(7);
+
+        /* Restore configuration to Sector 7 tail immediately */
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        FLASH_WriteBuffer(CONFIG_FLASH_ADDR, (uint8_t *)&s_http_cfg_temp, sizeof(Gateway_Config_t));
+
+        Log_Event("OTA", "Flash sectors 6 & 7 prepared for update.");
 
         /* Resume suspended tasks after flash operation finishes */
         if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
@@ -1084,6 +1590,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * Staging sectors are already erased via prepare endpoint.
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /update", 12) == 0) {
+        /* Suspend Modbus and MQTT tasks during firmware streaming to prevent CPU starvation and SPI contention */
+        extern osThreadId_t g_tid_modbus;
+        extern osThreadId_t g_tid_mqtt;
+        if (g_tid_modbus) vTaskSuspend((TaskHandle_t)g_tid_modbus);
+        if (g_tid_mqtt)   vTaskSuspend((TaskHandle_t)g_tid_mqtt);
 
         /* OTP validation disabled by user request. Force ota_otp_validated to 1. */
         ota_otp_validated = 1;
@@ -1148,12 +1659,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         /* Wait for OTA task to confirm */
         if (osSemaphoreAcquire(sem_ota_done, 5000) == osOK && ota_write_ok) {
+            Log_Event("OTA", "Firmware upload successful. Device is rebooting...");
             const char *resp = "HTTP/1.1 200 OK\r\nContent-Type:text/plain\r\nConnection:close\r\n\r\n"
                                "OTA OK. Rebooting...";
             send(sn, (uint8_t *)resp, strlen(resp));
         } else {
+            Log_Event("OTA", "Firmware upload failed (CRC check failed).");
             const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection:close\r\n\r\nOTA CRC FAIL";
             send(sn, (uint8_t *)resp, strlen(resp));
+            /* Resume suspended tasks since update failed */
+            if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
+            if (g_tid_mqtt)   vTaskResume((TaskHandle_t)g_tid_mqtt);
         }
 
         disconnect(sn);
@@ -1179,7 +1695,15 @@ void Task_HTTPServer(void *arg) {
     printf("[HTTP] Task started; opening TCP port %u\r\n", HTTP_PORT);
 
     for (;;) {
-        switch (getSn_SR(HTTP_SOCK)) {
+        uint8_t state = getSn_SR(HTTP_SOCK);
+        static uint32_t last_heartbeat = 0;
+        uint32_t now = osKernelGetTickCount();
+        if (now - last_heartbeat >= 2000) {
+            printf("[HTTP] Heartbeat: socket state = 0x%02X\r\n", state);
+            last_heartbeat = now;
+        }
+
+        switch (state) {
 
         /* ---------------------------------------------------------------
          * CLOSED → create TCP socket and prepare to listen.
@@ -1217,6 +1741,7 @@ void Task_HTTPServer(void *arg) {
          * LISTEN → idle, waiting for browser SYN  (no action needed)
          * -------------------------------------------------------------- */
         case SOCK_LISTEN:
+            osDelay(20);
             break;
 
         /* ---------------------------------------------------------------
@@ -1231,6 +1756,7 @@ void Task_HTTPServer(void *arg) {
             if (getSn_IR(HTTP_SOCK) & Sn_IR_CON) {
                 setSn_IR(HTTP_SOCK, Sn_IR_CON);
             }
+            printf("[HTTP] SOCK_ESTABLISHED: Browser connected!\r\n");
             {
                 uint16_t size = 0;
                 /* Retry loop: wait for at least 8 bytes (shortest valid
@@ -1245,15 +1771,35 @@ void Task_HTTPServer(void *arg) {
                 }
 
                 if (size > 0) {
+                    printf("[HTTP] Received %u bytes of request data\r\n", size);
                     if (size > (uint16_t)(sizeof(rx_buf) - 1))
                         size = (uint16_t)(sizeof(rx_buf) - 1);
                     recv(HTTP_SOCK, rx_buf, size);
                     Dispatch_Request(HTTP_SOCK, rx_buf, size);
-                    /* Give W5500 TX buffer 20ms to flush all response bytes
-                     * to the browser before we send FIN (disconnect).
-                     * Without this the final TCP segment can be lost when
-                     * the socket transitions too quickly to TIME_WAIT/CLOSED. */
-                    osDelay(20);
+                    
+                    /* Flush any leftover/overflow bytes in the socket RX buffer
+                     * before closing. If we close a socket with unread data in the
+                     * RX buffer, the W5500 will send a TCP RST packet to the browser,
+                     * causing ERR_CONNECTION_RESET or ERR_CONNECTION_REFUSED. */
+                    uint16_t rem_size;
+                    while ((rem_size = getSn_RX_RSR(HTTP_SOCK)) > 0) {
+                        uint16_t discard_len = (rem_size > sizeof(rx_buf)) ? sizeof(rx_buf) : rem_size;
+                        recv(HTTP_SOCK, rx_buf, discard_len);
+                        osDelay(1);
+                    }
+                    
+                    /* Wait for W5500 hardware TX buffer to be fully sent and ACKed by the client.
+                     * For a 2KB socket buffer, getSn_TX_FSR returning 2048 means the buffer is empty. */
+                    for (int wait_ack = 0; wait_ack < 200; wait_ack++) {
+                        if (getSn_TX_FSR(HTTP_SOCK) >= 2048) {
+                            break;
+                        }
+                        osDelay(1);
+                    }
+                    disconnect(HTTP_SOCK);
+                } else {
+                    printf("[HTTP] No request bytes received (size=0), disconnecting...\r\n");
+                    /* Socket leak fix: disconnect if no request bytes received */
                     disconnect(HTTP_SOCK);
                 }
             }
@@ -1280,6 +1826,8 @@ void Task_HTTPServer(void *arg) {
             break;
 
         default:
+            printf("[HTTP] Unknown socket state: 0x%02X\r\n", state);
+            osDelay(1000);
             break;
         }
 
@@ -1288,3 +1836,4 @@ void Task_HTTPServer(void *arg) {
                      * 1ms Control Engine. Exact 1ms, does not exceed budget. */
     }
 }
+

@@ -17,6 +17,9 @@ Gateway_Config_t    sharedConfig;
 uint8_t             relayStates[MAX_RELAYS];
 volatile ModbusScanStatus_t g_scan_status = {0};
 
+static Gateway_Config_t s_modbus_cfg;
+#define cfg s_modbus_cfg
+
 /* المساعدات */
 static uint16_t Modbus_CRC16(const uint8_t *buf, uint8_t len) {
     uint16_t crc = 0xFFFF;
@@ -63,13 +66,12 @@ void Modbus_DMA_Init(void) {
     USART3->CR1 = (1U << 13) | (1U << 3) | (1U << 2);
 
     /* Default config: empty sensor list (user adds via Auto-Scan / UI) + default relays */
-    Gateway_Config_t cfg;
     Get_Shared_Config(&cfg);
     if (cfg.magic != CONFIG_MAGIC_CURRENT) {
         memset(&cfg, 0, sizeof(cfg));
         cfg.magic = CONFIG_MAGIC_CURRENT;
         cfg.sensors.count = 0;
-        cfg.relay_count = 0;
+        cfg.actuator_count = 0;
         cfg.serial = 1; /* default serial for a fresh device */
         cfg.mqtt_port = 1883;
         cfg.mqtt_send_mode = 0;
@@ -147,11 +149,9 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
     uint8_t rx[50]; int received = 0;
     uint32_t start = osKernelGetTickCount();
     
-    static uint32_t yield_ctr = 0;
     while((osKernelGetTickCount() - start) < timeout_ms) {
         if(USART3->SR & (1U << 5)) {
             uint8_t b = (uint8_t)USART3->DR;
-            yield_ctr = 0; /* reset yield counter on every received byte */
 
             /* Reject leading noise: first byte must be the target slave ID */
             if (received == 0 && b != slave) {
@@ -176,15 +176,9 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
                 break;
             }
         } else {
-            /* No byte yet — yield every ~500 iterations so lower-priority tasks
-             * (HTTP dashboard, MQTT client) can still respond while we wait for
-             * a slow or absent sensor. The 1ms ControlEngine is unaffected by
-             * this: its priority (5) > Modbus (3), so it preempts us on the tick
-             * regardless. */
-            if (++yield_ctr >= 500) {
-                yield_ctr = 0;
-                taskYIELD();
-            }
+            /* No byte yet — sleep for 1ms to allow lower-priority tasks
+             * (HTTP dashboard, MQTT client) to run. */
+            osDelay(1);
         }
         
         /* Clean any hardware errors (Overrun, Framing, Noise) on the fly */
@@ -219,9 +213,8 @@ void Modbus_DMA_PollSensors(void) {
      *   long. We now poll 2 channels of the Multi-US board per cycle,
      *   distributing the 8 channels over 4 cycles.
      * ---------------------------------------------------------------- */
-    Modbus_SensorData_t local;
+    static Modbus_SensorData_t local;
     Get_Shared_Sensor_Data(&local);
-    Gateway_Config_t cfg;
     Get_Shared_Config(&cfg);
     uint16_t rs[12];
 
@@ -231,7 +224,8 @@ void Modbus_DMA_PollSensors(void) {
     /* Sync the slot count to match the current config.
      * Carry over values for slots that match by (type, id). */
     if (local.readings_count != cfg.sensors.count) {
-        Modbus_SensorData_t tmp;
+        printf("[MODBUS] Syncing sensor slot count from %u to %u\r\n", local.readings_count, cfg.sensors.count);
+        static Modbus_SensorData_t tmp;
         memset(&tmp, 0, sizeof(tmp));
         tmp.multi_us_count = 0;
 
@@ -374,15 +368,48 @@ void Modbus_DMA_PollSensors(void) {
                 break;
         }
 
+        uint8_t old_valid = rd->valid;
         if (ok) {
             rd->valid      = 1;
             rd->stale      = 0;
             rd->last_ok_ms = osKernelGetTickCount();
+            if (old_valid == 0) {
+                extern void Log_Event(const char *category, const char *message);
+                const char *tname = "Unknown";
+                if (rd->type == 1) tname = "pH";
+                else if (rd->type == 2) tname = "ORP";
+                else if (rd->type == 3) tname = "EC";
+                else if (rd->type == 4) tname = "DO";
+                else if (rd->type == 5) tname = "Ammonia";
+                else if (rd->type == 6) tname = "Ultrasonic";
+                else if (rd->type == 7) tname = "Multi-US";
+                
+                 char log_buf[64];
+                snprintf(log_buf, sizeof(log_buf), "Sensor %s (ID %u) connected.", tname, rd->id);
+                printf("[MODBUS] Sensor Connection: %s (ID %u) is now ONLINE\r\n", tname, rd->id);
+                Log_Event("MODBUS", log_buf);
+            }
         } else {
             /* Keep last-known-good value; mark as not valid THIS cycle */
             rd->valid = 0;
             /* stale = 1 only if we've NEVER had a good read */
             if (rd->last_ok_ms > 0) rd->stale = 0;
+            if (old_valid == 1) {
+                extern void Log_Event(const char *category, const char *message);
+                const char *tname = "Unknown";
+                if (rd->type == 1) tname = "pH";
+                else if (rd->type == 2) tname = "ORP";
+                else if (rd->type == 3) tname = "EC";
+                else if (rd->type == 4) tname = "DO";
+                else if (rd->type == 5) tname = "Ammonia";
+                else if (rd->type == 6) tname = "Ultrasonic";
+                else if (rd->type == 7) tname = "Multi-US";
+                
+                char log_buf[64];
+                snprintf(log_buf, sizeof(log_buf), "Sensor %s (ID %u) disconnected.", tname, rd->id);
+                printf("[MODBUS] Sensor Connection Warning: %s (ID %u) is now OFFLINE\r\n", tname, rd->id);
+                Log_Event("MODBUS", log_buf);
+            }
         }
 
         /* 35ms inter-sensor gap (was 15ms) — guarantees line settle time between different devices */
