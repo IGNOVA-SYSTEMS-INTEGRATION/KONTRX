@@ -137,7 +137,7 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
     }
 
     /* Relays status */
-    for (int i = 0; i < cfg->relay_count && i < MAX_RELAYS; i++) {
+    for (int i = 0; i < cfg->actuator_count && i < MAX_RELAYS; i++) {
         char name_buf[32];
         snprintf(name_buf, sizeof(name_buf), "Relays/Relay_%d", i);
         if (!write_metric_bool(&p, end, name_buf, timestamp_ms, relays[i])) return 0;

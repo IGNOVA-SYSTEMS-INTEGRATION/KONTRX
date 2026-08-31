@@ -36,19 +36,44 @@
 
 #include "freertos_tasks.h"
 #include "modbus_dma.h"
+#include "flash_partition.h"
 #include "http_server_task.h"
 #include "ota_task.h"
 #include "rtc_stm32.h"
 #include "MQTTClient.h"
 #include "mqtt_interface.h"
 #include "sparkplug_b_enc.h"
+
+static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay tasks */
 #include "socket.h"
 #include "led.h"
+#include "dns.h"
+#include "wizchip_conf.h"
+#include "cJSON.h"
+
+RuleConfig_t activeRules;
+osMutexId_t rulesMutex = NULL;
+volatile uint32_t rulesTestTicks = 0;
+volatile uint8_t rulesTesting = 0;
 
 
-/* Sparkplug B Topic Helper */
+/* Sparkplug B Topic Helper
+ * - If base_topic contains "/DDATA/", treat it as a Sparkplug B template and
+ *   replace DDATA with msg_type (NBIRTH, NDEATH, etc.).
+ * - If base_topic is a plain custom topic (e.g. "test/topic/12345"), use it
+ *   as-is for DDATA publishes. For NBIRTH/NDEATH, append "/msg_type".
+ * - If base_topic is empty, fall back to standard Sparkplug B format.
+ */
 static void get_sparkplug_topic(const char *base_topic, const char *msg_type, char *out_topic, size_t max_len) {
-    if (base_topic[0] != '\0' && strstr(base_topic, "/DDATA/") != NULL) {
+    /* Empty topic → standard Sparkplug B fallback */
+    if (base_topic[0] == '\0') {
+        snprintf(out_topic, max_len, "spBv1.0/KontrxGroup/%s/kontrx-%07lu", msg_type, (unsigned long)sharedConfig.serial);
+        return;
+    }
+
+    /* Sparkplug B template: contains "/DDATA/" → replace message type */
+    char *ddata_ptr_check = strstr(base_topic, "/DDATA/");
+    if (ddata_ptr_check != NULL) {
         char temp[128];
         strncpy(temp, base_topic, sizeof(temp)-1);
         temp[sizeof(temp)-1] = '\0';
@@ -59,8 +84,10 @@ static void get_sparkplug_topic(const char *base_topic, const char *msg_type, ch
             return;
         }
     }
-    /* Fallback standard Sparkplug B topic format */
-    snprintf(out_topic, max_len, "spBv1.0/KontrxGroup/%s/kontrx-%07lu", msg_type, (unsigned long)sharedConfig.serial);
+
+    /* Plain custom topic: use as-is for ALL message types (NBIRTH, NDEATH, DDATA) */
+    strncpy(out_topic, base_topic, max_len - 1);
+    out_topic[max_len - 1] = '\0';
 }
 #include "stm32f407_regs.h"
 #include "gpio_stm32.h"
@@ -72,41 +99,174 @@ static void get_sparkplug_topic(const char *base_topic, const char *msg_type, ch
 
 volatile MqttStatus_t g_mqtt_status = {0};
 
+uint8_t g_log_ring[LOG_BUFFER_SIZE] = {0};
+volatile uint32_t g_log_head = 0;
+volatile uint32_t g_log_tail = 0;
+volatile uint32_t g_log_used_bytes = 0;
+volatile uint32_t g_total_logs_written = 0;
+volatile uint32_t g_sys_log_count = 0;
+volatile uint8_t  g_sys_log_full = 0;
+
+void Log_Event(const char *category, const char *message) {
+    uint8_t cat_id = 0;
+    if (strcmp(category, "SYS") == 0) cat_id = 0;
+    else if (strcmp(category, "MQTT") == 0) cat_id = 1;
+    else if (strcmp(category, "MODBUS") == 0) cat_id = 2;
+    else if (strcmp(category, "RELAY") == 0) cat_id = 3;
+    else if (strcmp(category, "OTA") == 0) cat_id = 4;
+
+    uint32_t msg_len = strlen(message);
+    if (msg_len > 60) msg_len = 60; // Truncate long messages
+
+    uint32_t req_space = sizeof(LogHeader_t) + msg_len;
+
+    taskENTER_CRITICAL();
+
+    // Check if we need to wrap at the end of the buffer
+    if (g_log_head + req_space > LOG_BUFFER_SIZE) {
+        uint32_t pad_len = LOG_BUFFER_SIZE - g_log_head;
+        if (g_log_head + sizeof(LogHeader_t) <= LOG_BUFFER_SIZE) {
+            LogHeader_t *pad = (LogHeader_t *)&g_log_ring[g_log_head];
+            pad->category_id = 0xFF;
+            pad->msg_len = 0;
+        }
+        g_log_used_bytes += pad_len;
+        g_log_head = 0;
+    }
+
+    // Free space until we have enough
+    while (g_sys_log_count > 0 && (LOG_BUFFER_SIZE - g_log_used_bytes) < req_space + 1) {
+        LogHeader_t *old_hdr = (LogHeader_t *)&g_log_ring[g_log_tail];
+        if (old_hdr->category_id == 0xFF) {
+            // Padding marker: wrap tail to 0 and reclaim padding bytes
+            uint32_t pad_len = LOG_BUFFER_SIZE - g_log_tail;
+            g_log_tail = 0;
+            if (g_log_used_bytes >= pad_len) {
+                g_log_used_bytes -= pad_len;
+            } else {
+                g_log_used_bytes = 0;
+            }
+        } else {
+            // Advance tail past this message
+            uint32_t old_len = sizeof(LogHeader_t) + old_hdr->msg_len;
+            g_log_tail = (g_log_tail + old_len) % LOG_BUFFER_SIZE;
+            if (g_log_used_bytes >= old_len) {
+                g_log_used_bytes -= old_len;
+            } else {
+                g_log_used_bytes = 0;
+            }
+            if (g_sys_log_count > 0) {
+                g_sys_log_count--;
+            }
+        }
+    }
+
+    // Write new record at g_log_head
+    LogHeader_t *hdr = (LogHeader_t *)&g_log_ring[g_log_head];
+    hdr->timestamp = g_uptime_seconds;
+    hdr->category_id = cat_id;
+    hdr->msg_len = (uint8_t)msg_len;
+
+    memcpy(&g_log_ring[g_log_head + sizeof(LogHeader_t)], message, msg_len);
+
+    g_log_head += req_space;
+    g_log_used_bytes += req_space;
+    g_sys_log_count++;
+    g_total_logs_written++;
+
+    if (g_total_logs_written >= 800) {
+        g_sys_log_full = 1;
+    }
+
+    taskEXIT_CRITICAL();
+
+    // Persist log to W25Q16 external flash log partition outside critical section
+    extern void Partition_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg);
+    Partition_Log_Append(g_uptime_seconds, cat_id, message);
+}
+
 /* ======================================================================
  *  Global uptime counter
  * ====================================================================== */
 volatile uint32_t g_uptime_seconds = 0;
 
-/* CPU usage (0-100%) — updated once per second by idle hook */
-volatile uint8_t g_cpu_usage_pct = 0;
-
-/* FreeRTOS tick hook — increments uptime every second */
-static volatile uint32_t g_tick_counter = 0;
-
-void vApplicationTickHook(void) {
-    g_tick_counter++;
-    if (g_tick_counter >= (uint32_t)configTICK_RATE_HZ) {
-        g_tick_counter = 0;
-        g_uptime_seconds++;
-    }
-}
-
-/* ======================================================================
- *  CPU Usage via Cortex-M DWT cycle counter
- *  The idle hook accumulates idle cycles; once per second the tick hook
- *  would need to snapshot — but simpler: measure idle cycles in the hook
- *  itself over a rolling 1-second window using uptime.
- * ====================================================================== */
-static volatile uint32_t g_idle_cycles      = 0; /* idle cycles accumulated this window */
-static volatile uint32_t g_idle_window_s    = 0; /* uptime snapshot at window start */
-static volatile uint32_t g_idle_start_cyc   = 0; /* DWT CYCCNT at window start (for total) */
-
-/* DWT registers — Cortex-M4 Data Watchpoint and Trace unit */
+/* CPU usage (0-100%) — updated once per second by tick hook */
 #define DWT_CTRL   (*(volatile uint32_t *)0xE0001000U)
 #define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004U)
 #define DEM_CR     (*(volatile uint32_t *)0xE000EDFCU)
 #define DEM_CR_TRCENA (1UL << 24)
 
+volatile uint8_t g_cpu_usage_pct = 0;
+
+static volatile uint32_t g_idle_task_start_time = 0;
+static volatile uint32_t g_total_idle_cycles = 0;
+
+void KontrxTaskSwitchedIn(void *tcb) {
+    if (tcb == xTaskGetIdleTaskHandle()) {
+        g_idle_task_start_time = DWT_CYCCNT;
+    }
+}
+
+void KontrxTaskSwitchedOut(void *tcb) {
+    if (tcb == xTaskGetIdleTaskHandle()) {
+        if (g_idle_task_start_time != 0) {
+            g_total_idle_cycles += (DWT_CYCCNT - g_idle_task_start_time);
+            g_idle_task_start_time = 0;
+        }
+    }
+}
+
+void Update_CPU_Usage(void) {
+    static uint32_t last_cyccnt = 0;
+    static uint32_t last_idle_cycles = 0;
+
+    uint32_t now_cyc = DWT_CYCCNT;
+    uint32_t now_idle = g_total_idle_cycles;
+
+    /* If the idle task is currently running, add its accumulated cycles so far */
+    extern void* pxCurrentTCB;
+    if (pxCurrentTCB == xTaskGetIdleTaskHandle()) {
+        if (g_idle_task_start_time != 0) {
+            now_idle += (now_cyc - g_idle_task_start_time);
+        }
+    }
+
+    uint32_t total_cycles = now_cyc - last_cyccnt;
+    uint32_t idle_cycles = now_idle - last_idle_cycles;
+
+    if (total_cycles > 0) {
+        uint32_t idle_pct = (idle_cycles * 100U) / total_cycles;
+        if (idle_pct > 100U) idle_pct = 100U;
+        g_cpu_usage_pct = (uint8_t)(100U - idle_pct);
+    }
+
+    last_cyccnt = now_cyc;
+    last_idle_cycles = now_idle;
+}
+
+/* FreeRTOS tick hook — increments uptime every second */
+static volatile uint32_t g_tick_counter = 0;
+
+void vApplicationTickHook(void) {
+    /* Tick the MQTT MilliTimer every 1ms */
+    extern void MilliTimer_Handler(void);
+    MilliTimer_Handler();
+
+    g_tick_counter++;
+    if (g_tick_counter >= (uint32_t)configTICK_RATE_HZ) {
+        g_tick_counter = 0;
+        g_uptime_seconds++;
+        Update_CPU_Usage();
+        
+        /* Tick the DNS time handler */
+        extern void DNS_time_handler(void);
+        DNS_time_handler();
+    }
+}
+
+/* ======================================================================
+ *  CPU Usage via Cortex-M DWT cycle counter
+ * ====================================================================== */
 void KontrxDWT_Init(void) {
     DEM_CR   |= DEM_CR_TRCENA; /* enable trace subsystem */
     /* Unlock DWT LAR (Lock Access Register) to allow write access to DWT registers */
@@ -117,27 +277,7 @@ void KontrxDWT_Init(void) {
 }
 
 void vApplicationIdleHook(void) {
-    /* Accumulate idle cycles using DWT cycle counter */
-    static uint32_t last_cyc = 0;
-    uint32_t now = DWT_CYCCNT;
-    uint32_t delta = now - last_cyc; /* wraps safely on 32-bit */
-    last_cyc = now;
-    g_idle_cycles += delta;
-
-    /* Once per second: compute CPU % from idle/total cycle ratio */
-    uint32_t cur_s = g_uptime_seconds;
-    if (cur_s != g_idle_window_s) {
-        uint32_t window_cyc = now - g_idle_start_cyc;
-        if (window_cyc > 0) {
-            /* idle% = idle_cycles / total_cycles */
-            uint32_t idle_pct = (g_idle_cycles * 100U) / window_cyc;
-            if (idle_pct > 100U) idle_pct = 100U;
-            g_cpu_usage_pct = (uint8_t)(100U - idle_pct);
-        }
-        g_idle_cycles    = 0;
-        g_idle_start_cyc = now;
-        g_idle_window_s  = cur_s;
-    }
+    /* No-op: CPU cycles are tracked via scheduler trace hooks */
 }
 
 
@@ -176,37 +316,26 @@ static uint8_t Relay_Pin_Is_Reserved(uint8_t port, uint8_t pin) {
 /* ======================================================================
  *  Relay GPIO Initialisation
  * ====================================================================== */
+static int Get_Port_Id(const char *port_str) {
+    return GPIO_GetPortId(port_str);
+}
+
 void Relay_Init(void) {
-    Gateway_Config_t cfg;
-    Get_Shared_Config(&cfg);
+    Get_Shared_Config(&s_tasks_cfg);
 
-    if (cfg.magic != CONFIG_MAGIC_CURRENT) {
-        memset(&cfg, 0, sizeof(cfg));
-        cfg.magic = CONFIG_MAGIC_CURRENT;
-        cfg.sensors.count = 0;
-        cfg.relay_count = 10;
-        cfg.serial = 1; /* first device gets serial 1 => "KX-0000001" */
-        cfg.mqtt_port = 1883;
-        cfg.mqtt_interval = 1; /* default to 1 second */
-        cfg.mqtt_send_mode = 0; /* default to 0 = On Interval (Periodic) */
-        for (int i = 0; i < MAX_RELAYS; i++) {
-            cfg.relays[i].port_id = relay_defaults[i].port;
-            cfg.relays[i].pin_num = relay_defaults[i].pin;
-            cfg.relays[i].is_nc   = 0;
-            cfg.relays[i].state   = 0;
-            strncpy(cfg.relays[i].name, relay_defaults[i].name, sizeof(cfg.relays[i].name) - 1);
+    for (int i = 0; i < (int)s_tasks_cfg.actuator_count && i < MAX_RELAYS; i++) {
+        if (s_tasks_cfg.actuators[i].type != ACTUATOR_TYPE_LOCAL_GPIO) {
+            continue; // Skip non-local actuators in physical pin init
         }
-        Update_Shared_Config(&cfg);
-    }
 
-    for (int i = 0; i < (int)cfg.relay_count && i < MAX_RELAYS; i++) {
-        uint8_t port = cfg.relays[i].port_id;
-        uint8_t pin  = cfg.relays[i].pin_num;
+        int port = Get_Port_Id(s_tasks_cfg.actuators[i].port_or_ip);
+        uint8_t pin = s_tasks_cfg.actuators[i].pin_or_slave;
 
+        if (port < 0 || port > 4) continue;
         if (Relay_Pin_Is_Reserved(port, pin)) {
             printf("[Relay] %s pin P%c%u is reserved; relay disabled\r\n",
-                   cfg.relays[i].name[0] ? cfg.relays[i].name : "Relay",
-                   (port <= 4) ? ('A' + port) : '?', pin);
+                   s_tasks_cfg.actuators[i].name[0] ? s_tasks_cfg.actuators[i].name : "Relay",
+                   'A' + port, pin);
             continue;
         }
 
@@ -227,36 +356,148 @@ void Relay_Init(void) {
     }
 }
 
-/* ======================================================================
- *  Relay_SetState — thread-safe relay drive with NC inversion support
- * ====================================================================== */
 void Relay_SetState(uint8_t idx, uint8_t state) {
     if (idx >= MAX_RELAYS) return;
 
-    Gateway_Config_t cfg;
-    Get_Shared_Config(&cfg);
+    Get_Shared_Config(&s_tasks_cfg);
 
-    uint8_t port   = cfg.relays[idx].port_id;
-    uint8_t pin    = cfg.relays[idx].pin_num;
-    uint8_t is_nc  = cfg.relays[idx].is_nc;
+    if (idx >= s_tasks_cfg.actuator_count) return;
 
-    if (Relay_Pin_Is_Reserved(port, pin)) return;
+    if (s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+        int port = Get_Port_Id(s_tasks_cfg.actuators[idx].port_or_ip);
+        uint8_t pin = s_tasks_cfg.actuators[idx].pin_or_slave;
+        uint8_t is_nc = s_tasks_cfg.actuators[idx].is_active_low;
 
-    GPIO_TypeDef *gpio = GPIO_Ports[port];
+        if (port < 0 || port > 4) return;
+        if (Relay_Pin_Is_Reserved(port, pin)) return;
 
-    /* NC logic: for NC relay, invert the drive signal */
-    uint8_t drive = (is_nc ? !state : state);
+        GPIO_TypeDef *gpio = GPIO_Ports[port];
+        uint8_t drive = (is_nc ? !state : state);
 
-    if (drive) {
-        gpio->BSRR = (1U << pin);            /* Set pin HIGH */
-    } else {
-        gpio->BSRR = (1U << (pin + 16));     /* Set pin LOW */
+        if (drive) {
+            gpio->BSRR = (1U << pin);            /* Set pin HIGH */
+        } else {
+            gpio->BSRR = (1U << (pin + 16));     /* Set pin LOW */
+        }
+    } else if (s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_MODBUS_TCP) {
+        extern uint8_t Modbus_TCP_WriteCoil(const char *ip, uint16_t port, uint8_t slave_id, uint16_t coil_addr, uint8_t state);
+        Modbus_TCP_WriteCoil(s_tasks_cfg.actuators[idx].port_or_ip,
+                             s_tasks_cfg.actuators[idx].port,
+                             s_tasks_cfg.actuators[idx].pin_or_slave,
+                             s_tasks_cfg.actuators[idx].reg_addr,
+                             state);
+    } else if (s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_OPC_UA_CLIENT) {
+        extern uint8_t OPC_UA_Client_WriteNode(const char *endpoint, uint16_t ns, const char *node_id, uint8_t state);
+        OPC_UA_Client_WriteNode(s_tasks_cfg.actuators[idx].port_or_ip,
+                                s_tasks_cfg.actuators[idx].port,
+                                s_tasks_cfg.actuators[idx].opc_node_id,
+                                state);
     }
 
+    uint8_t old_state = relayStates[idx];
     relayStates[idx] = state;
 
-    cfg.relays[idx].state = state;
-    Update_Shared_Config(&cfg);
+    if (old_state != state) {
+        char r_log[64];
+        const char *act_name = s_tasks_cfg.actuators[idx].name[0] ? s_tasks_cfg.actuators[idx].name : "Unnamed";
+        snprintf(r_log, sizeof(r_log), "Actuator %d (%s) set to %s.", 
+                 idx + 1, act_name, 
+                 state ? "ON" : "OFF");
+        printf("[RELAY] State Change: Actuator %d (%s) set to %s\r\n", idx + 1, act_name, state ? "ON" : "OFF");
+        Log_Event("RELAY", r_log);
+    }
+
+    s_tasks_cfg.actuators[idx].state = state;
+    Update_Shared_Config(&s_tasks_cfg);
+    Partition_SaveConfig(&s_tasks_cfg); // Persist status in external config partition
+}
+
+extern osMutexId_t configMutex;
+
+static int string_equals_ci(const char *s1, const char *s2) {
+    if (!s1 || !s2) return 0;
+    while (*s1 && *s2) {
+        char c1 = *s1;
+        char c2 = *s2;
+        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+        if (c1 != c2) return 0;
+        s1++;
+        s2++;
+    }
+    return *s1 == *s2;
+}
+
+static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found) {
+    *found = 0;
+    
+    // 1. Try to find mapping in mqtt_mappings by matching json_key
+    for (int i = 0; i < cfg->mqtt_mapping_count; i++) {
+        if (cfg->mqtt_mappings[i].enabled && strcmp(cfg->mqtt_mappings[i].json_key, input_id) == 0) {
+            uint8_t sid = cfg->mqtt_mappings[i].source_id;
+            // Find this sensor in readings
+            for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
+                if (sd->readings[j].id == sid && sd->readings[j].valid) {
+                    *found = 1;
+                    if (strstr(input_id, "temp") != NULL || strstr(input_id, "Temp") != NULL) {
+                        return sd->readings[j].temp;
+                    }
+                    return sd->readings[j].value;
+                }
+            }
+        }
+    }
+    
+    // 2. Try to match standard type names
+    uint8_t target_type = 0;
+    uint8_t is_temp = 0;
+    if (string_equals_ci(input_id, "ph")) target_type = 1;
+    else if (string_equals_ci(input_id, "orp")) target_type = 2;
+    else if (string_equals_ci(input_id, "ec")) target_type = 3;
+    else if (string_equals_ci(input_id, "do")) target_type = 4;
+    else if (string_equals_ci(input_id, "ammonia")) target_type = 5;
+    else if (string_equals_ci(input_id, "ultasonic") || string_equals_ci(input_id, "ultrasonic")) target_type = 6;
+    else if (string_equals_ci(input_id, "multi_us")) target_type = 7;
+    else if (strstr(input_id, "temp") != NULL || strstr(input_id, "Temp") != NULL) {
+        is_temp = 1;
+    }
+    
+    if (target_type > 0) {
+        for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
+            if (sd->readings[j].type == target_type && sd->readings[j].valid) {
+                *found = 1;
+                return sd->readings[j].value;
+            }
+        }
+    } else if (is_temp) {
+        // Return temperature from first valid sensor
+        for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
+            if (sd->readings[j].valid) {
+                *found = 1;
+                return sd->readings[j].temp;
+            }
+        }
+    }
+    
+    return -9999.0f;
+}
+
+static int8_t Resolve_Output_Id(const char *output_id, const Gateway_Config_t *cfg) {
+    // 1. Try to match actuator name
+    for (int i = 0; i < cfg->actuator_count && i < MAX_RELAYS; i++) {
+        if (strcmp(cfg->actuators[i].name, output_id) == 0) {
+            return i;
+        }
+    }
+    
+    // 2. Try to parse as integer
+    char *endptr;
+    long val = strtol(output_id, &endptr, 10);
+    if (*endptr == '\0' && val >= 0 && val < MAX_RELAYS) {
+        return (int8_t)val;
+    }
+    
+    return -1;
 }
 
 /* ======================================================================
@@ -273,9 +514,6 @@ void Relay_SetState(uint8_t idx, uint8_t state) {
 static void Task_ControlEngine(void *arg) {
     (void)arg;
 
-    TickType_t   xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xPeriod   = pdMS_TO_TICKS(1); /* 1ms */
-
     Modbus_SensorData_t sd = { .last_update_time = 0 };
 
     for (;;) {
@@ -288,7 +526,7 @@ static void Task_ControlEngine(void *arg) {
         }
 
         if (sd.last_update_time == 0) {
-            vTaskDelayUntil(&xLastWakeTime, xPeriod);
+            osDelay(1);
             continue;
         }
         /* If mutex was unavailable, we proceed with the last known snapshot — 
@@ -297,11 +535,79 @@ static void Task_ControlEngine(void *arg) {
 /* ================================================================
          * --- CONTROL LOGIC ZONE (user-defined) ---
          * ================================================================ */
+        
+        /* 1. Stability watchdog for newly updated rules */
+        if (rulesTesting) {
+            uint32_t now = osKernelGetTickCount();
+            if ((int32_t)(now - rulesTestTicks) >= 0) {
+                if (osMutexAcquire(rulesMutex, 0) == osOK) {
+                    rulesTesting = 0;
+                    activeRules.rules_valid = 1;
+                    Partition_SaveRules(&activeRules);
+                    char stable_log[64];
+                    snprintf(stable_log, sizeof(stable_log), "Rules version %s verified stable.", activeRules.version_id);
+                    Log_Event("SYS", stable_log);
+                    osMutexRelease(rulesMutex);
+                }
+            }
+        }
 
+        /* 2. Execute active rules */
+        static RuleConfig_t localRules;
+        uint8_t has_rules = 0;
+        if (osMutexAcquire(rulesMutex, 0) == osOK) {
+            if (strcmp(localRules.version_id, activeRules.version_id) != 0 || localRules.rule_count != activeRules.rule_count) {
+                printf("[ControlEngine] Active rules configuration changed to: version '%s' (%lu rules)\r\n", 
+                       activeRules.version_id[0] ? activeRules.version_id : "empty", 
+                       (unsigned long)activeRules.rule_count);
+                localRules = activeRules;
+            }
+            has_rules = (localRules.rule_count > 0);
+            osMutexRelease(rulesMutex);
+        }
+
+        if (has_rules) {
+            // Non-blocking snapshot of current config to map names
+            static Gateway_Config_t cfg_snap;
+            if (configMutex && osMutexAcquire(configMutex, 0) == osOK) {
+                memcpy(&cfg_snap, &sharedConfig, sizeof(Gateway_Config_t));
+                osMutexRelease(configMutex);
+            }
+
+            for (uint32_t i = 0; i < localRules.rule_count; i++) {
+                const Rule_t *rule = &localRules.rules[i];
+                if (!rule->active) continue;
+
+                // Resolve input value from string input_id
+                uint8_t found = 0;
+                float val = Resolve_Input_Value(rule->input_id, &cfg_snap, &sd, &found);
+
+                if (found) {
+                    uint8_t cond_met = 0;
+                    float thr = rule->threshold;
+                    if (strcmp(rule->operator, ">") == 0)       cond_met = (val > thr);
+                    else if (strcmp(rule->operator, "<") == 0)  cond_met = (val < thr);
+                    else if (strcmp(rule->operator, "==") == 0) cond_met = (val == thr);
+                    else if (strcmp(rule->operator, ">=") == 0) cond_met = (val >= thr);
+                    else if (strcmp(rule->operator, "<=") == 0) cond_met = (val <= thr);
+
+                    if (cond_met) {
+                        int8_t relay_idx = Resolve_Output_Id(rule->output_id, &cfg_snap);
+                        if (relay_idx >= 0 && relay_idx < MAX_RELAYS) {
+                            uint8_t action_val = 0;
+                            if (string_equals_ci(rule->action, "ON") || strcmp(rule->action, "1") == 0) {
+                                action_val = 1;
+                            }
+                            Relay_SetState(relay_idx, action_val);
+                        }
+                    }
+                }
+            }
+        }
         /* ================================================================ */
 
         /* Strict 1ms delay — yields back to scheduler until next cycle */
-        vTaskDelayUntil(&xLastWakeTime, xPeriod);
+        osDelay(1);
     }
 }
 
@@ -412,8 +718,7 @@ static void messageArrived(MessageData* data) {
             target_str += 10; /* move past "target":" */
             value_str += 9;   /* move past "value":" */
             
-            Gateway_Config_t live_cfg;
-            Get_Shared_Config(&live_cfg);
+            Get_Shared_Config(&s_tasks_cfg);
             
             int relay_idx = -1;
             /* Look for relay_0, relay_1 etc */
@@ -423,16 +728,16 @@ static void messageArrived(MessageData* data) {
                 relay_idx = 0; /* Fallback for 'led' target */
             } else {
                 /* Try to match relay name */
-                for (int i=0; i<live_cfg.relay_count; i++) {
-                    int name_len = strlen(live_cfg.relays[i].name);
-                    if (name_len > 0 && strncmp(target_str, live_cfg.relays[i].name, name_len) == 0) {
+                for (int i=0; i<s_tasks_cfg.actuator_count; i++) {
+                    int name_len = strlen(s_tasks_cfg.actuators[i].name);
+                    if (name_len > 0 && strncmp(target_str, s_tasks_cfg.actuators[i].name, name_len) == 0) {
                         relay_idx = i;
                         break;
                     }
                 }
             }
             
-            if (relay_idx >= 0 && relay_idx < live_cfg.relay_count) {
+            if (relay_idx >= 0 && relay_idx < s_tasks_cfg.actuator_count) {
                 if (strncmp(value_str, "ON", 2) == 0 || strncmp(value_str, "1", 1) == 0) {
                     Relay_SetState(relay_idx, 1);
                     printf("[MQTT] Actuator %d ON\r\n", relay_idx);
@@ -455,58 +760,80 @@ static void Task_MQTTClient(void *arg) {
     static unsigned char tx_buf[2048];
     static unsigned char rx_buf[2048];
 
-    /* CRITICAL: Assign W5500 socket 1 to MQTT.
-     * Socket 0 is reserved exclusively for the HTTP server (HTTP_SOCK = 0).
-     * Without this call, n.my_socket is uninitialized stack garbage, which
-     * may randomly equal 0 and silently steal / corrupt the HTTP socket,
-     * causing ERR_CONNECTION_REFUSED on port 80. */
+    printf("[MQTT] Task entered, calling NewNetwork...\r\n");
     NewNetwork(&n, 1);
     
+    printf("[MQTT] NewNetwork done, entering 5-second link delay...\r\n");
     /* Wait 5 seconds after boot to let W5500 acquire link/IP */
     osDelay(5000);
     
-    printf("[MQTT] Client task starting on socket 1...\r\n");
+    printf("[MQTT] Client task woke up! Starting connection loop...\r\n");
 
     /* Track the broker+port we are currently connected to so we can detect
      * provisioning changes and reconnect automatically. */
     char  connected_broker[64] = {0};
     uint16_t connected_port   = 0;
+    uint32_t last_publish     = 0;
     
     for (;;) {
-        Gateway_Config_t cfg;
-        Get_Shared_Config(&cfg);
+        Get_Shared_Config(&s_tasks_cfg);
 
         /* Default port to 1883 if unset */
-        if (cfg.mqtt_port == 0) cfg.mqtt_port = 1883;
+        if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
         
-        /* Stop connecting/sending MQTT data unless provision status is "Active" */
-        if (strcmp(cfg.provision_status, "Active") != 0) {
+        if (s_tasks_cfg.mqtt_broker[0] == '\0') {
+            static uint32_t last_empty_print = 0;
+            uint32_t now_tick = osKernelGetTickCount();
+            if (now_tick - last_empty_print >= 5000) {
+                printf("[MQTT] Broker address is empty in config, skipping connection...\r\n");
+                last_empty_print = now_tick;
+            }
             g_mqtt_status.connected = 0;
             osDelay(2000);
             continue;
         }
-
-        if (cfg.mqtt_broker[0] == '\0') {
-            g_mqtt_status.connected = 0;
-            osDelay(5000);
-            continue;
-        }
         
         uint8_t broker_ip[4];
-        if (!Parse_IP(cfg.mqtt_broker, broker_ip)) {
-            printf("[MQTT] Invalid broker IP: %s\r\n", cfg.mqtt_broker);
-            g_mqtt_status.connected = 0;
-            osDelay(5000);
-            continue;
+        if (!Parse_IP(s_tasks_cfg.mqtt_broker, broker_ip)) {
+            /* Try to resolve via DNS */
+            printf("[MQTT] Resolving broker hostname via DNS: %s ...\r\n", s_tasks_cfg.mqtt_broker);
+            char log_msg[64];
+            snprintf(log_msg, sizeof(log_msg), "Resolving hostname: %s", s_tasks_cfg.mqtt_broker);
+            Log_Event("MQTT", log_msg);
+            
+            wiz_NetInfo net_info;
+            ctlnetwork(CN_GET_NETINFO, &net_info);
+            
+            static uint8_t dns_buf[MAX_DNS_BUF_SIZE];
+            static uint8_t dns_inited = 0;
+            if (!dns_inited) {
+                DNS_init(2, dns_buf);
+                dns_inited = 1;
+            }
+            
+            int8_t dns_res = DNS_run(net_info.dns, (uint8_t *)s_tasks_cfg.mqtt_broker, broker_ip);
+            if (dns_res != 1) {
+                printf("[MQTT] DNS resolution failed for: %s\r\n", s_tasks_cfg.mqtt_broker);
+                snprintf(log_msg, sizeof(log_msg), "DNS failed to resolve: %s", s_tasks_cfg.mqtt_broker);
+                Log_Event("MQTT", log_msg);
+                g_mqtt_status.connected = 0;
+                osDelay(5000);
+                continue;
+            }
+            printf("[MQTT] DNS Resolved %s -> %d.%d.%d.%d\r\n", 
+                   s_tasks_cfg.mqtt_broker, broker_ip[0], broker_ip[1], broker_ip[2], broker_ip[3]);
+            snprintf(log_msg, sizeof(log_msg), "DNS Resolved %s -> %d.%d.%d.%d", 
+                     s_tasks_cfg.mqtt_broker, broker_ip[0], broker_ip[1], broker_ip[2], broker_ip[3]);
+            Log_Event("MQTT", log_msg);
         }
         
-        /* Set active topic: provisioned sparkplug_topic takes priority */
+        /* Set active topic: sparkplug_topic takes priority if configured */
         char active_topic[128];
-        if (strcmp(cfg.provision_status, "Active") == 0 && cfg.sparkplug_topic[0] != '\0') {
-            strncpy(active_topic, cfg.sparkplug_topic, sizeof(active_topic) - 1);
+        if (s_tasks_cfg.sparkplug_topic[0] != '\0') {
+            strncpy(active_topic, s_tasks_cfg.sparkplug_topic, sizeof(active_topic) - 1);
             active_topic[sizeof(active_topic) - 1] = '\0';
         } else {
-            snprintf(active_topic, sizeof(active_topic), "telemetry/kontrx-%07lu", (unsigned long)cfg.serial);
+            snprintf(active_topic, sizeof(active_topic), "telemetry/kontrx-%07lu", (unsigned long)s_tasks_cfg.serial);
         }
         strncpy((char *)g_mqtt_status.active_topic, active_topic, sizeof(g_mqtt_status.active_topic) - 1);
         g_mqtt_status.active_topic[sizeof(g_mqtt_status.active_topic) - 1] = '\0';
@@ -516,7 +843,7 @@ static void Task_MQTTClient(void *arg) {
          * configured as the LWT topic: spBv1.0/{group_id}/NDEATH/{node_id}
          * ───────────────────────────────────────────────────────────────── */
         char lwt_topic[128];
-        get_sparkplug_topic(cfg.sparkplug_topic, "NDEATH", lwt_topic, sizeof(lwt_topic));
+        get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "NDEATH", lwt_topic, sizeof(lwt_topic));
         
         static uint8_t lwt_payload[64];
         uint64_t initial_ts = (uint64_t)g_uptime_seconds * 1000;
@@ -524,10 +851,10 @@ static void Task_MQTTClient(void *arg) {
 
         MQTTPacket_connectData connect_data = MQTTPacket_connectData_initializer;
         connect_data.MQTTVersion = 3;
-        connect_data.clientID.cstring = cfg.mqtt_client_id[0] ? cfg.mqtt_client_id : "kontrx-gateway";
-        if (cfg.mqtt_username[0]) {
-            connect_data.username.cstring = cfg.mqtt_username;
-            connect_data.password.cstring = cfg.mqtt_password;
+        connect_data.clientID.cstring = s_tasks_cfg.mqtt_client_id[0] ? s_tasks_cfg.mqtt_client_id : "kontrx-gateway";
+        if (s_tasks_cfg.mqtt_username[0]) {
+            connect_data.username.cstring = s_tasks_cfg.mqtt_username;
+            connect_data.password.cstring = s_tasks_cfg.mqtt_password;
         }
         connect_data.keepAliveInterval = 60;
         connect_data.cleansession = 0; // Persistent session
@@ -544,29 +871,76 @@ static void Task_MQTTClient(void *arg) {
         connect_data.will.qos = QOS1;
 
         /* Remember what broker we are about to connect to */
-        strncpy(connected_broker, cfg.mqtt_broker, sizeof(connected_broker) - 1);
+        strncpy(connected_broker, s_tasks_cfg.mqtt_broker, sizeof(connected_broker) - 1);
         connected_broker[sizeof(connected_broker) - 1] = '\0';
-        connected_port = cfg.mqtt_port;
+        connected_port = s_tasks_cfg.mqtt_port;
         
         printf("[MQTT] Connecting to broker %d.%d.%d.%d:%d...\r\n",
-               broker_ip[0], broker_ip[1], broker_ip[2], broker_ip[3], cfg.mqtt_port);
+               broker_ip[0], broker_ip[1], broker_ip[2], broker_ip[3], s_tasks_cfg.mqtt_port);
+        char conn_msg[64];
+        snprintf(conn_msg, sizeof(conn_msg), "Connecting to MQTT %s:%d...", s_tasks_cfg.mqtt_broker, s_tasks_cfg.mqtt_port);
+        Log_Event("MQTT", conn_msg);
         
-        if (ConnectNetwork(&n, broker_ip, cfg.mqtt_port) == SOCK_OK) {
+        if (ConnectNetwork(&n, broker_ip, s_tasks_cfg.mqtt_port) == SOCK_OK) {
             printf("[MQTT] TCP Connected! Initializing MQTT client...\r\n");
+            Log_Event("MQTT", "TCP connection established.");
             
             MQTTClientInit(&client, &n, 5000, tx_buf, sizeof(tx_buf), rx_buf, sizeof(rx_buf));
             
             int rc = MQTTConnect(&client, &connect_data);
             if (rc == SUCCESSS) {
                 printf("[MQTT] Connected successfully!\r\n");
+                Log_Event("MQTT", "MQTT session connected successfully.");
                 g_mqtt_status.connected = 1;
+
+                /* Flush offline queue before NBIRTH and live telemetry */
+                uint32_t cached_count = Partition_Queue_Count();
+                if (cached_count > 0) {
+                    printf("[MQTT] Connected! Flushing %lu cached offline records...\r\n", (unsigned long)cached_count);
+                    char cache_log[64];
+                    snprintf(cache_log, sizeof(cache_log), "Flushing %lu offline records...", (unsigned long)cached_count);
+                    Log_Event("MQTT", cache_log);
+
+                    OfflineRecord_t rec;
+                    while (Partition_Queue_Pop(&rec)) {
+                        char key_name[24] = {0};
+                        for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
+                            if (s_tasks_cfg.mqtt_mappings[m].source_type == rec.source_type &&
+                                s_tasks_cfg.mqtt_mappings[m].source_id == rec.source_id &&
+                                s_tasks_cfg.mqtt_mappings[m].enabled) {
+                                strncpy(key_name, s_tasks_cfg.mqtt_mappings[m].json_key, sizeof(key_name) - 1);
+                                break;
+                            }
+                        }
+                        
+                        if (key_name[0] != '\0') {
+                            char cache_payload[128];
+                            snprintf(cache_payload, sizeof(cache_payload),
+                                     "{\"timestamp\":%lu,\"%s\":%.2f}",
+                                     (unsigned long)rec.timestamp, key_name, rec.value);
+                            
+                            MQTTMessage msg;
+                            msg.qos = QOS1;
+                            msg.retained = 0;
+                            msg.dup = 0;
+                            msg.payload = (void*)cache_payload;
+                            msg.payloadlen = strlen(cache_payload);
+                            
+                            int cache_pub_rc = MQTTPublish(&client, active_topic, &msg);
+                            Log_Mqtt_Topic(active_topic, cache_pub_rc == SUCCESSS);
+                            osDelay(50); // Yield to prevent buffer congestion
+                        }
+                    }
+                    printf("[MQTT] Cache flushing completed.\r\n");
+                    Log_Event("MQTT", "Cache flushing completed successfully.");
+                }
 
                 /* ── Send NBIRTH (Node Birth) ──────────────────────────────────
                  * Immediately after connecting, announce online state and all metric
                  * definitions/initial values as a binary protobuf NBIRTH payload.
                  * ───────────────────────────────────────────────────────────── */
                 char nbirth_topic[128];
-                get_sparkplug_topic(cfg.sparkplug_topic, "NBIRTH", nbirth_topic, sizeof(nbirth_topic));
+                get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "NBIRTH", nbirth_topic, sizeof(nbirth_topic));
                 
                 static uint8_t nbirth_buf[1024];
                 TelemetryBatch_t nbirth_batch = {0};
@@ -574,7 +948,7 @@ static void Task_MQTTClient(void *arg) {
                 
                 uint64_t ts_ms = (uint64_t)g_uptime_seconds * 1000;
                 size_t nbirth_len = sparkplug_encode_nbirth(nbirth_buf, sizeof(nbirth_buf), ts_ms, 0,
-                                                            &nbirth_batch, &cfg, relayStates);
+                                                            &nbirth_batch, &s_tasks_cfg, relayStates);
                 if (nbirth_len > 0) {
                     MQTTMessage birth_msg;
                     birth_msg.qos        = QOS1;
@@ -584,34 +958,45 @@ static void Task_MQTTClient(void *arg) {
                     birth_msg.payloadlen = nbirth_len;
                     
                     printf("[MQTT] Publishing NBIRTH (%d bytes) to %s\r\n", (int)nbirth_len, nbirth_topic);
-                    MQTTPublish(&client, nbirth_topic, &birth_msg);
+                    int b_rc = MQTTPublish(&client, nbirth_topic, &birth_msg);
+                    Log_Mqtt_Topic(nbirth_topic, b_rc == SUCCESSS);
+                    if (b_rc == SUCCESSS) {
+                        Log_Event("MQTT", "Announced NBIRTH online state.");
+                    } else {
+                        char err_msg[64];
+                        snprintf(err_msg, sizeof(err_msg), "NBIRTH publish failed (err %d)", b_rc);
+                        Log_Event("MQTT", err_msg);
+                    }
                 }
                 
                 /* Subscribe to ThingsBoard RPC and generic commands */
                 MQTTSubscribe(&client, "v1/devices/me/rpc/request/+", QOS1, messageArrived);
                 MQTTSubscribe(&client, "commands/#", QOS1, messageArrived);
                 
-                uint32_t last_publish = osKernelGetTickCount();
+                last_publish = osKernelGetTickCount();
                 
                 while (client.isconnected) {
                     /* ── Detect any MQTT configuration changes (from provisioning or web UI) ── */
                     {
-                        Gateway_Config_t live_cfg;
-                        Get_Shared_Config(&live_cfg);
-                        if (live_cfg.mqtt_port == 0) live_cfg.mqtt_port = 1883;
-                        if (live_cfg.mqtt_interval == 0 || live_cfg.mqtt_interval > 86400) {
-                            live_cfg.mqtt_interval = 5;
+                        /* Save current config before reload to detect changes */
+                        Gateway_Config_t prev_cfg;
+                        memcpy(&prev_cfg, &s_tasks_cfg, sizeof(prev_cfg));
+
+                        Get_Shared_Config(&s_tasks_cfg);
+                        if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
+                        if (s_tasks_cfg.mqtt_interval == 0 || s_tasks_cfg.mqtt_interval > 86400) {
+                            s_tasks_cfg.mqtt_interval = 5;
                         }
 
-                        if (strncmp(live_cfg.mqtt_broker, connected_broker, sizeof(connected_broker)) != 0 ||
-                            live_cfg.mqtt_port != connected_port ||
-                            live_cfg.mqtt_interval != cfg.mqtt_interval ||
-                            live_cfg.mqtt_send_mode != cfg.mqtt_send_mode ||
-                            strcmp(live_cfg.mqtt_client_id, cfg.mqtt_client_id) != 0 ||
-                            strcmp(live_cfg.mqtt_username, cfg.mqtt_username) != 0 ||
-                            strcmp(live_cfg.mqtt_password, cfg.mqtt_password) != 0 ||
-                            strcmp(live_cfg.sparkplug_topic, cfg.sparkplug_topic) != 0 ||
-                            strcmp(live_cfg.provision_status, cfg.provision_status) != 0) {
+                        if (strncmp(s_tasks_cfg.mqtt_broker, connected_broker, sizeof(connected_broker)) != 0 ||
+                            s_tasks_cfg.mqtt_port != connected_port ||
+                            s_tasks_cfg.mqtt_interval != prev_cfg.mqtt_interval ||
+                            s_tasks_cfg.mqtt_send_mode != prev_cfg.mqtt_send_mode ||
+                            strcmp(s_tasks_cfg.mqtt_client_id, prev_cfg.mqtt_client_id) != 0 ||
+                            strcmp(s_tasks_cfg.mqtt_username, prev_cfg.mqtt_username) != 0 ||
+                            strcmp(s_tasks_cfg.mqtt_password, prev_cfg.mqtt_password) != 0 ||
+                            strcmp(s_tasks_cfg.sparkplug_topic, prev_cfg.sparkplug_topic) != 0 ||
+                            strcmp(s_tasks_cfg.provision_status, prev_cfg.provision_status) != 0) {
                             
                             printf("[MQTT] Config/provision status changed — reconnecting/stopping...\r\n");
                             break; /* exit inner loop → reconnect or sleep with new settings */
@@ -619,7 +1004,7 @@ static void Task_MQTTClient(void *arg) {
                     }
 
                     /* Call MQTTYield to maintain keep-alives and process incoming */
-                    int yield_rc = MQTTYield(&client, 10);
+                    int yield_rc = MQTTYield(&client, 100);
                     if (yield_rc != SUCCESSS) {
                         printf("[MQTT] MQTTYield error: %d\r\n", yield_rc);
                         break;
@@ -627,12 +1012,12 @@ static void Task_MQTTClient(void *arg) {
                     /* Send updates as soon as changes occur */
                     if (1) {
                         /* Refresh config in case interval changed */
-                        Get_Shared_Config(&cfg);
-                        if (cfg.mqtt_port == 0) cfg.mqtt_port = 1883;
+                        Get_Shared_Config(&s_tasks_cfg);
+                        if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
 
                         /* Refresh active topic from latest config */
-                        if (strcmp(cfg.provision_status, "Active") == 0 && cfg.sparkplug_topic[0] != '\0') {
-                            strncpy(active_topic, cfg.sparkplug_topic, sizeof(active_topic) - 1);
+                        if (strcmp(s_tasks_cfg.provision_status, "Active") == 0 && s_tasks_cfg.sparkplug_topic[0] != '\0') {
+                            strncpy(active_topic, s_tasks_cfg.sparkplug_topic, sizeof(active_topic) - 1);
                             active_topic[sizeof(active_topic) - 1] = '\0';
                         }
                         strncpy((char *)g_mqtt_status.active_topic, active_topic, sizeof(g_mqtt_status.active_topic) - 1);
@@ -652,7 +1037,7 @@ static void Task_MQTTClient(void *arg) {
                         
                         /* Check for relay changes before skipping on batch.count == 0 */
                         uint8_t relay_changed = 0;
-                        for (int i = 0; i < cfg.relay_count && i < MAX_RELAYS; i++) {
+                        for (int i = 0; i < s_tasks_cfg.actuator_count && i < MAX_RELAYS; i++) {
                             if (relayStates[i] != cov_last_relay[i]) {
                                 relay_changed = 1;
                                 break;
@@ -661,12 +1046,11 @@ static void Task_MQTTClient(void *arg) {
 
                         /* ── Skip if no sensors and no relay changes ───────────────── */
                         if (batch.count == 0 && !relay_changed && (g_uptime_seconds - cov_last_heartbeat_s) < 300U) {
-                            osDelay(20);
+                            osDelay(100);
                             continue;
                         }
 
                         uint8_t has_change = 0;
-                        uint8_t force_heartbeat = 0;
                         const char *trigger = "periodic";
                         
                         if (relay_changed) {
@@ -674,7 +1058,13 @@ static void Task_MQTTClient(void *arg) {
                             trigger = "relay";
                         }
 
-                        if (cfg.mqtt_send_mode == 1) {
+                        if (s_tasks_cfg.mqtt_send_mode == 0) {
+                            /* Periodic mode: check if interval has elapsed */
+                            if ((osKernelGetTickCount() - last_publish) >= pdMS_TO_TICKS(s_tasks_cfg.mqtt_interval * 1000)) {
+                                has_change = 1;
+                                trigger = "periodic";
+                            }
+                        } else if (s_tasks_cfg.mqtt_send_mode == 1) {
                             /* On Change / CoV mode: check if values changed or heartbeat expired */
                             #define COV_DB_PH      0.05f
                             #define COV_DB_ORP     5.0f
@@ -703,7 +1093,6 @@ static void Task_MQTTClient(void *arg) {
 
                             /* Heartbeat logic */
                             if ((g_uptime_seconds - cov_last_heartbeat_s) >= COV_HEARTBEAT_S) {
-                                force_heartbeat = 1;
                                 cov_last_heartbeat_s = g_uptime_seconds;
                                 has_change = 1;
                                 trigger = "heartbeat";
@@ -712,7 +1101,7 @@ static void Task_MQTTClient(void *arg) {
                             if (!has_change) {
                                 for (int i = 0; i < batch.count && i < MAX_SENSORS; i++) {
                                     if (!batch.records[i].valid) continue;
-                                    int idx = Get_Sensor_Config_Index(&cfg, batch.records[i].type, batch.records[i].id);
+                                    int idx = Get_Sensor_Config_Index(&s_tasks_cfg, batch.records[i].type, batch.records[i].id);
                                     if (idx < 0) continue; /* skip unconfigured sensors */
 
                                     if (!cov_ever_pub[idx]) { has_change = 1; trigger = "birth"; break; }
@@ -750,14 +1139,11 @@ static void Task_MQTTClient(void *arg) {
                                     if (dt >= 0.5f) { has_change = 1; trigger = "cov_temp"; break; }
                                 }
                             }
+                        }
 
-                            /* Rate limit removed per user request: system now inherently 
-                             * bounded to 1Hz max via Modbus polling delay (1000ms) */
-
-                            if (!has_change) {
-                                osDelay(20);
-                                continue;
-                            }
+                        if (!has_change) {
+                            osDelay(20);
+                            continue;
                         }
 
                         /* ── 6. RTC Timestamp (seconds since epoch / uptime) ─────── */
@@ -767,7 +1153,7 @@ static void Task_MQTTClient(void *arg) {
                         /* Update baselines */
                         for (int i = 0; i < batch.count && i < MAX_SENSORS; i++) {
                             if (batch.records[i].valid) {
-                                int idx = Get_Sensor_Config_Index(&cfg, batch.records[i].type, batch.records[i].id);
+                                int idx = Get_Sensor_Config_Index(&s_tasks_cfg, batch.records[i].type, batch.records[i].id);
                                 if (idx >= 0) {
                                     cov_last_val[idx] = batch.records[i].avg_value;
                                     cov_last_tmp[idx] = batch.records[i].avg_temp;
@@ -777,61 +1163,181 @@ static void Task_MQTTClient(void *arg) {
                         }
                         
                         /* Update relay baseline */
-                        for (int i = 0; i < cfg.relay_count && i < MAX_RELAYS; i++) {
+                        for (int i = 0; i < s_tasks_cfg.actuator_count && i < MAX_RELAYS; i++) {
                             cov_last_relay[i] = relayStates[i];
                         }
 
-                        /* Build binary Sparkplug B DDATA payload */
-                        static uint8_t ddata_buf[1024];
-                        uint64_t ts_ms = (uint64_t)g_uptime_seconds * 1000;
-                        
-                        /* Increment Sparkplug sequence */
-                        cov_seq = (cov_seq + 1) & 0xFF;
-                        if (cov_seq == 0) cov_seq = 1;
+                        int pub_rc = -1;
+                        if (s_tasks_cfg.mqtt_mapping_count > 0) {
+                            static char json_buf[512];
+                            int json_pos = 0;
+                            json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos,
+                                                 "{\"timestamp\":%lu", (unsigned long)g_uptime_seconds);
+                            
+                            for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
+                                if (!s_tasks_cfg.mqtt_mappings[m].enabled) continue;
+                                
+                                if (s_tasks_cfg.mqtt_mappings[m].source_type == MAP_SOURCE_SENSOR) {
+                                    for (int s = 0; s < batch.count; s++) {
+                                        if (batch.records[s].id == s_tasks_cfg.mqtt_mappings[m].source_id && batch.records[s].valid) {
+                                            json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos,
+                                                                ",\"%s\":%.2f",
+                                                                s_tasks_cfg.mqtt_mappings[m].json_key,
+                                                                batch.records[s].avg_value);
+                                            break;
+                                        }
+                                    }
+                                } else if (s_tasks_cfg.mqtt_mappings[m].source_type == MAP_SOURCE_ACTUATOR) {
+                                    json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos,
+                                                        ",\"%s\":%u",
+                                                        s_tasks_cfg.mqtt_mappings[m].json_key,
+                                                        relayStates[s_tasks_cfg.mqtt_mappings[m].source_id]);
+                                }
+                            }
+                            json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos, "}");
 
-                        size_t ddata_len = sparkplug_encode_ddata(ddata_buf, sizeof(ddata_buf), ts_ms, cov_seq,
-                                                                  &batch, relayStates);
-                                                                  
-                        char ddata_topic[128];
-                        get_sparkplug_topic(cfg.sparkplug_topic, "DDATA", ddata_topic, sizeof(ddata_topic));
+                            MQTTMessage message;
+                            message.qos        = QOS1;
+                            message.retained   = 1;
+                            message.dup        = 0;
+                            message.payload    = (void*)json_buf;
+                            message.payloadlen = strlen(json_buf);
 
-                        /* ── 5+7. QoS1 + Retained publish ───────────────────────── */
-                        MQTTMessage message;
-                        message.qos        = QOS1;  /* PUBACK required — no silent loss */
-                        message.retained   = 1;     /* new subscribers get last value   */
-                        message.dup        = 0;
-                        message.payload    = (void*)ddata_buf;
-                        message.payloadlen = ddata_len;
-
-                        printf("[MQTT] Pub DDATA(%s) seq=%lu size=%d: %s\r\n",
-                               trigger, (unsigned long)cov_seq, (int)ddata_len, ts_str);
-
-                        int pub_rc = MQTTPublish(&client, ddata_topic, &message);
-                        if (pub_rc == SUCCESSS) {
-                            cov_last_pub_tick = osKernelGetTickCount(); /* update rate-limit gate */
-                            Log_Mqtt_Topic(ddata_topic, 1);
+                            printf("[MQTT] Pub Custom JSON size=%d: %s\r\n", (int)strlen(json_buf), ts_str);
+                            pub_rc = MQTTPublish(&client, active_topic, &message);
                         } else {
-                            printf("[MQTT] Publish failed: %d\r\n", pub_rc);
-                            Log_Mqtt_Topic(ddata_topic, 0);
-                            break;
+                            static uint8_t ddata_buf[1024];
+                            uint64_t ts_ms = (uint64_t)g_uptime_seconds * 1000;
+                            
+                            /* Increment Sparkplug sequence */
+                            cov_seq = (cov_seq + 1) & 0xFF;
+                            if (cov_seq == 0) cov_seq = 1;
+
+                            size_t ddata_len = sparkplug_encode_ddata(ddata_buf, sizeof(ddata_buf), ts_ms, cov_seq,
+                                                                      &batch, relayStates);
+                                                                      
+                            char ddata_topic[128];
+                            get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "DDATA", ddata_topic, sizeof(ddata_topic));
+
+                            /* ── 5+7. QoS1 + Retained publish ───────────────────────── */
+                            MQTTMessage message;
+                            message.qos        = QOS1;  /* PUBACK required — no silent loss */
+                            message.retained   = 1;     /* new subscribers get last value   */
+                            message.dup        = 0;
+                            message.payload    = (void*)ddata_buf;
+                            message.payloadlen = ddata_len;
+
+                            pub_rc = MQTTPublish(&client, ddata_topic, &message);
+                        }
+
+                        if (pub_rc == SUCCESSS) {
+                            cov_last_pub_tick = osKernelGetTickCount();
+                            last_publish = cov_last_pub_tick;
+                            char pub_msg[128];
+                            snprintf(pub_msg, sizeof(pub_msg), "Published telemetry data to: %s", active_topic);
+                            Log_Event("MQTT", pub_msg);
+                            Log_Mqtt_Topic(active_topic, 1);
+                        } else {
+                            Log_Mqtt_Topic(active_topic, 0);
+                            printf("[MQTT] Publish failed, caching telemetry...\r\n");
+                            for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
+                                if (!s_tasks_cfg.mqtt_mappings[m].enabled) continue;
+                                
+                                OfflineRecord_t rec;
+                                rec.timestamp = g_uptime_seconds;
+                                rec.source_type = s_tasks_cfg.mqtt_mappings[m].source_type;
+                                rec.source_id = s_tasks_cfg.mqtt_mappings[m].source_id;
+                                rec.valid = 0;
+                                rec.value = 0.0f;
+                                rec.temp = 0.0f;
+                                
+                                if (rec.source_type == MAP_SOURCE_SENSOR) {
+                                    for (int s = 0; s < batch.count; s++) {
+                                        if (batch.records[s].id == rec.source_id && batch.records[s].valid) {
+                                            rec.value = batch.records[s].avg_value;
+                                            rec.temp = batch.records[s].avg_temp;
+                                            rec.valid = 1;
+                                            break;
+                                        }
+                                    }
+                                } else if (rec.source_type == MAP_SOURCE_ACTUATOR) {
+                                    rec.value = relayStates[rec.source_id];
+                                    rec.valid = 1;
+                                }
+                                
+                                if (rec.valid) {
+                                    Partition_Queue_Push(&rec);
+                                }
+                            }
+                            break; // Trigger reconnect
                         }
                     }
 
-                    osDelay(20);
-
+                    osDelay(100);
                 }
             } else {
                 printf("[MQTT] Connect failed, rc = %d\r\n", rc);
+                Log_Event("MQTT", "MQTT connect rejected by broker.");
             }
             g_mqtt_status.connected = 0;
             disconnect(1);
             close(1);
         } else {
             printf("[MQTT] TCP Connection failed.\r\n");
-            close(1); /* Ensure socket is closed/released on connection failure */
+            Log_Event("MQTT", "TCP connection to broker failed.");
+            close(1);
         }
         
-        osDelay(5000); /* Delay before retry connection */
+        // Cache data locally while disconnected
+        {
+            uint32_t start_retry_ms = osKernelGetTickCount();
+            while (osKernelGetTickCount() - start_retry_ms < pdMS_TO_TICKS(5000)) {
+                if ((osKernelGetTickCount() - last_publish) >= pdMS_TO_TICKS(s_tasks_cfg.mqtt_interval * 1000)) {
+                    TelemetryBatch_t batch = {0};
+                    Modbus_DMA_ConsumeBatch(&batch);
+                    
+                    uint8_t cached_any = 0;
+                    for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
+                        if (!s_tasks_cfg.mqtt_mappings[m].enabled) continue;
+                        
+                        OfflineRecord_t rec;
+                        rec.timestamp = g_uptime_seconds;
+                        rec.source_type = s_tasks_cfg.mqtt_mappings[m].source_type;
+                        rec.source_id = s_tasks_cfg.mqtt_mappings[m].source_id;
+                        rec.valid = 0;
+                        rec.value = 0.0f;
+                        rec.temp = 0.0f;
+                        
+                        if (rec.source_type == MAP_SOURCE_SENSOR) {
+                            for (int s = 0; s < batch.count; s++) {
+                                if (batch.records[s].id == rec.source_id && batch.records[s].valid) {
+                                    rec.value = batch.records[s].avg_value;
+                                    rec.temp = batch.records[s].avg_temp;
+                                    rec.valid = 1;
+                                    break;
+                                }
+                            }
+                        } else if (rec.source_type == MAP_SOURCE_ACTUATOR) {
+                            rec.value = relayStates[rec.source_id];
+                            rec.valid = 1;
+                        }
+                        
+                        if (rec.valid) {
+                            Partition_Queue_Push(&rec);
+                            cached_any = 1;
+                        }
+                    }
+                    if (cached_any) {
+                        char cache_msg[64];
+                        snprintf(cache_msg, sizeof(cache_msg), "Broker offline. Telemetry cached. Queue: %lu",
+                                 (unsigned long)Partition_Queue_Count());
+                        Log_Event("MQTT", cache_msg);
+                    }
+                    last_publish = osKernelGetTickCount();
+                }
+                osDelay(100);
+            }
+        }
     }
 }
 
@@ -843,31 +1349,42 @@ osThreadId_t g_tid_mqtt   = NULL;
  *  Called from main().  Does NOT return.
  * ====================================================================== */
 void RTOS_Tasks_Init(void) {
+    // 1. Initialize cJSON hooks with FreeRTOS heap memory functions
+    cJSON_Hooks cjson_hooks = {
+        .malloc_fn = pvPortMalloc,
+        .free_fn = vPortFree
+    };
+    cJSON_InitHooks(&cjson_hooks);
+
+    // 2. Initialize rules mutex and load rules configuration
+    if (!rulesMutex) {
+        rulesMutex = osMutexNew(NULL);
+    }
+    Partition_LoadRules(&activeRules);
+
     osThreadAttr_t attr = {0};
 
     /* Task 1 — Control Engine */
     attr.name       = "ControlEng";
-    attr.stack_size = 2048; // زدناها من 512 إلى 2048 لضمان الاستقرار
+    attr.stack_size = 6144; // Increased to 6KB to guarantee stack safety for string resolution and printfs
     attr.priority   = osPriorityRealtime;
     osThreadNew(Task_ControlEngine, NULL, &attr);
 
     /* Task 2 — Modbus Sensor Poll */
     attr.name       = "ModbusPoll";
     attr.stack_size = 4096; 
-    attr.priority   = osPriorityAboveNormal;
+    attr.priority   = osPriorityNormal;
     g_tid_modbus    = osThreadNew(Task_ModbusSensorPoll, NULL, &attr);
 
     /* Task 3 — HTTP Server */
     attr.name       = "HTTPServer";
-    attr.stack_size = 8192;  /* Increased from 4096: Gateway_Config_t is ~1KB,
-                              * up to 10 endpoint handlers allocate local copies,
-                              * plus snprintf frames → must be 8KB minimum. */
+    attr.stack_size = 12288;  /* Increased to 12KB to guarantee absolute stack overflow protection */
     attr.priority   = osPriorityNormal;
     osThreadNew(Task_HTTPServer, NULL, &attr);
 
     /* Task 4 — OTA Background */
     attr.name       = "OTAUpdate";
-    attr.stack_size = 2048; // زدناها من 1024 إلى 2048
+    attr.stack_size = 4096; // Increased to 4KB for firmware write stack buffer safety
     attr.priority   = osPriorityLow;
     osThreadNew(Task_OTAUpdate, NULL, &attr);
 
@@ -876,7 +1393,7 @@ void RTOS_Tasks_Init(void) {
     attr.stack_size = 8192;  /* Increased from 4096: MQTTClient+Network structs +
                               * LWT payload + sparkplug encode buffers + tx/rx[512]
                               * + deep MQTTConnect/MQTTPublish call frames. */
-    attr.priority   = osPriorityNormal;
+    attr.priority   = osPriorityAboveNormal;
     g_tid_mqtt      = osThreadNew(Task_MQTTClient, NULL, &attr);
 
     osKernelStart();

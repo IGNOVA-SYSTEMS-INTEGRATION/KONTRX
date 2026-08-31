@@ -27,8 +27,8 @@
 /* Memory allocation related definitions. */
 #define configSUPPORT_STATIC_ALLOCATION         0
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
-#define configTOTAL_HEAP_SIZE                   ( 48 * 1024 ) /* STM32F407 has 192KB RAM;
-                                                               * 48KB covers all task stacks
+#define configTOTAL_HEAP_SIZE                   ( 44 * 1024 ) /* STM32F407 has 192KB RAM;
+                                                               * 44KB covers all task stacks
                                                                * + TCBs + mutexes + headroom */
 #define configAPPLICATION_ALLOCATED_HEAP        0
 
@@ -65,7 +65,7 @@
 #define INCLUDE_xTaskGetSchedulerState          1
 #define INCLUDE_xTaskGetCurrentTaskHandle       1
 #define INCLUDE_uxTaskGetStackHighWaterMark     1 /* Enables stack watermark diagnostics */
-#define INCLUDE_xTaskGetIdleTaskHandle          0
+#define INCLUDE_xTaskGetIdleTaskHandle          1
 #define INCLUDE_eTaskGetState                   0
 #define INCLUDE_xEventGroupSetBitFromISR        1
 #define INCLUDE_xTimerPendFunctionCall          1
@@ -84,5 +84,16 @@
 #define vPortSVCHandler SVC_Handler
 #define xPortPendSVHandler PendSV_Handler
 #define xPortSysTickHandler SysTick_Handler
+
+/* Hook into task switched in / out to track CPU load dynamically. */
+#define traceTASK_SWITCHED_IN()  do { \
+    extern void KontrxTaskSwitchedIn(void*); \
+    KontrxTaskSwitchedIn(pxCurrentTCB); \
+} while(0)
+
+#define traceTASK_SWITCHED_OUT() do { \
+    extern void KontrxTaskSwitchedOut(void*); \
+    KontrxTaskSwitchedOut(pxCurrentTCB); \
+} while(0)
 
 #endif /* FREERTOS_CONFIG_H */

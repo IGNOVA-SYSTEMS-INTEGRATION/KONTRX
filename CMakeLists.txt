@@ -6,12 +6,12 @@ set(TARGET_MCU "STM32F4" CACHE STRING "Target Microcontroller")
 
 # CPU Specific Flags
 set(CPU_FLAGS "-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -O0 -g -Wall -Wextra -D_WIZCHIP_=W5500")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -O0 -g -Wall -Wextra -D_WIZCHIP_=W5500")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${CPU_FLAGS} -g")
 
 # Include Directories
-include_directories(HAL APP MCAL/STM32F4 ioLibrary_Driver/Ethernet ioLibrary_Driver/Ethernet/W5500 ioLibrary_Driver/Internet/DHCP ioLibrary_Driver/Internet/MQTT ioLibrary_Driver/Internet/MQTT/MQTTPacket/src)
+include_directories(HAL APP MCAL/STM32F4 ioLibrary_Driver/Ethernet ioLibrary_Driver/Ethernet/W5500 ioLibrary_Driver/Internet/DHCP ioLibrary_Driver/Internet/DNS ioLibrary_Driver/Internet/MQTT ioLibrary_Driver/Internet/MQTT/MQTTPacket/src)
 include_directories(. FreeRTOS/include FreeRTOS/portable/GCC/ARM_CM4F)
 
 # Common MCAL Sources
@@ -23,6 +23,9 @@ set(MCAL_SOURCES
     MCAL/STM32F4/spi_stm32.c
     MCAL/STM32F4/flash_stm32.c
     MCAL/STM32F4/rtc_stm32.c
+    HAL/w25q16.c
+    HAL/flash_partition.c
+    HAL/plc_control.c
 )
 
 # Ethernet Drivers
@@ -31,6 +34,7 @@ set(ETHERNET_SOURCES
     ioLibrary_Driver/Ethernet/socket.c
     ioLibrary_Driver/Ethernet/W5500/w5500.c
     ioLibrary_Driver/Internet/DHCP/dhcp.c
+    ioLibrary_Driver/Internet/DNS/dns.c
 )
 
 # -------------------------------------------------------------------
@@ -56,6 +60,7 @@ set(RTOS_APP_SOURCES
     APP/sparkplug_b_enc.c
     APP/http_server_task.c
     APP/ota_task.c
+    APP/cJSON.c
     HAL/modbus_dma.c
     ioLibrary_Driver/Internet/MQTT/MQTTClient.c
     ioLibrary_Driver/Internet/MQTT/mqtt_interface.c
