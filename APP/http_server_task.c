@@ -1078,11 +1078,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cursor = close + 1;
         }
 
-        if (actuator_count == 0) {
-            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"No actuators provided.\"}");
-            Send_Response(sn, HTTP_200_JSON, tx_buf);
-            return;
-        }
+        /* Allow empty relay list (clears config) */
 
         /* Build and update new config */
         Get_Shared_Config(&s_http_cfg_temp);
