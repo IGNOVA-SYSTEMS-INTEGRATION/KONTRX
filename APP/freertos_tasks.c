@@ -360,6 +360,12 @@ void Relay_Init(void) {
 
 void Relay_SetState(uint8_t idx, uint8_t state) {
     if (idx >= MAX_RELAYS) return;
+    
+    // Safety guard: return immediately if state is already in target state.
+    // This prevents endless blocking SPI flash writes inside the Control Engine loop.
+    if (relayStates[idx] == state) {
+        return;
+    }
 
     Get_Shared_Config(&s_tasks_cfg);
 

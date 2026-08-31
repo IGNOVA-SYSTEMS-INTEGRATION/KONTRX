@@ -134,8 +134,9 @@ static void Send_JSON_Logs(uint8_t sn) {
     uint32_t processed = 0;
     uint32_t printed = 0;
     char line_buf[128];
+    uint32_t safety_counter = 0;
 
-    while (processed < count) {
+    while (processed < count && safety_counter++ < 1000) {
         taskENTER_CRITICAL();
         // Check if we need to wrap at the end of the buffer
         if (temp_tail + sizeof(LogHeader_t) > LOG_BUFFER_SIZE) {
