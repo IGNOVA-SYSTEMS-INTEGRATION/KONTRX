@@ -52,6 +52,8 @@ static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay ta
 #include "cJSON.h"
 
 RuleConfig_t activeRules;
+RuleConfig_t pendingRules;
+volatile uint8_t hasPendingRules = 0;
 osMutexId_t rulesMutex = NULL;
 volatile uint32_t rulesTestTicks = 0;
 volatile uint8_t rulesTesting = 0;
@@ -479,6 +481,18 @@ static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *c
         }
     }
     
+    // 3. Try to parse as numeric sensor ID
+    char *endptr;
+    long target_id = strtol(input_id, &endptr, 10);
+    if (*endptr == '\0' && target_id >= 0) {
+        for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
+            if (sd->readings[j].id == (uint8_t)target_id && sd->readings[j].valid) {
+                *found = 1;
+                return sd->readings[j].value;
+            }
+        }
+    }
+    
     return -9999.0f;
 }
 
@@ -606,8 +620,8 @@ static void Task_ControlEngine(void *arg) {
         }
         /* ================================================================ */
 
-        /* Strict 1ms delay — yields back to scheduler until next cycle */
-        osDelay(1);
+        /* Strict 10ms delay — 100Hz is plenty for relay control (PLCs run at 10-100Hz) */
+        osDelay(10);
     }
 }
 

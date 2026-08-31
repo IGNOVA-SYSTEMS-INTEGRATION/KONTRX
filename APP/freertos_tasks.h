@@ -90,6 +90,8 @@ extern osThreadId_t g_tid_mqtt;
 extern SemaphoreHandle_t spiMutex;
 
 extern RuleConfig_t activeRules;
+extern RuleConfig_t pendingRules;
+extern volatile uint8_t hasPendingRules;
 extern osMutexId_t rulesMutex;
 extern volatile uint32_t rulesTestTicks;
 extern volatile uint8_t rulesTesting;
