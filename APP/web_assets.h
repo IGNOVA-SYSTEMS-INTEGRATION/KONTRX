@@ -182,7 +182,7 @@ static const char KONTRX_HTML[] =
     "</svg>"
     "<div>"
       "<div class='hdr-title'>Kontrx</div>"
-      "<div class='hdr-sub'>STM32F407 &nbsp;|&nbsp; Edge Gateway &nbsp;|&nbsp; FW v<span id='hdr-fw'>1.0.1</span></div>"
+      "<div class='hdr-sub'>STM32F407 &nbsp;|&nbsp; Edge Gateway &nbsp;|&nbsp; FW v<span id='hdr-fw'>1.1.0</span></div>"
     "</div>"
   "</div>"
   "<div class='hdr-status'>"

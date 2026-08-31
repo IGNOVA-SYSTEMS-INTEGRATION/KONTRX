@@ -15,7 +15,7 @@
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. (beta 1.0.1) */
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.1.0"
 
 /* Sensor types: 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US */
 typedef struct {
