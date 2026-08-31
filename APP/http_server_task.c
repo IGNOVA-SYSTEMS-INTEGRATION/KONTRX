@@ -318,83 +318,37 @@ static int JSON_StatusResponse(char *buf, int buflen) {
 
     ctlnetwork(CN_GET_NETINFO, &s_ni);
 
+    /* Fetch rules versions and pending flags safely under rulesMutex */
+    uint8_t has_pending = 0;
+    char pending_ver[36] = {0};
+    char active_ver[36] = {0};
+    if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
+        has_pending = hasPendingRules;
+        strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+        strncpy(active_ver, activeRules.version_id, sizeof(active_ver) - 1);
+        osMutexRelease(rulesMutex);
+    }
+
     pos += snprintf(buf + pos, buflen - pos,
         "\"uptime_s\":%lu,"
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
         "\"serial\":\"KX-%07lu\","
         "\"ip\":\"%d.%d.%d.%d\","
         "\"fw\":\"" FW_VERSION "\","
-        "\"device_id\":\"%s\","
-        "\"provision_status\":\"%s\","
-        "\"provision_message\":\"%s\","
-        "\"sparkplug_topic\":\"%s\","
-        "\"pending_sparkplug_topic\":\"%s\","
-        "\"mqtt\":{"
-          "\"connected\":%u,"
-          "\"interval\":%lu,"
-          "\"send_mode\":%u,"
-          "\"active_topic\":\"%s\","
-          "\"broker\":\"%s\","
-          "\"port\":%u,"
-          "\"client_id\":\"%s\","
-          "\"username\":\"%s\","
-          "\"log\":["
+        "\"model\":\"KX-F407\","
+        "\"rules_version_id\":\"%s\","
         ,
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         (unsigned long)s_cfg.serial,
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
-        s_cfg.device_id, s_cfg.provision_status, s_cfg.provision_message, s_cfg.sparkplug_topic,
-        s_cfg.pending_sparkplug_topic,
-        g_mqtt_status.connected, (unsigned long)s_cfg.mqtt_interval, s_cfg.mqtt_send_mode, g_mqtt_status.active_topic,
-        s_cfg.mqtt_broker, s_cfg.mqtt_port, s_cfg.mqtt_client_id, s_cfg.mqtt_username);
+        active_ver[0] ? active_ver : "default");
 
-    for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"topic\":\"%s\",\"success\":%u,\"time\":%lu}%s",
-            g_mqtt_status.log[i].topic,
-            g_mqtt_status.log[i].success,
-            (unsigned long)g_mqtt_status.log[i].timestamp,
-            (i < g_mqtt_status.log_count - 1) ? "," : "");
-    }
-    pos += snprintf(buf + pos, buflen - pos, "]},\"ota_debug\":{"
-        "\"fw_size\":%lu,"
-        "\"computed_crc\":\"0x%08lX\","
-        "\"staged_sp\":\"0x%08lX\","
-        "\"sp_valid\":%u,"
-        "\"meta_magic\":\"0x%08lX\","
-        "\"meta_status\":\"0x%08lX\","
-        "\"meta_size\":%lu,"
-        "\"meta_crc32\":\"0x%08lX\","
-        "\"meta_ok\":%u,"
-        "\"write_ok\":%u,"
-        "\"step\":%lu"
-        "}",          /* close ota_debug only — root object still open */
-        (unsigned long)g_ota_debug.fw_size,
-        (unsigned long)g_ota_debug.computed_crc,
-        (unsigned long)g_ota_debug.staged_sp,
-        g_ota_debug.sp_valid,
-        (unsigned long)g_ota_debug.meta_magic,
-        (unsigned long)g_ota_debug.meta_status,
-        (unsigned long)g_ota_debug.meta_size,
-        (unsigned long)g_ota_debug.meta_crc32,
-        g_ota_debug.meta_ok,
-        g_ota_debug.write_ok,
-        (unsigned long)g_ota_debug.step);
-
-    /* CPU and RAM (Heap) stats — appended inside root object, then close it */
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
-    uint8_t has_pending = 0;
-    char pending_ver[36] = {0};
-    if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
-        has_pending = hasPendingRules;
-        strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
-        osMutexRelease(rulesMutex);
-    }
+
     pos += snprintf(buf + pos, buflen - pos,
-        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"}}",
-        /* ↑ note trailing }} : closes sys object AND root object         */
+        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"}}",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
