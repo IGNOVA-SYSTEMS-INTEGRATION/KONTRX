@@ -164,6 +164,8 @@ extern Modbus_SensorData_t sharedSensorData;
 extern Gateway_Config_t sharedConfig;
 extern uint8_t relayStates[MAX_RELAYS];
 extern volatile ModbusScanStatus_t g_scan_status;
+extern volatile uint8_t g_config_changed;
+extern volatile uint32_t g_config_version;
 
 /* Modbus DMA Driver Initialization & Execution */
 void Modbus_DMA_Init(void);

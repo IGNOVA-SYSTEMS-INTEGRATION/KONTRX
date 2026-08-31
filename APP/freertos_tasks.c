@@ -417,7 +417,6 @@ void Relay_SetState(uint8_t idx, uint8_t state) {
 
     s_tasks_cfg.actuators[idx].state = state;
     Update_Shared_Config(&s_tasks_cfg);
-    Partition_SaveConfig(&s_tasks_cfg); // Persist status in external config partition
 }
 
 extern osMutexId_t configMutex;
@@ -584,9 +583,13 @@ static void Task_ControlEngine(void *arg) {
         if (has_rules) {
             // Non-blocking snapshot of current config to map names
             static Gateway_Config_t cfg_snap;
-            if (configMutex && osMutexAcquire(configMutex, 0) == osOK) {
-                memcpy(&cfg_snap, &sharedConfig, sizeof(Gateway_Config_t));
-                osMutexRelease(configMutex);
+            static uint32_t local_config_version = 0;
+            if (local_config_version != g_config_version) {
+                if (configMutex && osMutexAcquire(configMutex, 0) == osOK) {
+                    memcpy(&cfg_snap, &sharedConfig, sizeof(Gateway_Config_t));
+                    local_config_version = g_config_version;
+                    osMutexRelease(configMutex);
+                }
             }
 
             for (uint32_t i = 0; i < localRules.rule_count; i++) {
@@ -992,12 +995,15 @@ static void Task_MQTTClient(void *arg) {
                 
                 while (client.isconnected) {
                     /* ── Detect any MQTT configuration changes (from provisioning or web UI) ── */
-                    {
+                    static uint32_t local_mqtt_version = 0;
+                    if (local_mqtt_version != g_config_version) {
                         /* Save current config before reload to detect changes */
                         Gateway_Config_t prev_cfg;
                         memcpy(&prev_cfg, &s_tasks_cfg, sizeof(prev_cfg));
 
                         Get_Shared_Config(&s_tasks_cfg);
+                        local_mqtt_version = g_config_version;
+                        
                         if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
                         if (s_tasks_cfg.mqtt_interval == 0 || s_tasks_cfg.mqtt_interval > 86400) {
                             s_tasks_cfg.mqtt_interval = 5;
@@ -1027,8 +1033,11 @@ static void Task_MQTTClient(void *arg) {
                     /* Send updates as soon as changes occur */
                     if (1) {
                         /* Refresh config in case interval changed */
-                        Get_Shared_Config(&s_tasks_cfg);
-                        if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
+                        if (local_mqtt_version != g_config_version) {
+                            Get_Shared_Config(&s_tasks_cfg);
+                            local_mqtt_version = g_config_version;
+                            if (s_tasks_cfg.mqtt_port == 0) s_tasks_cfg.mqtt_port = 1883;
+                        }
 
                         /* Refresh active topic from latest config */
                         if (strcmp(s_tasks_cfg.provision_status, "Active") == 0 && s_tasks_cfg.sparkplug_topic[0] != '\0') {

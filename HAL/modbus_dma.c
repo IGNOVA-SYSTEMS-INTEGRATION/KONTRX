@@ -16,6 +16,8 @@ Modbus_SensorData_t sharedSensorData = { .last_update_time = 0 };
 Gateway_Config_t    sharedConfig;
 uint8_t             relayStates[MAX_RELAYS];
 volatile ModbusScanStatus_t g_scan_status = {0};
+volatile uint8_t    g_config_changed = 1; // Keep for compatibility if needed, but we will define version counter
+volatile uint32_t   g_config_version = 1;
 
 static Gateway_Config_t s_modbus_cfg;
 #define cfg s_modbus_cfg
@@ -548,11 +550,15 @@ void Get_Shared_Config(Gateway_Config_t *dest) {
 void Update_Shared_Config(const Gateway_Config_t *src) {
     if (osKernelGetState() != osKernelRunning || configMutex == NULL) {
         memcpy(&sharedConfig, src, sizeof(Gateway_Config_t));
+        g_config_changed = 1;
+        g_config_version++;
         return;
     }
 
     if (osMutexAcquire(configMutex, 100) == osOK) {
         memcpy(&sharedConfig, src, sizeof(Gateway_Config_t));
+        g_config_changed = 1;
+        g_config_version++;
         osMutexRelease(configMutex);
     }
 }   
