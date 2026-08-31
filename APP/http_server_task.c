@@ -738,6 +738,128 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
+     * GET /api/rules  → Get currently active rules from RAM (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/rules ", 14) == 0 || strncmp(line, "GET /api/rules?", 15) == 0) {
+        RuleConfig_t current_rules;
+        memset(&current_rules, 0, sizeof(RuleConfig_t));
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            current_rules = activeRules;
+            osMutexRelease(rulesMutex);
+        }
+
+        int pos = 0;
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"rules\":[",
+            current_rules.version_id, current_rules.timestamp, current_rules.rules_valid);
+        
+        for (uint32_t i = 0; i < current_rules.rule_count; i++) {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "%s{\"rule_id\":\"%s\",\"input_id\":\"%s\",\"operator\":\"%s\",\"threshold\":%.2f,\"output_id\":\"%s\",\"action\":\"%s\",\"active\":%u}",
+                (i > 0) ? "," : "",
+                current_rules.rules[i].rule_id,
+                current_rules.rules[i].input_id,
+                current_rules.rules[i].operator,
+                current_rules.rules[i].threshold,
+                current_rules.rules[i].output_id,
+                current_rules.rules[i].action,
+                current_rules.rules[i].active);
+        }
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+
+        char rules_hdr[256];
+        snprintf(rules_hdr, sizeof(rules_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            pos);
+        send(sn, (uint8_t *)rules_hdr, (uint16_t)strlen(rules_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/toggle  → Toggle individual rule active state (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/toggle", 22) == 0) {
+        char rule_id[32] = {0};
+        int active_val = -1;
+        
+        char *id_ptr = strstr(line, "id=");
+        if (id_ptr) {
+            id_ptr += 3;
+            char *amp = strchr(id_ptr, '&');
+            char *space = strchr(id_ptr, ' ');
+            char *end = amp ? amp : (space ? space : id_ptr + strlen(id_ptr));
+            int len = end - id_ptr;
+            if (len > 0 && len < 32) {
+                memcpy(rule_id, id_ptr, len);
+                rule_id[len] = '\0';
+            }
+        }
+        
+        char *act_ptr = strstr(line, "active=");
+        if (act_ptr) {
+            act_ptr += 7;
+            active_val = *act_ptr - '0';
+        }
+        
+        if (rule_id[0] == '\0' || active_val < 0 || active_val > 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid rule_id or active value\"}");
+            return;
+        }
+        
+        uint8_t found = 0;
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            for (uint32_t i = 0; i < activeRules.rule_count; i++) {
+                if (strcmp(activeRules.rules[i].rule_id, rule_id) == 0) {
+                    activeRules.rules[i].active = (uint8_t)active_val;
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) {
+                Partition_SaveRules(&activeRules);
+            }
+            osMutexRelease(rulesMutex);
+        }
+        
+        if (found) {
+            char log_msg[64];
+            snprintf(log_msg, sizeof(log_msg), "Rule %s active status toggled to %d.", rule_id, active_val);
+            Log_Event("SYS", log_msg);
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        } else {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Rule not found\"}");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/clear  → Delete all rules (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/clear", 21) == 0) {
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            memset(&activeRules, 0, sizeof(RuleConfig_t));
+            activeRules.magic = RULES_MAGIC_CURRENT;
+            strcpy(activeRules.version_id, "default");
+            strcpy(activeRules.timestamp, "2026-08-30T00:00:00.000Z");
+            activeRules.rule_count = 0;
+            activeRules.rules_valid = 1;
+            Partition_SaveRules(&activeRules);
+            osMutexRelease(rulesMutex);
+        }
+        Log_Event("SYS", "All active PLC rules cleared.");
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
      * POST /api/rules  → Receive and save rules + version_id & timestamp (CORS)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/rules", 15) == 0 || strncmp(line, "POST /api/rules/update", 22) == 0) {
