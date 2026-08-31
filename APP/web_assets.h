@@ -196,7 +196,7 @@ static const char KONTRX_HTML[] =
 "<div class='tabs'>"
   "<button class='tab active' onclick='showTab(this, \"dashboard\")'>📊 Dashboard</button>"
   "<button class='tab' onclick='showTab(this, \"configs\")'>⚙️ Configs</button>"
-  "<button class='tab' onclick='showTab(this, \"rules\")'>📝 PLC Rules</button>"
+  "<button class='tab' onclick='showTab(this, \"rules\")'>📝 Controller Rules</button>"
   "<button class='tab' onclick='showTab(this, \"mqtt\")'>☁️ MQTT</button>"
   "<button class='tab' onclick='showTab(this, \"ota\")'>🔄 OTA Update</button>"
 "</div>"
@@ -276,7 +276,7 @@ static const char KONTRX_HTML[] =
   "</div>"
 
   "<div class='card' style='margin-bottom:16px'>"
-    "<div class='card-title'>📊 PLC Logic Flow Diagram</div>"
+    "<div class='card-title'>📊 Controller Logic Flow Diagram</div>"
     "<div id='rules-diagram-container' style='padding:10px 0'></div>"
   "</div>"
 

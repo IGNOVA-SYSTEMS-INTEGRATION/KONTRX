@@ -854,7 +854,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Partition_SaveRules(&activeRules);
             osMutexRelease(rulesMutex);
         }
-        Log_Event("SYS", "All active PLC rules cleared.");
+        Log_Event("SYS", "All active controller rules cleared.");
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         return;
     }
