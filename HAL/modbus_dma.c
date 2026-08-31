@@ -317,19 +317,29 @@ void Modbus_DMA_PollSensors(void) {
                     MultiUS_t *mu = &local.multi_us[mu_idx];
                     
                     /* Restore previous board metadata */
+                    uint8_t found_meta = 0;
                     for (uint8_t k = 0; k < local.multi_us_count; k++) {
                         if (local.multi_us[k].id == sid) {
                             *mu = local.multi_us[k];
+                            found_meta = 1;
                             break;
                         }
                     }
-                    mu->id = sid;
+                    if (!found_meta || mu->id != sid) {
+                        mu->id = sid;
+                        for (uint8_t c = 0; c < 8; c++) mu->dist[c] = -1000.0f;
+                        mu->avg = -1000.0f;
+                        mu->comp = -1000.0f;
+                        mu->temp = -1000.0f;
+                    }
 
                     /* Poll 2 channels of the 8 in this cycle to avoid blocking the bus */
                     for (uint8_t c = 0; c < 2; c++) {
                         uint8_t ch = (multi_us_channel_offset + c) % 8;
                         if (Modbus_Safe_Transaction_T(sid, 0x03, ch * 0x10, 3, rs, 40)) {
                             mu->dist[ch] = (float)rs[0];
+                        } else {
+                            mu->dist[ch] = -1000.0f;
                         }
                         osDelay(15); /* 15ms inter-channel gap for line discharge */
                     }
@@ -345,6 +355,8 @@ void Modbus_DMA_PollSensors(void) {
                     if (valid > 0) {
                         mu->avg = (float)(sum / valid);
                         ok = 1;
+                    } else {
+                        mu->avg = -1000.0f;
                     }
 
                     /* Poll temp & config compensation once in a while */

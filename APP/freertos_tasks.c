@@ -445,7 +445,7 @@ static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *c
             uint8_t sid = cfg->mqtt_mappings[i].source_id;
             // Find this sensor in readings
             for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
-                if (sd->readings[j].id == sid && !sd->readings[j].stale) {
+                if (sd->readings[j].id == sid && (activeRules.bypass_validation || !sd->readings[j].stale)) {
                     *found = 1;
                     if (strstr(input_id, "temp") != NULL || strstr(input_id, "Temp") != NULL) {
                         return sd->readings[j].temp;
@@ -472,7 +472,7 @@ static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *c
     
     if (target_type > 0) {
         for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
-            if (sd->readings[j].type == target_type && !sd->readings[j].stale) {
+            if (sd->readings[j].type == target_type && (activeRules.bypass_validation || !sd->readings[j].stale)) {
                 *found = 1;
                 return sd->readings[j].value;
             }
@@ -480,7 +480,7 @@ static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *c
     } else if (is_temp) {
         // Return temperature from first valid sensor
         for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
-            if (!sd->readings[j].stale) {
+            if (activeRules.bypass_validation || !sd->readings[j].stale) {
                 *found = 1;
                 return sd->readings[j].temp;
             }
@@ -492,7 +492,7 @@ static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *c
     long target_id = strtol(input_id, &endptr, 10);
     if (*endptr == '\0' && target_id >= 0) {
         for (int j = 0; j < sd->readings_count && j < MAX_SENSORS; j++) {
-            if (sd->readings[j].id == (uint8_t)target_id && !sd->readings[j].stale) {
+            if (sd->readings[j].id == (uint8_t)target_id && (activeRules.bypass_validation || !sd->readings[j].stale)) {
                 *found = 1;
                 return sd->readings[j].value;
             }

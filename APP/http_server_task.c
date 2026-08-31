@@ -761,8 +761,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         int pos = 0;
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"rules\":[",
-            current_rules.version_id, current_rules.timestamp, current_rules.rules_valid);
+            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"rules\":[",
+            current_rules.version_id, current_rules.timestamp, current_rules.rules_valid, current_rules.bypass_validation);
         
         for (uint32_t i = 0; i < current_rules.rule_count; i++) {
             pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
@@ -853,6 +853,35 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
+     * POST /api/rules/bypass  → Toggle sensor validation bypass (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/bypass", 22) == 0) {
+        int enable_val = -1;
+        char *enable_ptr = strstr(line, "enable=");
+        if (enable_ptr) {
+            enable_ptr += 7;
+            enable_val = *enable_ptr - '0';
+        }
+        
+        if (enable_val < 0 || enable_val > 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid enable value\"}");
+            return;
+        }
+        
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            activeRules.bypass_validation = (uint8_t)enable_val;
+            Partition_SaveRules(&activeRules);
+            osMutexRelease(rulesMutex);
+        }
+        
+        char log_msg[64];
+        snprintf(log_msg, sizeof(log_msg), "Rule validation bypass set to %d.", enable_val);
+        Log_Event("SYS", log_msg);
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
      * GET /api/rules/pending  → Get pending rules if any (CORS)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/rules/pending", 22) == 0) {
@@ -868,8 +897,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int pos = 0;
         if (has_pending) {
             pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"has_pending\":true,\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules\":[",
-                pending_snap.version_id, pending_snap.timestamp);
+                "{\"has_pending\":true,\"version_id\":\"%s\",\"timestamp\":\"%s\",\"bypass_validation\":%u,\"rules\":[",
+                pending_snap.version_id, pending_snap.timestamp, pending_snap.bypass_validation);
             
             for (uint32_t i = 0; i < pending_snap.rule_count; i++) {
                 pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
