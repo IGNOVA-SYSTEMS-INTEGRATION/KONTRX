@@ -384,13 +384,22 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     /* CPU and RAM (Heap) stats — appended inside root object, then close it */
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
+    uint8_t has_pending = 0;
+    char pending_ver[36] = {0};
+    if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
+        has_pending = hasPendingRules;
+        strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+        osMutexRelease(rulesMutex);
+    }
     pos += snprintf(buf + pos, buflen - pos,
-        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u}}",
+        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"}}",
         /* ↑ note trailing }} : closes sys object AND root object         */
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
-        (unsigned)g_sys_log_full);
+        (unsigned)g_sys_log_full,
+        (unsigned)has_pending,
+        pending_ver);
 
     return pos;
 }
@@ -591,7 +600,7 @@ static void Stream_Web_Asset(uint8_t sn) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: %lu\r\n"
-        "Cache-Control: public, max-age=31536000\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
