@@ -1821,6 +1821,12 @@ void Task_HTTPServer(void *arg) {
             close(HTTP_SOCK);
             break;
 
+        /* Transient states (handshake & teardown): do nothing and yield */
+        case SOCK_SYNSENT:
+        case SOCK_SYNRECV:
+        case SOCK_LAST_ACK:
+            break;
+
         default:
             printf("[HTTP] Unknown socket state: 0x%02X\r\n", state);
             osDelay(1000);
