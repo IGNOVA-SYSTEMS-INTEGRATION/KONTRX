@@ -1955,8 +1955,9 @@ void Task_HTTPServer(void *arg) {
          * -------------------------------------------------------------- */
         case SOCK_CLOSED:
             if (socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
-                printf("[HTTP] Socket open failed\r\n");
-                osDelay(100); /* backoff on W5500 socket allocation failure */
+                printf("[HTTP] Socket open failed! Performing self-healing W5500 network check...\r\n");
+                Ensure_W5500_Network_Alive();
+                osDelay(200); /* backoff on W5500 socket allocation failure */
             } else {
                 osDelay(5);   /* let W5500 settle to SOCK_INIT state */
             }

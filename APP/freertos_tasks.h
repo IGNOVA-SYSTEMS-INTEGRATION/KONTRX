@@ -96,4 +96,10 @@ extern osMutexId_t rulesMutex;
 extern volatile uint32_t rulesTestTicks;
 extern volatile uint8_t rulesTesting;
 
+/**
+ * @brief Self-healing monitor for W5500 hardware registers.
+ *        Automatically recovers static IP and socket configuration if W5500 registers clear (0.0.0.0).
+ */
+void Ensure_W5500_Network_Alive(void);
+
 #endif /* FREERTOS_TASKS_H */

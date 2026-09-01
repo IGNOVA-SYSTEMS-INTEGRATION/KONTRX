@@ -770,6 +770,40 @@ static void messageArrived(MessageData* data) {
     }
 }
 
+void Ensure_W5500_Network_Alive(void) {
+    wiz_NetInfo ni;
+    ctlnetwork(CN_GET_NETINFO, &ni);
+    uint8_t ver = getVERSIONR();
+
+    /* If W5500 lost its IP address (0.0.0.0) or SPI read is corrupted */
+    if (ver != 0x04U || (ni.ip[0] == 0 && ni.ip[1] == 0 && ni.ip[2] == 0 && ni.ip[3] == 0)) {
+        printf("[NET] ⚠️ W5500 Health Alert: IP=%d.%d.%d.%d, VER=0x%02X! Self-healing W5500 network stack...\r\n",
+               ni.ip[0], ni.ip[1], ni.ip[2], ni.ip[3], ver);
+        
+        Log_Event("SYS", "W5500 self-healing triggered (IP loss detected)");
+
+        wizchip_sw_reset();
+        uint8_t rx_tx_buf_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
+        wizchip_init(rx_tx_buf_sizes, rx_tx_buf_sizes);
+
+        wiz_NetInfo net = {
+            .mac  = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33},
+            .ip   = {192, 168, 1, 200},
+            .sn   = {255, 255, 255, 0},
+            .gw   = {192, 168, 1, 1},
+            .dns  = {8, 8, 8, 8},
+            .dhcp = NETINFO_STATIC
+        };
+        ctlnetwork(CN_SET_NETINFO, &net);
+        setMR(0);
+
+        wiz_NetInfo rb;
+        ctlnetwork(CN_GET_NETINFO, &rb);
+        printf("[NET] ✅ W5500 self-healing complete! IP re-assigned to %d.%d.%d.%d\r\n",
+               rb.ip[0], rb.ip[1], rb.ip[2], rb.ip[3]);
+    }
+}
+
 static void Task_MQTTClient(void *arg) {
     (void)arg;
     
@@ -816,7 +850,8 @@ static void Task_MQTTClient(void *arg) {
         
         uint8_t broker_ip[4];
         if (!Parse_IP(s_tasks_cfg.mqtt_broker, broker_ip)) {
-            /* Try to resolve via DNS */
+            /* Check W5500 network health before attempting DNS */
+            Ensure_W5500_Network_Alive();
             printf("[MQTT] Resolving broker hostname via DNS: %s ...\r\n", s_tasks_cfg.mqtt_broker);
             char log_msg[64];
             snprintf(log_msg, sizeof(log_msg), "Resolving hostname: %s", s_tasks_cfg.mqtt_broker);
@@ -838,7 +873,7 @@ static void Task_MQTTClient(void *arg) {
                 snprintf(log_msg, sizeof(log_msg), "DNS failed to resolve: %s", s_tasks_cfg.mqtt_broker);
                 Log_Event("MQTT", log_msg);
                 g_mqtt_status.connected = 0;
-                osDelay(5000);
+                osDelay(10000); /* 10-second backoff on DNS failure */
                 continue;
             }
             printf("[MQTT] DNS Resolved %s -> %d.%d.%d.%d\r\n", 
