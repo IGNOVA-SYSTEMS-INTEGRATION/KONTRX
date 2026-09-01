@@ -35,7 +35,8 @@ typedef struct {
     uint32_t rule_count;
     Rule_t   rules[MAX_RULES];
     uint8_t  rules_valid;       // 1 = Validated & Stable, 0 = Under test
-    uint8_t  padding[3];
+    uint8_t  bypass_validation; // 1 = Bypass sensor online validation, 0 = Strict online checking
+    uint8_t  padding[2];
     uint32_t checksum;
 } RuleConfig_t;
 

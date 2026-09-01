@@ -23,3 +23,9 @@ obj/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Python cache & scratch files
+__pycache__/
+*.pyc
+scratch/
+ultrasonic_build/
