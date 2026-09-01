@@ -134,8 +134,9 @@ static void Send_JSON_Logs(uint8_t sn) {
     uint32_t processed = 0;
     uint32_t printed = 0;
     char line_buf[128];
+    uint32_t safety_counter = 0;
 
-    while (processed < count) {
+    while (processed < count && safety_counter++ < 1000) {
         taskENTER_CRITICAL();
         // Check if we need to wrap at the end of the buffer
         if (temp_tail + sizeof(LogHeader_t) > LOG_BUFFER_SIZE) {
@@ -317,80 +318,43 @@ static int JSON_StatusResponse(char *buf, int buflen) {
 
     ctlnetwork(CN_GET_NETINFO, &s_ni);
 
+    /* Fetch rules versions and pending flags safely under rulesMutex */
+    uint8_t has_pending = 0;
+    char pending_ver[36] = {0};
+    char active_ver[36] = {0};
+    if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
+        has_pending = hasPendingRules;
+        strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+        strncpy(active_ver, activeRules.version_id, sizeof(active_ver) - 1);
+        osMutexRelease(rulesMutex);
+    }
+
     pos += snprintf(buf + pos, buflen - pos,
         "\"uptime_s\":%lu,"
         "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
         "\"serial\":\"KX-%07lu\","
         "\"ip\":\"%d.%d.%d.%d\","
         "\"fw\":\"" FW_VERSION "\","
-        "\"device_id\":\"%s\","
-        "\"provision_status\":\"%s\","
-        "\"provision_message\":\"%s\","
-        "\"sparkplug_topic\":\"%s\","
-        "\"pending_sparkplug_topic\":\"%s\","
-        "\"mqtt\":{"
-          "\"connected\":%u,"
-          "\"interval\":%lu,"
-          "\"send_mode\":%u,"
-          "\"active_topic\":\"%s\","
-          "\"broker\":\"%s\","
-          "\"port\":%u,"
-          "\"client_id\":\"%s\","
-          "\"username\":\"%s\","
-          "\"log\":["
+        "\"model\":\"KX-F407\","
+        "\"rules_version_id\":\"%s\","
         ,
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         (unsigned long)s_cfg.serial,
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
-        s_cfg.device_id, s_cfg.provision_status, s_cfg.provision_message, s_cfg.sparkplug_topic,
-        s_cfg.pending_sparkplug_topic,
-        g_mqtt_status.connected, (unsigned long)s_cfg.mqtt_interval, s_cfg.mqtt_send_mode, g_mqtt_status.active_topic,
-        s_cfg.mqtt_broker, s_cfg.mqtt_port, s_cfg.mqtt_client_id, s_cfg.mqtt_username);
+        active_ver[0] ? active_ver : "default");
 
-    for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"topic\":\"%s\",\"success\":%u,\"time\":%lu}%s",
-            g_mqtt_status.log[i].topic,
-            g_mqtt_status.log[i].success,
-            (unsigned long)g_mqtt_status.log[i].timestamp,
-            (i < g_mqtt_status.log_count - 1) ? "," : "");
-    }
-    pos += snprintf(buf + pos, buflen - pos, "]},\"ota_debug\":{"
-        "\"fw_size\":%lu,"
-        "\"computed_crc\":\"0x%08lX\","
-        "\"staged_sp\":\"0x%08lX\","
-        "\"sp_valid\":%u,"
-        "\"meta_magic\":\"0x%08lX\","
-        "\"meta_status\":\"0x%08lX\","
-        "\"meta_size\":%lu,"
-        "\"meta_crc32\":\"0x%08lX\","
-        "\"meta_ok\":%u,"
-        "\"write_ok\":%u,"
-        "\"step\":%lu"
-        "}",          /* close ota_debug only — root object still open */
-        (unsigned long)g_ota_debug.fw_size,
-        (unsigned long)g_ota_debug.computed_crc,
-        (unsigned long)g_ota_debug.staged_sp,
-        g_ota_debug.sp_valid,
-        (unsigned long)g_ota_debug.meta_magic,
-        (unsigned long)g_ota_debug.meta_status,
-        (unsigned long)g_ota_debug.meta_size,
-        (unsigned long)g_ota_debug.meta_crc32,
-        g_ota_debug.meta_ok,
-        g_ota_debug.write_ok,
-        (unsigned long)g_ota_debug.step);
-
-    /* CPU and RAM (Heap) stats — appended inside root object, then close it */
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
+
     pos += snprintf(buf + pos, buflen - pos,
-        ",\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u}}",
-        /* ↑ note trailing }} : closes sys object AND root object         */
+        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"}}",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
-        (unsigned)g_sys_log_full);
+        (unsigned)g_sys_log_full,
+        (unsigned)has_pending,
+        pending_ver);
 
     return pos;
 }
@@ -591,7 +555,7 @@ static void Stream_Web_Asset(uint8_t sn) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: %lu\r\n"
-        "Cache-Control: public, max-age=31536000\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
@@ -721,11 +685,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]");
 
-        char hist_hdr[256];
+        char hist_hdr[320];
         snprintf(hist_hdr, sizeof(hist_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
@@ -734,6 +699,291 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             pos);
         send(sn, (uint8_t *)hist_hdr, (uint16_t)strlen(hist_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/rules  → Get currently active rules from RAM (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/rules ", 14) == 0 || strncmp(line, "GET /api/rules?", 15) == 0) {
+        RuleConfig_t current_rules;
+        memset(&current_rules, 0, sizeof(RuleConfig_t));
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            current_rules = activeRules;
+            osMutexRelease(rulesMutex);
+        }
+
+        int pos = 0;
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"rules\":[",
+            current_rules.version_id, current_rules.timestamp, current_rules.rules_valid, current_rules.bypass_validation);
+        
+        for (uint32_t i = 0; i < current_rules.rule_count; i++) {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "%s{\"rule_id\":\"%s\",\"input_id\":\"%s\",\"operator\":\"%s\",\"threshold\":%.2f,\"output_id\":\"%s\",\"action\":\"%s\",\"active\":%u}",
+                (i > 0) ? "," : "",
+                current_rules.rules[i].rule_id,
+                current_rules.rules[i].input_id,
+                current_rules.rules[i].operator,
+                current_rules.rules[i].threshold,
+                current_rules.rules[i].output_id,
+                current_rules.rules[i].action,
+                current_rules.rules[i].active);
+        }
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+
+        char rules_hdr[320];
+        snprintf(rules_hdr, sizeof(rules_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            pos);
+        send(sn, (uint8_t *)rules_hdr, (uint16_t)strlen(rules_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/toggle  → Toggle individual rule active state (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/toggle", 22) == 0) {
+        char rule_id[32] = {0};
+        int active_val = -1;
+        
+        char *id_ptr = strstr(line, "id=");
+        if (id_ptr) {
+            id_ptr += 3;
+            char *amp = strchr(id_ptr, '&');
+            char *space = strchr(id_ptr, ' ');
+            char *end = amp ? amp : (space ? space : id_ptr + strlen(id_ptr));
+            int len = end - id_ptr;
+            if (len > 0 && len < 32) {
+                memcpy(rule_id, id_ptr, len);
+                rule_id[len] = '\0';
+            }
+        }
+        
+        char *act_ptr = strstr(line, "active=");
+        if (act_ptr) {
+            act_ptr += 7;
+            active_val = *act_ptr - '0';
+        }
+        
+        if (rule_id[0] == '\0' || active_val < 0 || active_val > 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid rule_id or active value\"}");
+            return;
+        }
+        
+        uint8_t found = 0;
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            for (uint32_t i = 0; i < activeRules.rule_count; i++) {
+                if (strcmp(activeRules.rules[i].rule_id, rule_id) == 0) {
+                    activeRules.rules[i].active = (uint8_t)active_val;
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) {
+                Partition_SaveRules(&activeRules);
+            }
+            osMutexRelease(rulesMutex);
+        }
+        
+        if (found) {
+            char log_msg[64];
+            snprintf(log_msg, sizeof(log_msg), "Rule %s active status toggled to %d.", rule_id, active_val);
+            Log_Event("SYS", log_msg);
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        } else {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Rule not found\"}");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/bypass  → Toggle sensor validation bypass (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/bypass", 22) == 0) {
+        int enable_val = -1;
+        char *enable_ptr = strstr(line, "enable=");
+        if (enable_ptr) {
+            enable_ptr += 7;
+            enable_val = *enable_ptr - '0';
+        }
+        
+        if (enable_val < 0 || enable_val > 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid enable value\"}");
+            return;
+        }
+        
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            activeRules.bypass_validation = (uint8_t)enable_val;
+            Partition_SaveRules(&activeRules);
+            osMutexRelease(rulesMutex);
+        }
+        
+        char log_msg[64];
+        snprintf(log_msg, sizeof(log_msg), "Rule validation bypass set to %d.", enable_val);
+        Log_Event("SYS", log_msg);
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/rules/pending  → Get pending rules if any (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/rules/pending", 22) == 0) {
+        RuleConfig_t pending_snap;
+        uint8_t has_pending = 0;
+        
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            pending_snap = pendingRules;
+            has_pending = hasPendingRules;
+            osMutexRelease(rulesMutex);
+        }
+
+        int pos = 0;
+        if (has_pending) {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "{\"has_pending\":true,\"version_id\":\"%s\",\"timestamp\":\"%s\",\"bypass_validation\":%u,\"rules\":[",
+                pending_snap.version_id, pending_snap.timestamp, pending_snap.bypass_validation);
+            
+            for (uint32_t i = 0; i < pending_snap.rule_count; i++) {
+                pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                    "%s{\"rule_id\":\"%s\",\"input_id\":\"%s\",\"operator\":\"%s\",\"threshold\":%.2f,\"output_id\":\"%s\",\"action\":\"%s\",\"active\":%u}",
+                    (i > 0) ? "," : "",
+                    pending_snap.rules[i].rule_id,
+                    pending_snap.rules[i].input_id,
+                    pending_snap.rules[i].operator,
+                    pending_snap.rules[i].threshold,
+                    pending_snap.rules[i].output_id,
+                    pending_snap.rules[i].action,
+                    pending_snap.rules[i].active);
+            }
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+        } else {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "{\"has_pending\":false}");
+        }
+
+        char rules_hdr[320];
+        snprintf(rules_hdr, sizeof(rules_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            pos);
+        send(sn, (uint8_t *)rules_hdr, (uint16_t)strlen(rules_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/accept  → Accept and activate pending rules (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/accept", 22) == 0) {
+        RuleConfig_t newRules;
+        uint8_t activated = 0;
+
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            if (hasPendingRules) {
+                newRules = pendingRules;
+                hasPendingRules = 0;
+                activated = 1;
+            }
+            osMutexRelease(rulesMutex);
+        }
+
+        if (activated) {
+            // Backup current rules
+            printf("[HTTP] POST /api/rules/accept: Backing up current stable rules...\r\n");
+            Partition_BackupCurrentRules();
+
+            // Save new accepted rules to primary flash partition
+            printf("[HTTP] POST /api/rules/accept: Saving accepted rules to primary flash partition...\r\n");
+            Partition_SaveRules(&newRules);
+
+            // Copy to activeRules
+            if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                activeRules = newRules;
+                
+                // Set up the watchdog timer (5 seconds stability test)
+                printf("[HTTP] POST /api/rules/accept: Active rules updated in RAM. Activating watchdog...\r\n");
+                rulesTestTicks = osKernelGetTickCount() + pdMS_TO_TICKS(5000);
+                rulesTesting = 1;
+                
+                osMutexRelease(rulesMutex);
+            }
+
+            char accept_log[128];
+            snprintf(accept_log, sizeof(accept_log), "Pending rules version %s ACCEPTED and applied.", newRules.version_id);
+            Log_Event("SYS", accept_log);
+
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        } else {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"No pending rules to accept\"}");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/reject  → Reject and clear pending rules (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/reject", 22) == 0) {
+        char rejected_version[36] = {0};
+        uint8_t cleared = 0;
+
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            if (hasPendingRules) {
+                strncpy(rejected_version, pendingRules.version_id, sizeof(rejected_version) - 1);
+                memset(&pendingRules, 0, sizeof(RuleConfig_t));
+                hasPendingRules = 0;
+                cleared = 1;
+            }
+            osMutexRelease(rulesMutex);
+        }
+
+        if (cleared) {
+            char reject_log[128];
+            snprintf(reject_log, sizeof(reject_log), "Pending rules version %s REJECTED.", rejected_version);
+            Log_Event("SYS", reject_log);
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        } else {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"No pending rules to reject\"}");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/clear  → Delete all rules (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/clear", 21) == 0) {
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            memset(&activeRules, 0, sizeof(RuleConfig_t));
+            activeRules.magic = RULES_MAGIC_CURRENT;
+            strcpy(activeRules.version_id, "default");
+            strcpy(activeRules.timestamp, "2026-08-30T00:00:00.000Z");
+            activeRules.rule_count = 0;
+            activeRules.rules_valid = 1;
+            Partition_SaveRules(&activeRules);
+            
+            memset(&pendingRules, 0, sizeof(RuleConfig_t));
+            hasPendingRules = 0;
+            
+            osMutexRelease(rulesMutex);
+        }
+        Log_Event("SYS", "All active and pending controller rules cleared.");
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         return;
     }
 
@@ -799,10 +1049,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cJSON *act = cJSON_GetObjectItemCaseSensitive(rule_obj, "action");
 
             if (!r_id || !cJSON_IsString(r_id) ||
-                !in_id || !cJSON_IsString(in_id) ||
+                !in_id || (!cJSON_IsString(in_id) && !cJSON_IsNumber(in_id)) ||
                 !op || !cJSON_IsString(op) ||
                 !thresh || !cJSON_IsNumber(thresh) ||
-                !out_id || !cJSON_IsString(out_id) ||
+                !out_id || (!cJSON_IsString(out_id) && !cJSON_IsNumber(out_id)) ||
                 !act || !cJSON_IsString(act)) {
                 cJSON_Delete(root);
                 Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule field missing or invalid type\"}");
@@ -810,10 +1060,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
 
             strncpy(tempRules.rules[i].rule_id, r_id->valuestring, sizeof(tempRules.rules[i].rule_id) - 1);
-            strncpy(tempRules.rules[i].input_id, in_id->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
+            if (cJSON_IsString(in_id)) {
+                strncpy(tempRules.rules[i].input_id, in_id->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
+            } else {
+                snprintf(tempRules.rules[i].input_id, sizeof(tempRules.rules[i].input_id), "%d", in_id->valueint);
+            }
             strncpy(tempRules.rules[i].operator, op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
             tempRules.rules[i].threshold = (float)thresh->valuedouble;
-            strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
+            if (cJSON_IsString(out_id)) {
+                strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
+            } else {
+                snprintf(tempRules.rules[i].output_id, sizeof(tempRules.rules[i].output_id), "%d", out_id->valueint);
+            }
             strncpy(tempRules.rules[i].action, act->valuestring, sizeof(tempRules.rules[i].action) - 1);
             tempRules.rules[i].active = 1;
             tempRules.rule_count++;
@@ -821,41 +1079,29 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         cJSON_Delete(root);
 
-        // Before writing, update the Backup partition with the current stable configuration
-        printf("[HTTP] POST /api/rules: Backing up current stable rules in flash...\r\n");
-        Partition_BackupCurrentRules();
-
-        // Write the unvalidated new rules to the Primary partition (Sector 130)
-        printf("[HTTP] POST /api/rules: Saving new rules to primary flash partition...\r\n");
-        Partition_SaveRules(&tempRules);
-
-        // Load rules into active memory structure safely
+        // Save rules into pending structure safely
         if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
-            activeRules = tempRules;
-            
-            // Set up the watchdog timer (5 seconds stability test)
-            printf("[HTTP] POST /api/rules: Active rules updated in RAM. Activating 5-second stability watchdog...\r\n");
-            rulesTestTicks = osKernelGetTickCount() + pdMS_TO_TICKS(5000);
-            rulesTesting = 1;
-            
+            pendingRules = tempRules;
+            hasPendingRules = 1;
             osMutexRelease(rulesMutex);
         }
 
         char update_log[128];
-        snprintf(update_log, sizeof(update_log), "New rules version %s applied (testing).", tempRules.version_id);
+        snprintf(update_log, sizeof(update_log), "New rules version %s received (pending approval).", tempRules.version_id);
         Log_Event("SYS", update_log);
 
-        // Build Response JSON and send with CORS headers
+        // Build Response JSON indicating pending status and send with CORS headers
         char resp_body[128];
         int resp_len = snprintf(resp_body, sizeof(resp_body),
-            "{\"status\":\"success\",\"active_version\":\"%s\"}",
+            "{\"status\":\"pending\",\"version_id\":\"%s\"}",
             tempRules.version_id);
 
-        char resp_hdr[256];
+        char resp_hdr[320];
         snprintf(resp_hdr, sizeof(resp_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
@@ -873,11 +1119,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/status", 15) == 0) {
         int n = JSON_StatusResponse(tx_buf, sizeof(tx_buf));
-        char status_hdr[240];
+        char status_hdr[320];
         snprintf(status_hdr, sizeof(status_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type\r\n"
@@ -1819,6 +2066,12 @@ void Task_HTTPServer(void *arg) {
         case SOCK_CLOSING:
         case SOCK_TIME_WAIT:
             close(HTTP_SOCK);
+            break;
+
+        /* Transient states (handshake & teardown): do nothing and yield */
+        case SOCK_SYNSENT:
+        case SOCK_SYNRECV:
+        case SOCK_LAST_ACK:
             break;
 
         default:

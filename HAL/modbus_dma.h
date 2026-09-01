@@ -15,7 +15,7 @@
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. (beta 1.0.1) */
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.1.0"
 
 /* Sensor types: 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US */
 typedef struct {
@@ -164,6 +164,8 @@ extern Modbus_SensorData_t sharedSensorData;
 extern Gateway_Config_t sharedConfig;
 extern uint8_t relayStates[MAX_RELAYS];
 extern volatile ModbusScanStatus_t g_scan_status;
+extern volatile uint8_t g_config_changed;
+extern volatile uint32_t g_config_version;
 
 /* Modbus DMA Driver Initialization & Execution */
 void Modbus_DMA_Init(void);
