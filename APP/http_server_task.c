@@ -276,6 +276,45 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
         active_ver[0] ? active_ver : "default");
 
+    pos += snprintf(buf + pos, buflen - pos,
+        "\"sparkplug_topic\":\"%s\","
+        "\"pending_sparkplug_topic\":\"%s\","
+        "\"provision_status\":\"%s\","
+        "\"provision_message\":\"%s\","
+        "\"mqtt\":{"
+        "\"connected\":%u,"
+        "\"active_topic\":\"%s\","
+        "\"broker\":\"%s\","
+        "\"port\":%u,"
+        "\"client_id\":\"%s\","
+        "\"username\":\"%s\","
+        "\"interval\":%u,"
+        "\"send_mode\":%u,"
+        "\"log\":[",
+        s_cfg.sparkplug_topic,
+        s_cfg.pending_sparkplug_topic,
+        s_cfg.provision_status[0] ? s_cfg.provision_status : "Active",
+        s_cfg.provision_message,
+        g_mqtt_status.connected,
+        g_mqtt_status.active_topic,
+        s_cfg.mqtt_broker,
+        s_cfg.mqtt_port ? s_cfg.mqtt_port : 1883,
+        s_cfg.mqtt_client_id,
+        s_cfg.mqtt_username,
+        s_cfg.mqtt_interval,
+        s_cfg.mqtt_send_mode
+    );
+
+    for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "%s{\"topic\":\"%s\",\"success\":%u,\"time\":%lu}",
+            (i > 0) ? "," : "",
+            g_mqtt_status.log[i].topic,
+            g_mqtt_status.log[i].success,
+            (unsigned long)g_mqtt_status.log[i].timestamp);
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]},");
+
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
 
