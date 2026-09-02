@@ -110,81 +110,9 @@ volatile uint32_t g_sys_log_count = 0;
 volatile uint8_t  g_sys_log_full = 0;
 
 void Log_Event(const char *category, const char *message) {
-    uint8_t cat_id = 0;
-    if (strcmp(category, "SYS") == 0) cat_id = 0;
-    else if (strcmp(category, "MQTT") == 0) cat_id = 1;
-    else if (strcmp(category, "MODBUS") == 0) cat_id = 2;
-    else if (strcmp(category, "RELAY") == 0) cat_id = 3;
-    else if (strcmp(category, "OTA") == 0) cat_id = 4;
-
-    uint32_t msg_len = strlen(message);
-    if (msg_len > 60) msg_len = 60; // Truncate long messages
-
-    uint32_t req_space = sizeof(LogHeader_t) + msg_len;
-
-    taskENTER_CRITICAL();
-
-    // Check if we need to wrap at the end of the buffer
-    if (g_log_head + req_space > LOG_BUFFER_SIZE) {
-        uint32_t pad_len = LOG_BUFFER_SIZE - g_log_head;
-        if (g_log_head + sizeof(LogHeader_t) <= LOG_BUFFER_SIZE) {
-            LogHeader_t *pad = (LogHeader_t *)&g_log_ring[g_log_head];
-            pad->category_id = 0xFF;
-            pad->msg_len = 0;
-        }
-        g_log_used_bytes += pad_len;
-        g_log_head = 0;
-    }
-
-    // Free space until we have enough
-    while (g_sys_log_count > 0 && (LOG_BUFFER_SIZE - g_log_used_bytes) < req_space + 1) {
-        LogHeader_t *old_hdr = (LogHeader_t *)&g_log_ring[g_log_tail];
-        if (old_hdr->category_id == 0xFF) {
-            // Padding marker: wrap tail to 0 and reclaim padding bytes
-            uint32_t pad_len = LOG_BUFFER_SIZE - g_log_tail;
-            g_log_tail = 0;
-            if (g_log_used_bytes >= pad_len) {
-                g_log_used_bytes -= pad_len;
-            } else {
-                g_log_used_bytes = 0;
-            }
-        } else {
-            // Advance tail past this message
-            uint32_t old_len = sizeof(LogHeader_t) + old_hdr->msg_len;
-            g_log_tail = (g_log_tail + old_len) % LOG_BUFFER_SIZE;
-            if (g_log_used_bytes >= old_len) {
-                g_log_used_bytes -= old_len;
-            } else {
-                g_log_used_bytes = 0;
-            }
-            if (g_sys_log_count > 0) {
-                g_sys_log_count--;
-            }
-        }
-    }
-
-    // Write new record at g_log_head
-    LogHeader_t *hdr = (LogHeader_t *)&g_log_ring[g_log_head];
-    hdr->timestamp = g_uptime_seconds;
-    hdr->category_id = cat_id;
-    hdr->msg_len = (uint8_t)msg_len;
-
-    memcpy(&g_log_ring[g_log_head + sizeof(LogHeader_t)], message, msg_len);
-
-    g_log_head += req_space;
-    g_log_used_bytes += req_space;
-    g_sys_log_count++;
-    g_total_logs_written++;
-
-    if (g_total_logs_written >= 800) {
-        g_sys_log_full = 1;
-    }
-
-    taskEXIT_CRITICAL();
-
-    // Persist log to W25Q16 external flash log partition outside critical section
-    extern void Partition_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg);
-    Partition_Log_Append(g_uptime_seconds, cat_id, message);
+    (void)category;
+    (void)message;
+    /* In-memory logging disabled per user request for SD Card integration */
 }
 
 /* ======================================================================

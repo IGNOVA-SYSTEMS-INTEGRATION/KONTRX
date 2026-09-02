@@ -118,81 +118,13 @@ const char *SensorTypeName(uint8_t type) {
 }
 
 static void Send_JSON_Logs(uint8_t sn) {
-    // Send HTTP Header first
-    const char *hdr = "HTTP/1.1 200 OK\r\n"
-                      "Content-Type: application/json\r\n"
-                      "Connection: close\r\n"
-                      "\r\n"
-                      "{\"logs\":[";
-    send(sn, (uint8_t *)hdr, strlen(hdr));
-
-    taskENTER_CRITICAL();
-    uint32_t count = g_sys_log_count;
-    uint32_t temp_tail = g_log_tail;
-    taskEXIT_CRITICAL();
-
-    uint32_t processed = 0;
-    uint32_t printed = 0;
-    char line_buf[128];
-    uint32_t safety_counter = 0;
-
-    while (processed < count && safety_counter++ < 1000) {
-        taskENTER_CRITICAL();
-        // Check if we need to wrap at the end of the buffer
-        if (temp_tail + sizeof(LogHeader_t) > LOG_BUFFER_SIZE) {
-            temp_tail = 0;
-            taskEXIT_CRITICAL();
-            continue;
-        }
-
-        LogHeader_t *l_hdr = (LogHeader_t *)&g_log_ring[temp_tail];
-        if (l_hdr->category_id == 0xFF) {
-            temp_tail = 0;
-            taskEXIT_CRITICAL();
-            continue;
-        }
-
-        uint32_t s = l_hdr->timestamp;
-        uint8_t cat_id = l_hdr->category_id;
-        uint8_t msg_len = l_hdr->msg_len;
-
-        // Copy message string safely while in critical section
-        char msg_temp[64];
-        uint32_t copy_len = msg_len;
-        if (copy_len >= sizeof(msg_temp)) copy_len = sizeof(msg_temp) - 1;
-        memcpy(msg_temp, &g_log_ring[temp_tail + sizeof(LogHeader_t)], copy_len);
-        msg_temp[copy_len] = '\0';
-
-        // Advance tail for the next loop
-        temp_tail += sizeof(LogHeader_t) + msg_len;
-        taskEXIT_CRITICAL();
-
-        uint32_t hrs = s / 3600;
-        uint32_t mins = (s % 3600) / 60;
-        uint32_t secs = s % 60;
-
-        const char *cat_str = "SYS";
-        if (cat_id == 1) cat_str = "MQTT";
-        else if (cat_id == 2) cat_str = "MODBUS";
-        else if (cat_id == 3) cat_str = "RELAY";
-        else if (cat_id == 4) cat_str = "OTA";
-
-        int n = snprintf(line_buf, sizeof(line_buf),
-                         "%s{\"time\":\"%02lu:%02lu:%02lu\",\"cat\":\"%s\",\"msg\":\"%s\"}",
-                         (printed > 0) ? "," : "",
-                         (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
-                         cat_str, msg_temp);
-
-        send(sn, (uint8_t *)line_buf, n);
-        printed++;
-        processed++;
-        
-        // 1ms yield to prevent task starvation of the 1ms control loop during long transmissions
-        osDelay(1);
-    }
-
-    const char *footer = "]}";
-    send(sn, (uint8_t *)footer, strlen(footer));
+    const char *resp = "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Access-Control-Allow-Origin: *\r\n"
+                       "Connection: close\r\n"
+                       "\r\n"
+                       "{\"logs\":[],\"sys_count\":0,\"total_written\":0,\"log_full\":0}";
+    send(sn, (uint8_t *)resp, strlen(resp));
 }
 
 static int JSON_HardwareResponse(char *buf, int buflen) {
@@ -461,7 +393,7 @@ static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen
  *  HTTP response helpers
  * ====================================================================== */
 #define HTTP_200_HTML "HTTP/1.1 200 OK\r\nContent-Type:text/html;charset=UTF-8\r\nConnection:close\r\n\r\n"
-#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nConnection:close\r\n\r\n"
+#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection:close\r\n\r\n"
 #define HTTP_400      "HTTP/1.1 400 Bad Request\r\nConnection:close\r\n\r\n{\"ok\":false}"
 #define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nConnection:close\r\n\r\n{\"ok\":false,\"error\":\"OTP invalid\"}"
 #define HTTP_200_OK_JSON "{\"ok\":true}"
