@@ -46,10 +46,11 @@ extern volatile uint8_t g_cpu_usage_pct;
 /** @brief Initialise DWT cycle counter for CPU usage measurement. Call before RTOS_Tasks_Init(). */
 void KontrxDWT_Init(void);
 
-#define MQTT_LOG_MAX 5
+#define MQTT_LOG_MAX 10
 
 typedef struct {
-    char topic[128];
+    char topic[64];
+    char payload[128];
     uint8_t success;
     uint32_t timestamp; /* uptime seconds when sent */
 } MqttLogEntry_t;
@@ -57,6 +58,7 @@ typedef struct {
 typedef struct {
     uint8_t connected;
     char active_topic[128];
+    char last_error[128];
     MqttLogEntry_t log[MQTT_LOG_MAX];
     uint8_t log_count;
 } MqttStatus_t;

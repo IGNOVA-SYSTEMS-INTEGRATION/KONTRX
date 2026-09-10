@@ -18,7 +18,7 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
 /* Encodes a DDATA (Device/Node Data) payload into the destination buffer.
  * Returns the final encoded length, or 0 on failure/buffer overflow. */
 size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_ms, uint64_t seq,
-                              const TelemetryBatch_t *batch, const uint8_t *relays);
+                              const TelemetryBatch_t *batch, const Gateway_Config_t *cfg, const uint8_t *relays);
 
 /* Encodes an NDEATH (Node Death) payload into the destination buffer.
  * Returns the final encoded length, or 0 on failure/buffer overflow. */

@@ -178,21 +178,16 @@ void w5x00_disconnect(Network* n) {
 int ConnectNetwork(Network* n, uint8_t* ip, uint16_t port) {
     uint16_t myport = 0; /* Use dynamic random port allocation to avoid port conflicts */
 
+    close(n->my_socket);
+
     if (socket(n->my_socket, Sn_MR_TCP, myport, 0) != n->my_socket) {
         return SOCK_ERROR;
     }
 
-#if 1
-    // 20231016 taylor//teddy 240122
-#if ((_WIZCHIP_ == 6100) || (_WIZCHIP_ == 6300))
-    if (connect(n->my_socket, ip, port, 4) != SOCK_OK)
-#else
-    if (connect(n->my_socket, ip, port) != SOCK_OK)
-#endif
-#else
-    if (connect(n->my_socket, ip, port) != SOCK_OK)
-#endif
+    if (connect(n->my_socket, ip, port) != SOCK_OK) {
+        close(n->my_socket);
         return SOCK_ERROR;
+    }
 
     return SOCK_OK;
 }

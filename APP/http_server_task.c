@@ -80,13 +80,7 @@ void Relay_SetState(uint8_t idx, uint8_t state);
  *  Buffer — kept static to avoid stack pressure
  * ====================================================================== */
 static uint8_t rx_buf[RX_BUF_SIZE];
-static char    tx_buf[6144];  /* Sized for max /api/status JSON:
-                               *   16 sensors × ~80B = 1280B
-                               *   16 relays  × ~60B =  960B
-                               *   mqtt/ota/sys fields  ~800B
-                               *   HTTP header          ~200B
-                               *   headroom            ~904B
-                               *   Total ≈ 4244B → 6144B safe margin */
+static char    tx_buf[6144];  /* Sized for max /api/status JSON with MQTT message logs */
 
 
 
@@ -117,14 +111,32 @@ const char *SensorTypeName(uint8_t type) {
     }
 }
 
+#include "sdcard.h"
+
+static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total);
+
 static void Send_JSON_Logs(uint8_t sn) {
-    const char *resp = "HTTP/1.1 200 OK\r\n"
-                       "Content-Type: application/json\r\n"
-                       "Access-Control-Allow-Origin: *\r\n"
-                       "Connection: close\r\n"
-                       "\r\n"
-                       "{\"logs\":[],\"sys_count\":0,\"total_written\":0,\"log_full\":0}";
-    send(sn, (uint8_t *)resp, strlen(resp));
+    static char json_buf[7168];
+    int n = SDCard_Log_FormatJSON(json_buf, sizeof(json_buf), 128, "ALL", NULL);
+    if (n <= 0) {
+        n = snprintf(json_buf, sizeof(json_buf), "{\"logs\":[],\"total_count\":0}");
+    }
+
+    char hdr[384];
+    snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        n);
+
+    send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
+    Send_Chunked(sn, (const uint8_t *)json_buf, (uint32_t)n);
 }
 
 static int JSON_HardwareResponse(char *buf, int buflen) {
@@ -284,12 +296,14 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"mqtt\":{"
         "\"connected\":%u,"
         "\"active_topic\":\"%s\","
+        "\"last_error\":\"%s\","
         "\"broker\":\"%s\","
         "\"port\":%u,"
         "\"client_id\":\"%s\","
         "\"username\":\"%s\","
-        "\"interval\":%u,"
+        "\"interval\":%lu,"
         "\"send_mode\":%u,"
+        "\"payload_shape\":%u,"
         "\"log\":[",
         s_cfg.sparkplug_topic,
         s_cfg.pending_sparkplug_topic,
@@ -297,21 +311,41 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         s_cfg.provision_message,
         g_mqtt_status.connected,
         g_mqtt_status.active_topic,
+        g_mqtt_status.last_error,
         s_cfg.mqtt_broker,
         s_cfg.mqtt_port ? s_cfg.mqtt_port : 1883,
         s_cfg.mqtt_client_id,
         s_cfg.mqtt_username,
-        s_cfg.mqtt_interval,
-        s_cfg.mqtt_send_mode
+        (unsigned long)s_cfg.mqtt_interval,
+        s_cfg.mqtt_send_mode,
+        s_cfg.mqtt_payload_shape
     );
 
+    uint8_t locked = 0;
+    if (sensorMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        if (osMutexAcquire(sensorMutex, 10) == osOK) {
+            locked = 1;
+        }
+    }
     for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
+        char clean_payload[128];
+        memset(clean_payload, 0, sizeof(clean_payload));
+        strncpy(clean_payload, (const char *)g_mqtt_status.log[i].payload, sizeof(clean_payload) - 1);
+        for (size_t k = 0; k < strlen(clean_payload); k++) {
+            if ((unsigned char)clean_payload[k] < 32 || (unsigned char)clean_payload[k] > 126) clean_payload[k] = ' ';
+            else if (clean_payload[k] == '"' || clean_payload[k] == '\\') clean_payload[k] = '\'';
+        }
+
         pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"topic\":\"%s\",\"success\":%u,\"time\":%lu}",
+            "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu}",
             (i > 0) ? "," : "",
             g_mqtt_status.log[i].topic,
+            clean_payload,
             g_mqtt_status.log[i].success,
             (unsigned long)g_mqtt_status.log[i].timestamp);
+    }
+    if (locked) {
+        osMutexRelease(sensorMutex);
     }
     pos += snprintf(buf + pos, buflen - pos, "]},");
 
@@ -420,8 +454,7 @@ static int Is_Pin_Reserved(uint8_t port, uint8_t pin) {
 
 static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen) {
     const char *v = JSON_FindValue(src, key);
-    if (!v) { out[0]='\0'; return; }
-    if (*v != '"') { out[0]='\0'; return; }
+    if (!v || *v != '"') return;
     v++;
     int i = 0;
     while (*v && *v != '"' && i < maxlen - 1) out[i++] = *v++;
@@ -1088,7 +1121,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     /* -----------------------------------------------------------------
      * GET /api/status  → JSON sensor + relay snapshot (with CORS)
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "GET /api/status", 15) == 0) {
+    if (strncmp(line, "GET /api/status ", 16) == 0 || strncmp(line, "GET /api/status?", 16) == 0) {
         int n = JSON_StatusResponse(tx_buf, sizeof(tx_buf));
         char status_hdr[320];
         snprintf(status_hdr, sizeof(status_hdr),
@@ -1116,17 +1149,124 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/logs/clear  → Clear log buffer
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/logs/clear", 20) == 0) {
-        taskENTER_CRITICAL();
-        g_sys_log_count = 0;
-        g_log_head = 0;
-        g_log_tail = 0;
-        g_total_logs_written = 0;
-        g_sys_log_full = 0;
-        memset(g_log_ring, 0, sizeof(g_log_ring));
-        taskEXIT_CRITICAL();
-
+        SDCard_Log_Clear();
         Log_Event("SYS", "Event log cleared. Resuming recording.");
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
 
+    /* -----------------------------------------------------------------
+     * GET /api/sdcard/status  → SD Card capacity & storage metrics
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/sdcard/status", 22) == 0) {
+        SDCard_Status_t st;
+        SDCard_GetStatus(&st);
+        char sd_buf[256];
+        snprintf(sd_buf, sizeof(sd_buf),
+                 "{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}",
+                 st.mounted, st.card_type,
+                 (unsigned long)st.total_capacity_mb,
+                 (unsigned long)st.free_capacity_mb,
+                 (unsigned long)(st.total_capacity_mb - st.free_capacity_mb),
+                 (unsigned long)st.queue_record_count,
+                 (unsigned long)st.log_entry_count,
+                 (unsigned long)st.log_file_bytes);
+        Send_Response(sn, HTTP_200_JSON, sd_buf);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/sdcard/browse?path=...  → List files & subdirectories
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/sdcard/browse", 22) == 0) {
+        char path_param[64] = "/";
+        char *p = strstr(line, "path=");
+        if (p) {
+            p += 5;
+            char *end = strchr(p, ' ');
+            if (!end) end = strchr(p, '&');
+            if (end) {
+                size_t len = end - p;
+                if (len < sizeof(path_param)) {
+                    strncpy(path_param, p, len);
+                    path_param[len] = '\0';
+                }
+            } else {
+                strncpy(path_param, p, sizeof(path_param) - 1);
+            }
+        }
+        int n = SDCard_List_Dir(path_param, tx_buf, sizeof(tx_buf));
+        char sd_hdr[320];
+        snprintf(sd_hdr, sizeof(sd_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            n);
+        send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/sdcard/read?path=...  → Read SD Card file content data
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/sdcard/read", 20) == 0) {
+        char path_param[64] = "system.log";
+        char *p = strstr(line, "path=");
+        if (p) {
+            p += 5;
+            char *end = strchr(p, ' ');
+            if (!end) end = strchr(p, '&');
+            if (end) {
+                size_t len = end - p;
+                if (len < sizeof(path_param)) {
+                    strncpy(path_param, p, len);
+                    path_param[len] = '\0';
+                }
+            } else {
+                strncpy(path_param, p, sizeof(path_param) - 1);
+            }
+        }
+        int n = SDCard_Read_File(path_param, tx_buf, sizeof(tx_buf));
+        char sd_hdr[320];
+        snprintf(sd_hdr, sizeof(sd_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            n);
+        send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/sdcard/queue/clear  → Clear offline queue from SD Card
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/sdcard/queue/clear", 28) == 0) {
+        SDCard_Queue_Clear();
+        Log_Event("SD", "User cleared offline telemetry queue from SD Card.");
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/sdcard/logs/clear  → Clear system logs from SD Card
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/sdcard/logs/clear", 27) == 0) {
+        SDCard_Log_Clear();
+        Log_Event("SD", "User cleared system event logs from SD Card.");
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
     }
@@ -1386,14 +1526,20 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         memset(s_http_cfg_temp.mqtt_username, 0, sizeof(s_http_cfg_temp.mqtt_username));
         memset(s_http_cfg_temp.mqtt_password, 0, sizeof(s_http_cfg_temp.mqtt_password));
         memset(s_http_cfg_temp.sparkplug_topic, 0, sizeof(s_http_cfg_temp.sparkplug_topic));
+        memset(s_http_cfg_temp.pending_sparkplug_topic, 0, sizeof(s_http_cfg_temp.pending_sparkplug_topic));
+        memset(s_http_cfg_temp.device_id, 0, sizeof(s_http_cfg_temp.device_id));
+        memset(s_http_cfg_temp.provision_status, 0, sizeof(s_http_cfg_temp.provision_status));
+        memset(s_http_cfg_temp.provision_message, 0, sizeof(s_http_cfg_temp.provision_message));
         s_http_cfg_temp.mqtt_interval = 5;
         s_http_cfg_temp.mqtt_send_mode = 0;
         
-        memset(s_http_cfg_temp.provision_status, 0, sizeof(s_http_cfg_temp.provision_status));
-        memset(s_http_cfg_temp.provision_message, 0, sizeof(s_http_cfg_temp.provision_message));
-        
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&s_http_cfg_temp);
+
+        /* Immediately reset live MQTT status */
+        g_mqtt_status.connected = 0;
+        memset((void*)g_mqtt_status.active_topic, 0, sizeof(g_mqtt_status.active_topic));
+        snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "Disconnected (Settings reset by user)");
 
         /* Persist to flash */
         Safe_Write_Config_To_Flash(&s_http_cfg_temp, "MQTT clear");
@@ -1412,11 +1558,54 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         body += 4;
         Get_Shared_Config(&s_http_cfg_temp);
 
-        JSON_ReadStr(body, "broker",    s_http_cfg_temp.mqtt_broker,    sizeof(s_http_cfg_temp.mqtt_broker));
-        JSON_ReadStr(body, "client_id", s_http_cfg_temp.mqtt_client_id, sizeof(s_http_cfg_temp.mqtt_client_id));
-        JSON_ReadStr(body, "username",  s_http_cfg_temp.mqtt_username,  sizeof(s_http_cfg_temp.mqtt_username));
-        JSON_ReadStr(body, "password",  s_http_cfg_temp.mqtt_password,  sizeof(s_http_cfg_temp.mqtt_password));
-        JSON_ReadStr(body, "sparkplug_topic", s_http_cfg_temp.sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic));
+        char val_buf[128];
+
+        if (JSON_FindValue(body, "broker") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "broker", val_buf, sizeof(val_buf));
+            char *p = val_buf;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            char *end = p + strlen(p) - 1;
+            while (end > p && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) { *end = '\0'; end--; }
+            strncpy(s_http_cfg_temp.mqtt_broker, p, sizeof(s_http_cfg_temp.mqtt_broker) - 1);
+            s_http_cfg_temp.mqtt_broker[sizeof(s_http_cfg_temp.mqtt_broker) - 1] = '\0';
+        }
+
+        if (JSON_FindValue(body, "client_id") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "client_id", val_buf, sizeof(val_buf));
+            char *p = val_buf;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            char *end = p + strlen(p) - 1;
+            while (end > p && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) { *end = '\0'; end--; }
+            strncpy(s_http_cfg_temp.mqtt_client_id, p, sizeof(s_http_cfg_temp.mqtt_client_id) - 1);
+            s_http_cfg_temp.mqtt_client_id[sizeof(s_http_cfg_temp.mqtt_client_id) - 1] = '\0';
+        }
+
+        if (JSON_FindValue(body, "username") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "username", val_buf, sizeof(val_buf));
+            strncpy(s_http_cfg_temp.mqtt_username, val_buf, sizeof(s_http_cfg_temp.mqtt_username) - 1);
+            s_http_cfg_temp.mqtt_username[sizeof(s_http_cfg_temp.mqtt_username) - 1] = '\0';
+        }
+
+        if (JSON_FindValue(body, "password") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "password", val_buf, sizeof(val_buf));
+            strncpy(s_http_cfg_temp.mqtt_password, val_buf, sizeof(s_http_cfg_temp.mqtt_password) - 1);
+            s_http_cfg_temp.mqtt_password[sizeof(s_http_cfg_temp.mqtt_password) - 1] = '\0';
+        }
+
+        if (JSON_FindValue(body, "sparkplug_topic") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "sparkplug_topic", val_buf, sizeof(val_buf));
+            char *p = val_buf;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            char *end = p + strlen(p) - 1;
+            while (end > p && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) { *end = '\0'; end--; }
+            strncpy(s_http_cfg_temp.sparkplug_topic, p, sizeof(s_http_cfg_temp.sparkplug_topic) - 1);
+            s_http_cfg_temp.sparkplug_topic[sizeof(s_http_cfg_temp.sparkplug_topic) - 1] = '\0';
+        }
 
         const char *port_v = JSON_FindValue(body, "port");
         if (port_v) {
@@ -1435,6 +1624,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         const char *sm_v = JSON_FindValue(body, "send_mode");
         if (sm_v && *sm_v >= '0' && *sm_v <= '9') {
             s_http_cfg_temp.mqtt_send_mode = (uint8_t)(*sm_v - '0');
+        }
+
+        const char *ps_v = JSON_FindValue(body, "payload_shape");
+        if (!ps_v) ps_v = JSON_FindValue(body, "shape");
+        if (ps_v && *ps_v >= '0' && *ps_v <= '9') {
+            s_http_cfg_temp.mqtt_payload_shape = (uint8_t)(*ps_v - '0');
         }
 
         if (s_http_cfg_temp.mqtt_broker[0] != '\0') {

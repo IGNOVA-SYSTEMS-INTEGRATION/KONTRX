@@ -140,7 +140,7 @@ static void Load_Config_From_Flash(void) {
         sharedConfig.mqtt_interval = 2;
         sharedConfig.mqtt_send_mode = 0; // Periodic
         
-        strcpy(sharedConfig.mqtt_broker, "broker.emqx.io");
+        sharedConfig.mqtt_broker[0] = '\0';
         strcpy(sharedConfig.sparkplug_topic, "test/topic/12345");
         strcpy(sharedConfig.provision_status, "Active");
         strcpy(sharedConfig.provision_message, "Provisioned manually via Cloud MQTT settings");
