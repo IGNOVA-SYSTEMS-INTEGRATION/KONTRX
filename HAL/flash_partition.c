@@ -328,25 +328,53 @@ int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
     int pos = 0;
     pos += snprintf(buf + pos, max_len - pos, "{\"logs\":[");
     
-    uint32_t count = 0;
-    uint8_t printed = 0;
-    
-    // Read up to max_items logs going backwards from write_addr
+    static uint32_t addrs[128];
+    uint32_t total_found = 0;
     uint32_t read_start = PARTITION_LOG_ADDR;
-    // Walk through active logs
-    while (read_start < PARTITION_LOG_ADDR + PARTITION_LOG_SIZE && count < max_items) {
+    
+    while (read_start < (PARTITION_LOG_ADDR + PARTITION_LOG_SIZE)) {
         PartitionLogHeader_t hdr;
         W25Q_Read(read_start, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
         
-        if (hdr.timestamp == 0xFFFFFFFF || hdr.timestamp == 0) {
-            break; // No more logged items
+        if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) {
+            break;
         }
+        
+        if (total_found < 128) {
+            addrs[total_found] = read_start;
+        } else {
+            memmove(&addrs[0], &addrs[1], sizeof(uint32_t) * 127);
+            addrs[127] = read_start;
+        }
+        total_found++;
+        
+        read_start += sizeof(PartitionLogHeader_t) + hdr.msg_len;
+        if (read_start % 4096 > 4096 - sizeof(PartitionLogHeader_t)) {
+            read_start = (read_start - (read_start % 4096)) + 4096;
+        }
+    }
+    
+    uint32_t count = (total_found < 128) ? total_found : 128;
+    uint8_t printed = 0;
+    
+    for (int idx = (int)count - 1; idx >= 0 && printed < max_items; idx--) {
+        uint32_t addr = addrs[idx];
+        PartitionLogHeader_t hdr;
+        W25Q_Read(addr, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
         
         char msg_temp[64];
         uint32_t len = hdr.msg_len;
         if (len >= sizeof(msg_temp)) len = sizeof(msg_temp) - 1;
-        W25Q_Read(read_start + sizeof(PartitionLogHeader_t), (uint8_t *)msg_temp, len);
+        W25Q_Read(addr + sizeof(PartitionLogHeader_t), (uint8_t *)msg_temp, len);
         msg_temp[len] = '\0';
+        
+        for (uint32_t k = 0; k < len; k++) {
+            if ((unsigned char)msg_temp[k] < 32 || (unsigned char)msg_temp[k] > 126) {
+                msg_temp[k] = ' ';
+            } else if (msg_temp[k] == '"' || msg_temp[k] == '\\') {
+                msg_temp[k] = '\'';
+            }
+        }
         
         uint32_t s = hdr.timestamp;
         uint32_t hrs = s / 3600;
@@ -358,6 +386,7 @@ int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
         else if (hdr.category_id == 2) cat_str = "MODBUS";
         else if (hdr.category_id == 3) cat_str = "RELAY";
         else if (hdr.category_id == 4) cat_str = "OTA";
+        else if (hdr.category_id == 5) cat_str = "SD";
         
         if (printed > 0) {
             pos += snprintf(buf + pos, max_len - pos, ",");
@@ -369,16 +398,15 @@ int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
                         cat_str, msg_temp);
         
         printed++;
-        count++;
-        
-        read_start += sizeof(PartitionLogHeader_t) + hdr.msg_len;
-        if (read_start % 4096 > 4096 - sizeof(PartitionLogHeader_t)) {
-            read_start = (read_start - (read_start % 4096)) + 4096; // Jump to next sector
-        }
-        
         if (pos >= max_len - 128) break;
     }
     
-    pos += snprintf(buf + pos, max_len - pos, "]}");
+    pos += snprintf(buf + pos, max_len - pos, "],\"total_count\":%lu}", (unsigned long)total_found);
     return pos;
+}
+
+void Partition_Log_Clear(void) {
+    W25Q_EraseSector(PARTITION_LOG_ADDR);
+    log_write_addr = PARTITION_LOG_ADDR;
+    log_read_addr = PARTITION_LOG_ADDR;
 }

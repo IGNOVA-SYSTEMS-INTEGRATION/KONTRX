@@ -4,6 +4,7 @@
  */
 
 #include "modbus_dma.h"
+#include "dsp_filter.h"
 #include "stm32f407_regs.h"
 #include "cmsis_os2.h"
 #include <string.h>
@@ -254,8 +255,17 @@ void Modbus_DMA_PollSensors(void) {
     }
 
     uint8_t mu_idx = 0;
+    static uint32_t fail_until_s[MAX_SENSORS] = {0};
+    static uint8_t  fail_cnt[MAX_SENSORS]     = {0};
+    extern volatile uint32_t g_uptime_seconds;
 
     for (uint8_t s = 0; s < cfg.sensors.count && s < MAX_SENSORS; s++) {
+        /* Smart Backoff: if sensor is offline/unresponsive, skip polling for 4 seconds */
+        if (fail_cnt[s] >= 2 && g_uptime_seconds < fail_until_s[s]) {
+            local.readings[s].valid = 0;
+            continue;
+        }
+
         uint8_t type = cfg.sensors.entries[s].type;
         uint8_t sid  = cfg.sensors.entries[s].id;
         SensorReading_t *rd = &local.readings[s];
@@ -384,6 +394,10 @@ void Modbus_DMA_PollSensors(void) {
 
         uint8_t old_valid = rd->valid;
         if (ok) {
+            fail_cnt[s] = 0;
+            fail_until_s[s] = 0;
+            extern volatile uint32_t g_uptime_seconds;
+            rd->value      = DSP_Filter_ProcessSample(rd->type, rd->id, rd->value, g_uptime_seconds, NULL, NULL);
             rd->valid      = 1;
             rd->stale      = 0;
             rd->last_ok_ms = osKernelGetTickCount();
@@ -404,6 +418,10 @@ void Modbus_DMA_PollSensors(void) {
                 Log_Event("MODBUS", log_buf);
             }
         } else {
+            fail_cnt[s]++;
+            if (fail_cnt[s] >= 2) {
+                fail_until_s[s] = g_uptime_seconds + 4;
+            }
             /* Keep last-known-good value; mark as not valid THIS cycle */
             rd->valid = 0;
             /* stale = 1 only if we've NEVER had a good read */

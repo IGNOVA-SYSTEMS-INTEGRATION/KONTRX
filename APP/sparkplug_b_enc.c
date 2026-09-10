@@ -92,6 +92,25 @@ static int write_metric_int32(uint8_t **p, uint8_t *end, const char *name, uint6
     return 1;
 }
 
+static int write_metric_string(uint8_t **p, uint8_t *end, const char *name, uint64_t ts_ms, const char *val) {
+    uint8_t temp[256];
+    uint8_t *tp = temp;
+    uint8_t *tend = temp + sizeof(temp);
+
+    if (!write_string(&tp, tend, 1, name)) return 0;
+    if (!write_key(&tp, tend, 3, 0) || !write_varint(&tp, tend, ts_ms)) return 0;
+    if (!write_key(&tp, tend, 4, 0) || !write_varint(&tp, tend, 12)) return 0; /* SPB_DATA_TYPE_STRING = 12 */
+    if (!write_string(&tp, tend, 17, val)) return 0; /* String_value = field 17 */
+
+    size_t metric_len = tp - temp;
+    if (!write_key(p, end, 2, 2)) return 0;
+    if (!write_varint(p, end, metric_len)) return 0;
+    if (*p + metric_len > end) return 0;
+    memcpy(*p, temp, metric_len);
+    *p += metric_len;
+    return 1;
+}
+
 static const char *get_sensor_type_name(uint8_t type) {
     switch (type) {
         case 1: return "pH";
@@ -119,9 +138,10 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
     if (!write_metric_int32(&p, end, "bdSeq", timestamp_ms, 0)) return 0;
     
     /* Device serial and hardware status */
-    char hw_ver[16];
-    snprintf(hw_ver, sizeof(hw_ver), "%lu", (unsigned long)cfg->serial);
-    if (!write_metric_int32(&p, end, "serial", timestamp_ms, cfg->serial)) return 0;
+    if (!write_metric_int32(&p, end, "System/Serial", timestamp_ms, cfg->serial)) return 0;
+    if (!write_metric_int32(&p, end, "System/Uptime", timestamp_ms, (int32_t)(timestamp_ms / 1000))) return 0;
+    if (!write_metric_string(&p, end, "System/Status", timestamp_ms, "ONLINE")) return 0;
+    if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, "1.1.0")) return 0;
     
     /* Sensor properties and values */
     for (int i = 0; i < batch->count; i++) {
@@ -137,9 +157,15 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
     }
 
     /* Relays status */
-    for (int i = 0; i < cfg->actuator_count && i < MAX_RELAYS; i++) {
-        char name_buf[32];
-        snprintf(name_buf, sizeof(name_buf), "Relays/Relay_%d", i);
+    uint8_t relay_cnt = cfg ? cfg->actuator_count : MAX_RELAYS;
+    if (relay_cnt > MAX_RELAYS) relay_cnt = MAX_RELAYS;
+    for (int i = 0; i < relay_cnt; i++) {
+        char name_buf[64];
+        if (cfg && cfg->actuators[i].name[0] != '\0') {
+            snprintf(name_buf, sizeof(name_buf), "Relays/%s", cfg->actuators[i].name);
+        } else {
+            snprintf(name_buf, sizeof(name_buf), "Relays/Relay_%d", i);
+        }
         if (!write_metric_bool(&p, end, name_buf, timestamp_ms, relays[i])) return 0;
     }
 
@@ -150,7 +176,7 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
 }
 
 size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_ms, uint64_t seq,
-                              const TelemetryBatch_t *batch, const uint8_t *relays) {
+                              const TelemetryBatch_t *batch, const Gateway_Config_t *cfg, const uint8_t *relays) {
     uint8_t *p = buf;
     uint8_t *end = buf + max_len;
 
@@ -158,6 +184,16 @@ size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_m
     if (!write_key(&p, end, 1, 0) || !write_varint(&p, end, timestamp_ms)) return 0;
 
     /* 2. Metrics (field 2) */
+    
+    /* Device serial, uptime, status, version */
+    if (cfg && cfg->serial > 0) {
+        if (!write_metric_int32(&p, end, "System/Serial", timestamp_ms, cfg->serial)) return 0;
+    }
+    if (!write_metric_int32(&p, end, "System/Uptime", timestamp_ms, (int32_t)(timestamp_ms / 1000))) return 0;
+    if (!write_metric_string(&p, end, "System/Status", timestamp_ms, "ONLINE")) return 0;
+    if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, "1.1.0")) return 0;
+
+    /* Sensors */
     for (int i = 0; i < batch->count; i++) {
         if (!batch->records[i].valid) continue;
         char name_buf[64];
@@ -171,9 +207,15 @@ size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_m
     }
 
     /* Relays */
-    for (int i = 0; i < MAX_RELAYS; i++) {
-        char name_buf[32];
-        snprintf(name_buf, sizeof(name_buf), "Relays/Relay_%d", i);
+    uint8_t relay_cnt = cfg ? cfg->actuator_count : MAX_RELAYS;
+    if (relay_cnt > MAX_RELAYS) relay_cnt = MAX_RELAYS;
+    for (int i = 0; i < relay_cnt; i++) {
+        char name_buf[64];
+        if (cfg && cfg->actuators[i].name[0] != '\0') {
+            snprintf(name_buf, sizeof(name_buf), "Relays/%s", cfg->actuators[i].name);
+        } else {
+            snprintf(name_buf, sizeof(name_buf), "Relays/Relay_%d", i);
+        }
         if (!write_metric_bool(&p, end, name_buf, timestamp_ms, relays[i])) return 0;
     }
 

@@ -10,8 +10,8 @@
 #define MAX_MULTI_US   4
 
 #define SENSOR_TYPE_MULTI_US 7
-/* Bumped 0xC01D0004 -> 0xC01D0005: Added mqtt_interval to Gateway_Config_t. */
-#define CONFIG_MAGIC_CURRENT 0xC01D0005U
+/* Bumped 0xC01D0005 -> 0xC01D0006: Added mqtt_payload_shape to Gateway_Config_t. */
+#define CONFIG_MAGIC_CURRENT 0xC01D0006U
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. (beta 1.0.1) */
@@ -133,6 +133,7 @@ typedef struct {
     char pending_sparkplug_topic[128];
     uint32_t mqtt_interval;       /* MQTT publish interval in seconds */
     uint8_t mqtt_send_mode;       /* 0 = On Interval (Periodic), 1 = On Change (CoV) */
+    uint8_t mqtt_payload_shape;   /* 0 = Standard Nested JSON, 1 = Flat Key-Value JSON, 2 = Sparkplug B */
     
     /* Dynamic Schema Mapping */
     Mqtt_Field_Mapping_t mqtt_mappings[MAX_MQTT_MAPPINGS];

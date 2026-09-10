@@ -61,6 +61,8 @@ set(RTOS_APP_SOURCES
     APP/http_server_task.c
     APP/ota_task.c
     APP/cJSON.c
+    APP/dsp_filter.c
+    HAL/sdcard.c
     HAL/modbus_dma.c
     ioLibrary_Driver/Internet/MQTT/MQTTClient.c
     ioLibrary_Driver/Internet/MQTT/mqtt_interface.c
