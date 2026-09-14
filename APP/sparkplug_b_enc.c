@@ -141,7 +141,7 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
     if (!write_metric_int32(&p, end, "System/Serial", timestamp_ms, cfg->serial)) return 0;
     if (!write_metric_int32(&p, end, "System/Uptime", timestamp_ms, (int32_t)(timestamp_ms / 1000))) return 0;
     if (!write_metric_string(&p, end, "System/Status", timestamp_ms, "ONLINE")) return 0;
-    if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, "1.1.0")) return 0;
+    if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, FW_VERSION)) return 0;
     
     /* Sensor properties and values */
     for (int i = 0; i < batch->count; i++) {
@@ -191,7 +191,7 @@ size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_m
     }
     if (!write_metric_int32(&p, end, "System/Uptime", timestamp_ms, (int32_t)(timestamp_ms / 1000))) return 0;
     if (!write_metric_string(&p, end, "System/Status", timestamp_ms, "ONLINE")) return 0;
-    if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, "1.1.0")) return 0;
+    if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, FW_VERSION)) return 0;
 
     /* Sensors */
     for (int i = 0; i < batch->count; i++) {

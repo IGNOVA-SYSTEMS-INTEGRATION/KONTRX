@@ -22,7 +22,7 @@ Returns a real-time JSON snapshot of the gateway, including all configured Modbu
 ```json
 {
   "device_id": "KX-0000002",
-  "fw": "1.1.0",
+  "fw": "2.0.0",
   "uptime": 1420,
   "cpu": 12,
   "free_heap": 34816,
