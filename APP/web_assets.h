@@ -269,7 +269,7 @@ static const char KONTRX_HTML[] =
 "</div>"
 
 /* ============ PAGE: DASHBOARD ============ */
-"<div class='page active' id='page-dashboard'>"
+"<div class='page' id='page-dashboard'>"
   "<div class='grid grid2' style='margin-bottom:16px'>"
 
     /* Sensor value cards — populated by JS from /api/status */
@@ -829,7 +829,7 @@ static const char KONTRX_HTML[] =
   "</div>"
 "</div>"
 "<script>"
-"function $(i){return $(i);}"
+"function $(i){return document.getElementById(i);}"
 "function showQRModal(){var m=$('qr-modal');if(!m)return;m.classList.remove('hidden');var s=$('qr-canvas'),d=$('qr-modal-canvas');if(s&&d){var x=d.getContext('2d');x.imageSmoothingEnabled=false;x.drawImage(s,0,0,d.width,d.height);}}function closeQRModal(){var m=$('qr-modal');if(m)m.classList.add('hidden');}"
 "function showLoader(msg){"
   "var el=$('kontrx-loader');"
@@ -1874,10 +1874,10 @@ static const char KONTRX_HTML[] =
     "}"
     "buildSensorCards();"
     "buildMultiUSCards(d.multi_us);\n"
-    "if(d.interfaces){var pI=document.getElementById(\'page-interfaces\');if(pI&&pI.classList.contains(\'active\'))renderInterfaces(d.interfaces);}\n"
-    "if(d.pto||d.pwm||d.analog){var pC=document.getElementById(\'page-configs\');if(pC&&pC.classList.contains(\'active\')){if(d.pto)renderPTO(d.pto);if(d.pwm)renderPWM(d.pwm);if(d.analog)renderAnalog(d.analog);}}\n"
-    "var snEl=document.getElementById(\'hdr-sn\');if(snEl&&d.serial)snEl.textContent=(d.serial.indexOf(\'KX-\')===0?d.serial:\'KX-\'+d.serial);\n"
-    "var fwEl=document.getElementById(\'hdr-fw\');if(fwEl&&d.fw)fwEl.textContent=d.fw;"
+    "if(d.interfaces){var pI=$('page-interfaces');if(pI&&pI.classList.contains('active'))renderInterfaces(d.interfaces);}\n"
+    "if(d.pto||d.pwm||d.analog){var pC=$('page-configs');if(pC&&pC.classList.contains('active')){if(d.pto)renderPTO(d.pto);if(d.pwm)renderPWM(d.pwm);if(d.analog)renderAnalog(d.analog);}}\n"
+    "var snEl=$('hdr-sn');if(snEl&&d.serial)snEl.textContent=(d.serial.indexOf('KX-')===0?d.serial:'KX-'+d.serial);\n"
+    "var fwEl=$('hdr-fw');if(fwEl&&d.fw)fwEl.textContent=d.fw;"
     "if(d.relays){"
       "var rsig='';"
       "for(var ri=0;ri<d.relays.length;ri++){rsig+=d.relays[ri].pin+'|'+d.relays[ri].nc+'|'+d.relays[ri].name+';';}"
