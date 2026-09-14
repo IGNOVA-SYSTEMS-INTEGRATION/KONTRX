@@ -724,8 +724,9 @@ static void Stream_Web_Asset(uint8_t sn) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: %lu\r\n"
-        "Cache-Control: public, max-age=3600\r\n"
-        "ETag: \"kx-spa-v110\"\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Pragma: no-cache\r\n"
+        "Expires: 0\r\n"
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);

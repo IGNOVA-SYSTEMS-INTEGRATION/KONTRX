@@ -228,7 +228,7 @@ static const char KONTRX_HTML[] =
 "</div>"
 "</div>"
 "<div id='qr-modal' class='hidden' style='position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center' onclick='closeQRModal()'>"
-"<div class='card' style='padding:20px;text-align:center;max-width:320px;margin:16px' onclick='event.stopPropagation()'>"
+"<div style='background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;text-align:center;max-width:320px;margin:16px;box-shadow:0 8px 30px rgba(0,0,0,.6)' onclick='event.stopPropagation()'>"
 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'><span style='font-weight:700;font-size:1rem;color:var(--text)'>Device Identity QR</span><span style='cursor:pointer;font-size:1.4rem;color:var(--muted);line-height:1' onclick='closeQRModal()'>&times;</span></div>"
 "<canvas id='qr-modal-canvas' width='280' height='280' style='border-radius:10px;background:#fff;display:block;margin:0 auto'></canvas>"
 "<div style='margin-top:10px;font-size:.75rem;color:var(--muted)'>Scan to identify device</div>"
