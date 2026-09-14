@@ -22,6 +22,7 @@
  */
 
 #include "stm32f407_regs.h"
+#include "rcc_stm32.h"
 #include "uart_stm32.h"
 #include "gpio_stm32.h"
 #include "spi_stm32.h"
@@ -40,6 +41,12 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "cmsis_os2.h"
+#include "pwm_controller.h"
+#include "pto_motion.h"
+#include "dac_420ma.h"
+#include "analog_010v.h"
+#include "interface_discovery.h"
+#include "modbus_tcp_server.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -172,6 +179,10 @@ static void Load_Config_From_Flash(void) {
         sharedConfig.mqtt_mappings[4] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=10, .json_key="multi_us", .enabled=1};
         sharedConfig.mqtt_mapping_count = 5;
 
+        strncpy(sharedConfig.admin_username, "admin", sizeof(sharedConfig.admin_username));
+        strncpy(sharedConfig.admin_password, "adminkontrx", sizeof(sharedConfig.admin_password));
+        sharedConfig.actuator_mask = 0x0F; // All enabled by default (PTO, 0-10V, 4-20mA, PWM)
+
         Partition_SaveConfig(&sharedConfig);
         printf("[CFG] Default configurations written to flash partitions.\r\n");
     }
@@ -181,13 +192,16 @@ static void Load_Config_From_Flash(void) {
     W25Q_Read(PARTITION_WEB_ADDR, (uint8_t *)&first_word, 4);
     if (first_word != 0x4F44213CU || 1) { // Force re-extract to update UI with PLC support
         printf("[SYS] External Web Assets blank. Extracting embedded web assets (HTML/CSS/JS) to W25Q16...\r\n");
-        // Erase 32 sectors (128 KB) to clear space
-        for (uint32_t s = 0; s < 32; s++) {
+        // Dynamically erase enough 4KB sectors to fit the full embedded web assets
+        uint32_t needed_sectors = (strlen(KONTRX_HTML) + 4095) / 4096;
+        if (needed_sectors < 32) needed_sectors = 32;
+        for (uint32_t s = 0; s < needed_sectors; s++) {
             W25Q_EraseSector(PARTITION_WEB_ADDR + s * 4096);
         }
         // Write embedded HTML file
         W25Q_Write(PARTITION_WEB_ADDR, (const uint8_t *)KONTRX_HTML, strlen(KONTRX_HTML));
-        printf("[SYS] Web Assets successfully written to External Flash!\r\n");
+        printf("[SYS] Web Assets successfully written to External Flash (%lu bytes, %lu sectors)!\r\n",
+               (unsigned long)strlen(KONTRX_HTML), (unsigned long)needed_sectors);
     } else {
         printf("[SYS] Onboard W25Q16 Web Assets partition verified.\r\n");
     }
@@ -198,6 +212,9 @@ static void Load_Config_From_Flash(void) {
  * ====================================================================== */
 int main(void) {
 
+    /* ---- 0. High-Performance Clock: 168 MHz via PLL (HSE / HSI auto-fallback) ---- */
+    RCC_SystemClock_168MHz_Init();
+
     /* ---- 1. NVIC priority grouping: 4 bits preemption, 0 sub-priority ---- */
     SCB_AIRCR = AIRCR_VECTKEY | (3U << 8);
 
@@ -206,10 +223,10 @@ int main(void) {
     UART_Debug_Init();
     RTC_Init();
     printf("\r\n\r\n");
-    Log_Event("SYS", "System initialized and booted successfully.");
+    Log_Event("SYS", "System initialized and booted successfully at 168 MHz.");
     printf("╔══════════════════════════════════════════╗\r\n");
-    printf("║  Kontrx Edge Gateway  v2.0.0             ║\r\n");
-    printf("║  STM32F407VET6 + W5500 + FreeRTOS CMSIS  ║\r\n");
+    printf("║  Kontrx Edge Gateway  v2.1.0 (Universal) ║\r\n");
+    printf("║  STM32F407VET6 @ 168 MHz + W5500 + RTOS  ║\r\n");
     printf("╚══════════════════════════════════════════╝\r\n\r\n");
 
     /* ---- 3. SPI2 + W5500 pins ---- */
@@ -301,6 +318,15 @@ int main(void) {
 
     /* ---- 9. Initialise relay GPIO from config ---- */
     Relay_Init();
+
+    /* ---- 9b. Universal Controller Hardware Subsystems ---- */
+    PWM_Controller_Init();
+    PTO_Motion_Init();
+    DAC_420MA_Init();
+    Analog_010V_Init();
+    Interface_Discovery_Init();
+    Modbus_TCP_Server_Init();
+    printf("[SYS] Universal Hardware Subsystems Initialized (PWM, PTO, DAC 4-20mA, 0-10V, Modbus TCP Server).\r\n");
 
     printf("[SYS] Hardware init complete. Starting RTOS...\r\n\r\n");
 

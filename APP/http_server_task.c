@@ -38,8 +38,14 @@
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "portable.h"   /* xPortGetFreeHeapSize, configTOTAL_HEAP_SIZE */
+#include "pwm_controller.h"
+#include "pto_motion.h"
+#include "dac_420ma.h"
+#include "analog_010v.h"
+#include "interface_discovery.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ======================================================================
  *  OTA inter-task state (defined here, declared extern in header)
@@ -80,7 +86,7 @@ void Relay_SetState(uint8_t idx, uint8_t state);
  *  Buffer — kept static to avoid stack pressure
  * ====================================================================== */
 static uint8_t rx_buf[RX_BUF_SIZE];
-static char    tx_buf[6144];  /* Sized for max /api/status JSON with MQTT message logs */
+static char    tx_buf[10240] __attribute__((section(".ccmram")));  /* Sized for complete /api/status JSON in CCMRAM */
 
 
 
@@ -94,6 +100,55 @@ static Gateway_Config_t s_http_cfg_temp;  /* Shared config scratch for all HTTP 
 static Modbus_SensorData_t s_sd;
 static Gateway_Config_t    s_cfg;
 static wiz_NetInfo         s_ni;
+
+/* ======================================================================
+ *  Web Authentication & Session State
+ * ====================================================================== */
+static char s_session_token[33] = {0};
+
+static void Generate_Session_Token(char *out, size_t maxlen) {
+    uint32_t t = xTaskGetTickCount();
+    uint32_t r = (t * 1103515245U + 12345U) ^ (uint32_t)g_uptime_seconds;
+    snprintf(out, maxlen, "kx%08lx%08lx", (unsigned long)t, (unsigned long)r);
+}
+
+static uint8_t Is_Session_Valid(const char *req) {
+    if (s_session_token[0] == '\0') return 0;
+    const char *c = strstr(req, "kx_session=");
+    if (c) {
+        c += 11;
+        if (strncmp(c, s_session_token, strlen(s_session_token)) == 0) return 1;
+    }
+    const char *a = strstr(req, "Bearer ");
+    if (a) {
+        a += 7;
+        if (strncmp(a, s_session_token, strlen(s_session_token)) == 0) return 1;
+    }
+    const char *x = strstr(req, "X-Auth-Token: ");
+    if (x) {
+        x += 14;
+        if (strncmp(x, s_session_token, strlen(s_session_token)) == 0) return 1;
+    }
+    return 0;
+}
+
+static uint8_t Is_Page_Route(const char *line) {
+    if (strncmp(line, "GET / ", 6) == 0 ||
+        strncmp(line, "GET /index", 10) == 0 ||
+        strncmp(line, "GET /dashboard", 14) == 0 ||
+        strncmp(line, "GET /configs", 12) == 0 ||
+        strncmp(line, "GET /rules", 10) == 0 ||
+        (strncmp(line, "GET /interfaces", 15) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
+        strncmp(line, "GET /mqtt", 9) == 0 ||
+        (strncmp(line, "GET /logs", 9) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
+        (strncmp(line, "GET /sdcard", 11) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
+        (strncmp(line, "GET /ota", 8) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
+        strncmp(line, "GET /login", 10) == 0 ||
+        strncmp(line, "GET /settings", 13) == 0) {
+        return 1;
+    }
+    return 0;
+}
 
 /* ======================================================================
  *  JSON helpers (no dynamic allocation, snprintf into tx_buf)
@@ -178,6 +233,68 @@ static int JSON_HardwareResponse(char *buf, int buflen) {
     pos += snprintf(buf + pos, buflen - pos, "]}");
     return pos;
 }
+
+static int JSON_PTO_Array(char *buf, int buflen) {
+    int pos = 0;
+    pos += snprintf(buf + pos, buflen - pos, "[");
+    uint8_t count = PTO_GetChannelCount();
+    for (uint8_t i = 0; i < count; i++) {
+        const PTO_Channel_Status_t *st = PTO_GetStatus(i);
+        if (!st) continue;
+        pos += snprintf(buf + pos, buflen - pos,
+            "%s{\"id\":%d,\"position\":%ld,\"target\":%ld,\"speed\":%lu,\"moving\":%d,\"dir\":%d,\"lmt_state\":%d,\"pul\":\"%s\",\"dir_pin\":\"%s\",\"lmt_pin\":\"%s\",\"timer\":\"%s\"}",
+            (i > 0) ? "," : "",
+            st->id, (long)st->position, (long)st->target, (unsigned long)st->speed_pps,
+            st->moving, st->direction, st->lmt_state, st->pul_pin, st->dir_pin, st->lmt_pin, st->timer_name);
+        if (pos >= buflen - 64) break;
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]");
+    return pos;
+}
+
+static int JSON_PWM_Array(char *buf, int buflen) {
+    int pos = 0;
+    pos += snprintf(buf + pos, buflen - pos, "[");
+    uint8_t count = PWM_GetChannelCount();
+    for (uint8_t i = 0; i < count; i++) {
+        const PWM_Channel_Info_t *info = PWM_GetChannelInfo(i);
+        if (!info) continue;
+        pos += snprintf(buf + pos, buflen - pos,
+            "%s{\"id\":%d,\"duty\":%.1f,\"freq\":%lu,\"pin\":\"%s\",\"timer\":\"%s\"}",
+            (i > 0) ? "," : "",
+            info->id, info->duty_pct, (unsigned long)info->freq_hz, info->pin_name, info->timer_name);
+        if (pos >= buflen - 64) break;
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]");
+    return pos;
+}
+
+static int JSON_Analog_Object(char *buf, int buflen) {
+    int pos = 0;
+    pos += snprintf(buf + pos, buflen - pos, "{\"ma\":[");
+    uint8_t ma_cnt = DAC_420MA_GetChannelCount();
+    for (uint8_t i = 0; i < ma_cnt; i++) {
+        const DAC_420MA_Channel_t *info = DAC_420MA_GetChannelInfo(i);
+        if (!info) continue;
+        pos += snprintf(buf + pos, buflen - pos,
+            "%s{\"id\":%d,\"current_ma\":%.2f,\"raw\":%u}",
+            (i > 0) ? "," : "", info->id, info->current_mA, info->raw_dac);
+        if (pos >= buflen - 64) break;
+    }
+    pos += snprintf(buf + pos, buflen - pos, "],\"v\":[");
+    uint8_t v_cnt = Analog_010V_GetChannelCount();
+    for (uint8_t i = 0; i < v_cnt; i++) {
+        const Analog_010V_Channel_t *info = Analog_010V_GetChannelInfo(i);
+        if (!info) continue;
+        pos += snprintf(buf + pos, buflen - pos,
+            "%s{\"id\":%d,\"voltage_v\":%.2f,\"duty\":%.1f,\"pin\":\"%s\"}",
+            (i > 0) ? "," : "", info->id, info->voltage_V, info->duty_pct, info->pin_name);
+        if (pos >= buflen - 64) break;
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]}");
+    return pos;
+}
+
 
 static int JSON_StatusResponse(char *buf, int buflen) {
     /* Use static storage — keeps stack frames shallow and prevents
@@ -353,13 +470,29 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     size_t heap_total = configTOTAL_HEAP_SIZE;
 
     pos += snprintf(buf + pos, buflen - pos,
-        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"}}",
+        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"},",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
         (unsigned)g_sys_log_full,
         (unsigned)has_pending,
         pending_ver);
+
+    pos += snprintf(buf + pos, buflen - pos, "\"interfaces\":");
+    pos += Interface_BuildArrayJSON(buf + pos, buflen - pos);
+    pos += snprintf(buf + pos, buflen - pos, ",");
+
+    pos += snprintf(buf + pos, buflen - pos, "\"pto\":");
+    pos += JSON_PTO_Array(buf + pos, buflen - pos);
+    pos += snprintf(buf + pos, buflen - pos, ",");
+
+    pos += snprintf(buf + pos, buflen - pos, "\"pwm\":");
+    pos += JSON_PWM_Array(buf + pos, buflen - pos);
+    pos += snprintf(buf + pos, buflen - pos, ",");
+
+    pos += snprintf(buf + pos, buflen - pos, "\"analog\":");
+    pos += JSON_Analog_Object(buf + pos, buflen - pos);
+    pos += snprintf(buf + pos, buflen - pos, "}");
 
     return pos;
 }
@@ -376,6 +509,24 @@ static int ParseQueryInt(const char *url, const char *key) {
     int val = 0;
     while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); p++; }
     return val;
+}
+
+static float ParseQueryFloat(const char *url, const char *key) {
+    const char *p = strstr(url, key);
+    if (!p) return -1.0f;
+    p += strlen(key);
+    if (*p != '=') return -1.0f;
+    p++;
+    return (float)atof(p);
+}
+
+static int32_t ParseQuerySignedInt(const char *url, const char *key) {
+    const char *p = strstr(url, key);
+    if (!p) return 0;
+    p += strlen(key);
+    if (*p != '=') return 0;
+    p++;
+    return (int32_t)atoi(p);
 }
 
 /* ======================================================================
@@ -465,9 +616,9 @@ static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen
  *  HTTP response helpers
  * ====================================================================== */
 #define HTTP_200_HTML "HTTP/1.1 200 OK\r\nContent-Type:text/html;charset=UTF-8\r\nConnection:close\r\n\r\n"
-#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection:close\r\n\r\n"
+#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token, Cookie\r\nConnection:close\r\n\r\n"
 #define HTTP_400      "HTTP/1.1 400 Bad Request\r\nConnection:close\r\n\r\n{\"ok\":false}"
-#define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nConnection:close\r\n\r\n{\"ok\":false,\"error\":\"OTP invalid\"}"
+#define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type:application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nConnection:close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\",\"unauth\":true}"
 #define HTTP_200_OK_JSON "{\"ok\":true}"
 
 static void Send_Response(uint8_t sn, const char *header, const char *body) {
@@ -554,41 +705,40 @@ static void Safe_Write_Config_To_Flash(const Gateway_Config_t *cfg_in, const cha
 static void Stream_Web_Asset(uint8_t sn) {
     uint32_t html_len = strlen(KONTRX_HTML);
     printf("[HTTP] Streaming web asset: %lu bytes\r\n", (unsigned long)html_len);
-    char hdr[200];
+    char hdr[256];
     snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: %lu\r\n"
-        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Cache-Control: public, max-age=3600\r\n"
+        "ETag: \"kx-spa-v110\"\r\n"
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
     send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
 
-    // Stream from W25Q16 in 512-byte chunks with send() retry
-    uint8_t chunk_buf[512];
+    // Stream from W25Q16 in 1024-byte chunks
+    uint8_t chunk_buf[1024];
     uint32_t addr = PARTITION_WEB_ADDR;
     uint32_t remaining = html_len;
-    uint32_t last_progress_print = 0;
+    uint32_t chunks_sent = 0;
     while (remaining > 0) {
-        uint32_t read_len = (remaining > 512) ? 512 : remaining;
+        uint32_t read_len = (remaining > 1024) ? 1024 : remaining;
         W25Q_Read(addr, chunk_buf, read_len);
         int32_t result = send(sn, chunk_buf, (uint16_t)read_len);
         if (result > 0) {
             addr += read_len;
             remaining -= read_len;
-            if (html_len - remaining - last_progress_print >= 10240 || remaining == 0) {
-                printf("[HTTP] Streaming: %lu/%lu bytes sent\r\n", 
-                       (unsigned long)(html_len - remaining), (unsigned long)html_len);
-                last_progress_print = html_len - remaining;
+            chunks_sent++;
+            if ((chunks_sent % 4) == 0) {
+                osDelay(1); // Yield every 4KB to let other RTOS tasks run
             }
         } else if (result == SOCK_BUSY) {
-            osDelay(1);  // TX buffer full, retry next tick
+            osDelay(2);  // TX buffer full, wait for W5500 hardware transmission
         } else {
             printf("[HTTP] Streaming socket error, aborting stream! (result=%ld)\r\n", (long)result);
             break;  // Socket error, abort
         }
-        osDelay(1); // Yield to other tasks
     }
 }
 
@@ -616,20 +766,346 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char cors_hdr[] =
             "HTTP/1.1 200 OK\r\n"
             "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Credentials: true\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token, Cookie\r\n"
             "Connection: close\r\n"
             "\r\n";
         send(sn, (uint8_t *)cors_hdr, (uint16_t)strlen(cors_hdr));
         return;
     }
 
+    /* Favicon quick respond */
+    if (strncmp(line, "GET /favicon.ico", 16) == 0) {
+        const char *r204 = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+        send(sn, (uint8_t *)r204, strlen(r204));
+        return;
+    }
+
     /* -----------------------------------------------------------------
-     * GET /
-     * Serve the full SPA HTML page from W25Q16 with Cache-Control headers
+     * Multi-Page Web Route Dispatch:
+     * Serves the full SPA HTML asset from W25Q16 for all registered UI paths.
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "GET / ", 6) == 0 || strncmp(line, "GET /index", 10) == 0) {
+    if (Is_Page_Route(line)) {
+        if (strstr(line, "kx-spa-v110") != NULL) {
+            const char *r304 = "HTTP/1.1 304 Not Modified\r\nETag: \"kx-spa-v110\"\r\nConnection: close\r\n\r\n";
+            send(sn, (uint8_t *)r304, strlen(r304));
+            return;
+        }
         Stream_Web_Asset(sn);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/auth/login  → Authenticate credentials & issue session
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/auth/login", 20) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        char u[32] = {0};
+        char p[32] = {0};
+        if (body) {
+            body += 4;
+            JSON_ReadStr(body, "username", u, sizeof(u));
+            JSON_ReadStr(body, "password", p, sizeof(p));
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.admin_username[0] == '\0') {
+            strncpy(s_http_cfg_temp.admin_username, "admin", sizeof(s_http_cfg_temp.admin_username));
+        }
+        if (s_http_cfg_temp.admin_password[0] == '\0') {
+            strncpy(s_http_cfg_temp.admin_password, "adminkontrx", sizeof(s_http_cfg_temp.admin_password));
+        }
+
+        if (strcmp(u, s_http_cfg_temp.admin_username) == 0 && strcmp(p, s_http_cfg_temp.admin_password) == 0) {
+            Generate_Session_Token(s_session_token, sizeof(s_session_token));
+            char resp_hdr[300];
+            snprintf(resp_hdr, sizeof(resp_hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Set-Cookie: kx_session=%s; Path=/; SameSite=Strict\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Credentials: true\r\n"
+                "Connection: close\r\n\r\n", s_session_token);
+            send(sn, (uint8_t *)resp_hdr, strlen(resp_hdr));
+            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"token\":\"%s\",\"username\":\"%s\"}", s_session_token, s_http_cfg_temp.admin_username);
+            send(sn, (uint8_t *)tx_buf, strlen(tx_buf));
+            Log_Event("AUTH", "User logged in successfully");
+        } else {
+            const char *err = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Invalid username or password\"}";
+            send(sn, (uint8_t *)err, strlen(err));
+            Log_Event("AUTH", "Failed login attempt");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/auth/logout  → Clear active session
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/auth/logout", 21) == 0) {
+        s_session_token[0] = '\0';
+        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: kx_session=; Path=/; Max-Age=0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nConnection: close\r\n\r\n{\"ok\":true}";
+        send(sn, (uint8_t *)resp, strlen(resp));
+        Log_Event("AUTH", "User logged out");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/auth/change_password  → Update admin credentials
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/auth/change_password", 30) == 0) {
+        if (!Is_Session_Valid(line)) {
+            Send_Response(sn, HTTP_401, NULL);
+            return;
+        }
+        char *body = strstr(line, "\r\n\r\n");
+        char cur_p[32] = {0};
+        char new_u[32] = {0};
+        char new_p[32] = {0};
+        if (body) {
+            body += 4;
+            JSON_ReadStr(body, "current_password", cur_p, sizeof(cur_p));
+            JSON_ReadStr(body, "new_username", new_u, sizeof(new_u));
+            JSON_ReadStr(body, "new_password", new_p, sizeof(new_p));
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (strcmp(cur_p, s_http_cfg_temp.admin_password) != 0) {
+            const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Current password is incorrect\"}";
+            send(sn, (uint8_t *)err, strlen(err));
+            return;
+        }
+        if (new_u[0] != '\0') {
+            strncpy(s_http_cfg_temp.admin_username, new_u, sizeof(s_http_cfg_temp.admin_username) - 1);
+        }
+        if (new_p[0] != '\0') {
+            strncpy(s_http_cfg_temp.admin_password, new_p, sizeof(s_http_cfg_temp.admin_password) - 1);
+        }
+        s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Safe_Write_Config_To_Flash(&s_http_cfg_temp, "admin_auth");
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        Log_Event("AUTH", "Admin credentials updated");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/auth/me  → Session verification
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/auth/me", 16) == 0) {
+        if (!Is_Session_Valid(line)) {
+            Send_Response(sn, HTTP_401, NULL);
+            return;
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"username\":\"%s\"}", s_http_cfg_temp.admin_username);
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * Protected API Gatekeeper:
+     * Any subsequent /api/ or /update request requires an authenticated session.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/", 9) == 0 || strncmp(line, "POST /api/", 10) == 0 || strncmp(line, "POST /update", 12) == 0) {
+        if (!Is_Session_Valid(line)) {
+            Send_Response(sn, HTTP_401, NULL);
+            return;
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/interfaces  → Hardware discovery & active protocols (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/interfaces", 19) == 0) {
+        Interface_BuildDiscoveryJSON(tx_buf, sizeof(tx_buf));
+        int pos = strlen(tx_buf);
+        char if_hdr[256];
+        snprintf(if_hdr, sizeof(if_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n", pos);
+        send(sn, (uint8_t *)if_hdr, (uint16_t)strlen(if_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/interfaces/enable?id=N&state=0|1
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/interfaces/enable?", 28) == 0) {
+        int id = ParseQueryInt(line, "id");
+        int state = ParseQueryInt(line, "state");
+        if (id >= 0 && id < (int)Interface_GetTotalCount() && state >= 0) {
+            Interface_SetEnabled((uint8_t)id, (uint8_t)state);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/pto  → Multi-axis PTO motion channel statuses (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/pto", 12) == 0) {
+        int pos = JSON_PTO_Array(tx_buf, sizeof(tx_buf));
+        char pto_hdr[256];
+        snprintf(pto_hdr, sizeof(pto_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n", pos);
+        send(sn, (uint8_t *)pto_hdr, (uint16_t)strlen(pto_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/pto/move?id=N&steps=S&speed=V  (Relative motion)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/pto/move?", 19) == 0) {
+        int id = ParseQueryInt(line, "id");
+        int32_t steps = ParseQuerySignedInt(line, "steps");
+        int speed = ParseQueryInt(line, "speed");
+        if (speed <= 0) speed = 1000;
+        if (id >= 0 && id < (int)PTO_GetChannelCount()) {
+            PTO_MoveRelative((uint8_t)id, steps, (uint32_t)speed);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/pto/moveto?id=N&pos=P&speed=V  (Absolute motion)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/pto/moveto?", 21) == 0) {
+        int id = ParseQueryInt(line, "id");
+        int32_t pos = ParseQuerySignedInt(line, "pos");
+        int speed = ParseQueryInt(line, "speed");
+        if (speed <= 0) speed = 1000;
+        if (id >= 0 && id < (int)PTO_GetChannelCount()) {
+            PTO_MoveAbsolute((uint8_t)id, pos, (uint32_t)speed);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/pto/stop?id=N
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/pto/stop?", 19) == 0) {
+        int id = ParseQueryInt(line, "id");
+        if (id >= 0 && id < (int)PTO_GetChannelCount()) {
+            PTO_Stop((uint8_t)id);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/pto/home?id=N
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/pto/home?", 19) == 0) {
+        int id = ParseQueryInt(line, "id");
+        if (id >= 0 && id < (int)PTO_GetChannelCount()) {
+            PTO_SetHome((uint8_t)id);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/pwm  → Duty cycles and frequencies for PWM channels
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/pwm", 12) == 0) {
+        int pos = JSON_PWM_Array(tx_buf, sizeof(tx_buf));
+        char pwm_hdr[256];
+        snprintf(pwm_hdr, sizeof(pwm_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n", pos);
+        send(sn, (uint8_t *)pwm_hdr, (uint16_t)strlen(pwm_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/pwm?id=N&duty=D
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/pwm?", 14) == 0) {
+        int id = ParseQueryInt(line, "id");
+        float duty = ParseQueryFloat(line, "duty");
+        if (id >= 0 && id < (int)PWM_GetChannelCount() && duty >= 0.0f) {
+            PWM_SetDuty((uint8_t)id, duty);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/pwm/freq?id=N&freq=F
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/pwm/freq?", 19) == 0) {
+        int id = ParseQueryInt(line, "id");
+        int freq = ParseQueryInt(line, "freq");
+        if (id >= 0 && id < (int)PWM_GetChannelCount() && freq > 0) {
+            PWM_SetFrequency((uint8_t)id, (uint32_t)freq);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/analog  → 4-20mA and 0-10V analog outputs status (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/analog", 15) == 0) {
+        int pos = JSON_Analog_Object(tx_buf, sizeof(tx_buf));
+        char an_hdr[256];
+        snprintf(an_hdr, sizeof(an_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n", pos);
+        send(sn, (uint8_t *)an_hdr, (uint16_t)strlen(an_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/analog/ma?id=N&val=M  (4-20mA current setpoint)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/analog/ma?", 20) == 0) {
+        int id = ParseQueryInt(line, "id");
+        float val = ParseQueryFloat(line, "val");
+        if (val < 0.0f) val = ParseQueryFloat(line, "ma");
+        if (id >= 0 && id < (int)DAC_420MA_GetChannelCount() && val >= 0.0f) {
+            DAC_420MA_SetCurrent((uint8_t)id, val);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/analog/v?id=N&val=V  (0-10V voltage setpoint)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/analog/v?", 19) == 0) {
+        int id = ParseQueryInt(line, "id");
+        float val = ParseQueryFloat(line, "val");
+        if (val < 0.0f) val = ParseQueryFloat(line, "v");
+        if (id >= 0 && id < (int)Analog_010V_GetChannelCount() && val >= 0.0f) {
+            Analog_010V_SetVoltage((uint8_t)id, val);
+        }
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         return;
     }
 
@@ -717,10 +1193,19 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             osMutexRelease(rulesMutex);
         }
 
+        uint8_t has_pending = 0;
+        char pending_ver[36] = {0};
+        if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
+            has_pending = hasPendingRules;
+            strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+            osMutexRelease(rulesMutex);
+        }
+
         int pos = 0;
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"rules\":[",
-            current_rules.version_id, current_rules.timestamp, current_rules.rules_valid, current_rules.bypass_validation);
+            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"rules\":[",
+            current_rules.version_id, current_rules.timestamp, current_rules.rules_valid, current_rules.bypass_validation,
+            has_pending, pending_ver);
         
         for (uint32_t i = 0; i < current_rules.rule_count; i++) {
             pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
@@ -733,6 +1218,32 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 current_rules.rules[i].output_id,
                 current_rules.rules[i].action,
                 current_rules.rules[i].active);
+        }
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "],\"history\":[");
+
+        RuleConfig_t temp_rules;
+        uint8_t hist_added = 0;
+        char prim_version[36] = {0};
+
+        W25Q_Read(RULES_PRIMARY_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
+        uint32_t prim_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
+        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == prim_crc) {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
+                temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
+            strncpy(prim_version, temp_rules.version_id, sizeof(prim_version) - 1);
+            hist_added = 1;
+        }
+
+        W25Q_Read(RULES_BACKUP_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
+        uint32_t back_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
+        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == back_crc) {
+            if (!hist_added || strcmp(prim_version, temp_rules.version_id) != 0) {
+                pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                    "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
+                    hist_added ? "," : "",
+                    temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
+            }
         }
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
 
