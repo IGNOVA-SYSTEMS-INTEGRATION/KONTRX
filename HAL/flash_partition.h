@@ -85,6 +85,7 @@ void Partition_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg);
 uint32_t Partition_Log_Count(uint32_t *out_bytes);
 // Read logs into JSON buffer for API output (max_items limit)
 int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items);
+int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit);
 void Partition_Log_Clear(void);
 
 #endif // FLASH_PARTITION_H

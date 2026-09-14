@@ -170,11 +170,25 @@ const char *SensorTypeName(uint8_t type) {
 
 static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total);
 
-static void Send_JSON_Logs(uint8_t sn) {
+static void Send_JSON_Logs(uint8_t sn, const char *line) {
     static char json_buf[7168];
-    int n = SDCard_Log_FormatJSON(json_buf, sizeof(json_buf), 128, "ALL", NULL);
+    uint32_t offset = 0;
+    uint32_t limit = 40;
+
+    if (line) {
+        const char *p_off = strstr(line, "offset=");
+        if (p_off) offset = (uint32_t)atoi(p_off + 7);
+
+        const char *p_lim = strstr(line, "limit=");
+        if (p_lim) {
+            int l = atoi(p_lim + 6);
+            if (l > 0 && l <= 50) limit = (uint32_t)l;
+        }
+    }
+
+    int n = SDCard_Log_FormatJSON_Paged(json_buf, sizeof(json_buf), offset, limit, "ALL", NULL);
     if (n <= 0) {
-        n = snprintf(json_buf, sizeof(json_buf), "{\"logs\":[],\"total_count\":0}");
+        n = snprintf(json_buf, sizeof(json_buf), "{\"logs\":[],\"offset\":0,\"limit\":40,\"count\":0,\"total_count\":0}");
     }
 
     char hdr[384];
@@ -1652,7 +1666,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     if (strncmp(line, "GET /api/logs", 13) == 0) {
-        Send_JSON_Logs(sn);
+        Send_JSON_Logs(sn, line);
         return;
     }
 
@@ -1705,6 +1719,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             } else {
                 strncpy(path_param, p, sizeof(path_param) - 1);
             }
+        }
+        if (strcmp(path_param, "%2F") == 0 || strcmp(path_param, "%2f") == 0 || path_param[0] == '\0') {
+            strcpy(path_param, "/");
         }
         int n = SDCard_List_Dir(path_param, tx_buf, sizeof(tx_buf));
         char sd_hdr[320];

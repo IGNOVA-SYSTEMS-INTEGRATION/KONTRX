@@ -343,57 +343,94 @@ uint32_t Partition_Log_Count(uint32_t *out_bytes) {
     return s_log_entry_count;
 }
 
-int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
+int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit) {
+    if (!buf || max_len <= 0) return 0;
+    if (limit == 0) limit = 40;
+    if (limit > 50) limit = 50;
+
     int pos = 0;
     pos += snprintf(buf + pos, max_len - pos, "{\"logs\":[");
-    
-    static uint32_t addrs[128];
+
+    /* Pass 1: Count total valid log entries across active sectors */
     uint32_t total_found = 0;
-    
     for (uint32_t sec = 0; sec < 252; sec++) {
         uint32_t sec_addr = PARTITION_LOG_ADDR + sec * 4096;
         uint32_t marker = 0xFFFFFFFF;
         W25Q_Read(sec_addr, (uint8_t *)&marker, 4);
-        if (marker == 0xFFFFFFFF) {
-            break;
-        }
-        
+        if (marker == 0xFFFFFFFF) break;
+
         uint32_t off = 0;
         while (off + sizeof(PartitionLogHeader_t) <= 4096) {
             PartitionLogHeader_t hdr;
             uint32_t entry_addr = sec_addr + off;
             W25Q_Read(entry_addr, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
-            
-            if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) {
-                break;
-            }
-            
-            if (total_found < 128) {
-                addrs[total_found] = entry_addr;
-            } else {
-                memmove(&addrs[0], &addrs[1], sizeof(uint32_t) * 127);
-                addrs[127] = entry_addr;
-            }
+            if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) break;
             total_found++;
-            
             off += sizeof(PartitionLogHeader_t) + hdr.msg_len;
         }
     }
-    
-    uint32_t count = (total_found < 128) ? total_found : 128;
-    uint8_t printed = 0;
-    
-    for (int idx = (int)count - 1; idx >= 0 && printed < max_items; idx--) {
-        uint32_t addr = addrs[idx];
+
+    /* Target window: entries from newest downwards.
+     * Newest is index (total_found - 1).
+     * With offset, requested newest index is (total_found - 1 - offset).
+     * Oldest requested index is (total_found - offset - limit) or 0.
+     */
+    uint32_t target_addrs[50];
+    uint32_t target_count = 0;
+
+    if (total_found > offset) {
+        uint32_t win_end = total_found - 1 - offset;
+        uint32_t win_start = (total_found >= offset + limit) ? (total_found - offset - limit) : 0;
+
+        /* Pass 2: Collect entry addresses that fall into [win_start, win_end] */
+        uint32_t curr_idx = 0;
+        for (uint32_t sec = 0; sec < 252; sec++) {
+            uint32_t sec_addr = PARTITION_LOG_ADDR + sec * 4096;
+            uint32_t marker = 0xFFFFFFFF;
+            W25Q_Read(sec_addr, (uint8_t *)&marker, 4);
+            if (marker == 0xFFFFFFFF) break;
+
+            uint32_t off = 0;
+            while (off + sizeof(PartitionLogHeader_t) <= 4096) {
+                PartitionLogHeader_t hdr;
+                uint32_t entry_addr = sec_addr + off;
+                W25Q_Read(entry_addr, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
+                if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) break;
+
+                if (curr_idx >= win_start && curr_idx <= win_end) {
+                    uint32_t slot = curr_idx - win_start;
+                    if (slot < 50) {
+                        target_addrs[slot] = entry_addr;
+                        if (slot + 1 > target_count) target_count = slot + 1;
+                    }
+                }
+                curr_idx++;
+                off += sizeof(PartitionLogHeader_t) + hdr.msg_len;
+                if (curr_idx > win_end) break;
+            }
+            if (curr_idx > win_end) break;
+        }
+    }
+
+    /* Print target_addrs from newest (target_count - 1) down to 0 */
+    uint16_t yr = 2026;
+    uint8_t mo = 9, dy = 14;
+    RTC_GetDateTime(&yr, &mo, &dy, NULL, NULL, NULL);
+
+    static const char * const cats[] = {"SYS", "MQTT", "MODBUS", "RELAY", "OTA", "SD", "AUTH"};
+    uint32_t printed = 0;
+
+    for (int idx = (int)target_count - 1; idx >= 0; idx--) {
+        uint32_t addr = target_addrs[idx];
         PartitionLogHeader_t hdr;
         W25Q_Read(addr, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
-        
+
         char msg_temp[64];
         uint32_t len = hdr.msg_len;
         if (len >= sizeof(msg_temp)) len = sizeof(msg_temp) - 1;
         W25Q_Read(addr + sizeof(PartitionLogHeader_t), (uint8_t *)msg_temp, len);
         msg_temp[len] = '\0';
-        
+
         for (uint32_t k = 0; k < len; k++) {
             if ((unsigned char)msg_temp[k] < 32 || (unsigned char)msg_temp[k] > 126) {
                 msg_temp[k] = ' ';
@@ -401,22 +438,16 @@ int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
                 msg_temp[k] = '\'';
             }
         }
-        
+
         uint32_t s = hdr.timestamp;
         uint32_t hrs = (s / 3600) % 24;
         uint32_t mins = (s % 3600) / 60;
         uint32_t secs = s % 60;
-        
-        static const char * const cats[] = {"SYS", "MQTT", "MODBUS", "RELAY", "OTA", "SD", "AUTH"};
         const char *cat_str = (hdr.category_id <= 6) ? cats[hdr.category_id] : "SYS";
-        
+
         if (printed > 0) {
             pos += snprintf(buf + pos, max_len - pos, ",");
         }
-        
-        uint16_t yr = 2026;
-        uint8_t mo = 9, dy = 14;
-        RTC_GetDateTime(&yr, &mo, &dy, NULL, NULL, NULL);
 
         pos += snprintf(buf + pos, max_len - pos,
                         "{\"time\":\"%04u-%02u-%02u %02lu:%02lu:%02lu\",\"uptime\":\"%02lu:%02lu:%02lu\",\"up_s\":%lu,\"cat\":\"%s\",\"msg\":\"%s\"}",
@@ -425,13 +456,20 @@ int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
                         (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
                         (unsigned long)s,
                         cat_str, msg_temp);
-        
+
         printed++;
         if (pos >= max_len - 128) break;
     }
-    
-    pos += snprintf(buf + pos, max_len - pos, "],\"total_count\":%lu}", (unsigned long)total_found);
+
+    pos += snprintf(buf + pos, max_len - pos,
+                    "],\"offset\":%lu,\"limit\":%lu,\"count\":%lu,\"total_count\":%lu}",
+                    (unsigned long)offset, (unsigned long)limit,
+                    (unsigned long)printed, (unsigned long)total_found);
     return pos;
+}
+
+int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items) {
+    return Partition_Log_FormatJSON_Paged(buf, max_len, 0, (max_items > 0 && max_items <= 50) ? max_items : 40);
 }
 
 void Partition_Log_Clear(void) {

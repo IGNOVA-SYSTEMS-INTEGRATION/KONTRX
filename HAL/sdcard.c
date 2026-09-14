@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include "rtc_stm32.h"
 
 static SDCard_Status_t s_sd_status = {
     .mounted = 1,
@@ -119,15 +120,18 @@ static const char *Get_Category_Name(uint8_t cat_id) {
     }
 }
 
-int SDCard_Log_FormatJSON(char *buf, int max_len, uint32_t max_items, const char *cat_filter, const char *search_kw) {
+int SDCard_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit, const char *cat_filter, const char *search_kw) {
     (void)cat_filter;
     (void)search_kw;
-    (void)Get_Category_Name;
     if (!buf || max_len <= 0) return 0;
     SD_Lock();
-    int res = Partition_Log_FormatJSON(buf, max_len, max_items);
+    int res = Partition_Log_FormatJSON_Paged(buf, max_len, offset, limit);
     SD_Unlock();
     return res;
+}
+
+int SDCard_Log_FormatJSON(char *buf, int max_len, uint32_t max_items, const char *cat_filter, const char *search_kw) {
+    return SDCard_Log_FormatJSON_Paged(buf, max_len, 0, max_items, cat_filter, search_kw);
 }
 
 void SDCard_Log_Clear(void) {
@@ -146,29 +150,39 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     const char *curr_path = (path && path[0] != '\0') ? path : "/";
     pos += snprintf(out_json + pos, max_len - pos, "{\"path\":\"%s\",\"files\":[", curr_path);
 
-    if (strcmp(curr_path, "/") == 0) {
+    /* Dynamic live timestamp for SD files */
+    uint16_t yr = 2026;
+    uint8_t mo = 9, dy = 14, hr = 16, mn = 20, sc = 0;
+    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+    char cur_dt[24];
+    snprintf(cur_dt, sizeof(cur_dt), "%04u-%02u-%02u %02u:%02u", yr, mo, dy, hr, mn);
+
+    if (strcmp(curr_path, "/") == 0 || strcmp(curr_path, "%2F") == 0 || strcmp(curr_path, "%2f") == 0) {
         pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"LOGS\",\"is_dir\":true,\"size\":0,\"date\":\"2026-09-09 14:00\"},"
-            "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"2026-09-09 14:00\"},"
-            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"2026-09-09 15:00\"},"
-            "{\"name\":\"telemetry_queue.dat\",\"is_dir\":false,\"size\":%lu,\"date\":\"2026-09-09 15:00\"}",
-            (unsigned long)(s_sd_status.log_entry_count * 48),
-            (unsigned long)(s_sd_status.queue_record_count * sizeof(OfflineRecord_t))
+            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+            "{\"name\":\"telemetry_queue.dat\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+            "{\"name\":\"LOGS\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
+            "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"}",
+            (unsigned long)(s_sd_status.log_entry_count * 48), cur_dt,
+            (unsigned long)(s_sd_status.queue_record_count * sizeof(OfflineRecord_t)), cur_dt,
+            cur_dt, cur_dt
         );
     } else if (strstr(curr_path, "LOGS") != NULL || strstr(curr_path, "logs") != NULL) {
         pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"2026-09-09 15:00\"},"
-            "{\"name\":\"boot_history.log\",\"is_dir\":false,\"size\":1024,\"date\":\"2026-09-09 12:00\"}",
-            (unsigned long)(s_sd_status.log_entry_count * 48)
+            "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+            "{\"name\":\"boot_history.log\",\"is_dir\":false,\"size\":1024,\"date\":\"%s\"}",
+            (unsigned long)(s_sd_status.log_entry_count * 48), cur_dt,
+            cur_dt
         );
     } else if (strstr(curr_path, "QUEUE") != NULL || strstr(curr_path, "queue") != NULL) {
         pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"2026-09-09 15:00\"}",
-            (unsigned long)(s_sd_status.queue_record_count * sizeof(OfflineRecord_t))
+            "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
+            (unsigned long)(s_sd_status.queue_record_count * sizeof(OfflineRecord_t)), cur_dt
         );
     } else {
         pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"file_data.txt\",\"is_dir\":false,\"size\":512,\"date\":\"2026-09-09 15:00\"}"
+            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
+            (unsigned long)(s_sd_status.log_entry_count * 48), cur_dt
         );
     }
 

@@ -33,6 +33,7 @@ void SDCard_Queue_Clear(void);
 /* System-Wide Event Logger on SD Card */
 void SDCard_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg);
 int SDCard_Log_FormatJSON(char *buf, int max_len, uint32_t max_items, const char *cat_filter, const char *search_kw);
+int SDCard_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit, const char *cat_filter, const char *search_kw);
 void SDCard_Log_Clear(void);
 
 /* SD Card Interactive Directory & File Explorer */
