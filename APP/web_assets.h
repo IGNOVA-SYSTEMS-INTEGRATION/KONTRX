@@ -226,15 +226,6 @@ static const char KONTRX_HTML[] =
 "<div class='loader-brand'>Kontrx</div>"
 "<div id='loader-text' class='loader-text'>Connecting to Kontrx...</div>"
 "</div>"
-"</div>"
-"<div id='qr-modal' class='hidden' style='position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:center;justify-content:center' onclick='closeQRModal()'>"
-"<div style='background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;text-align:center;max-width:320px;margin:16px;box-shadow:0 8px 30px rgba(0,0,0,.6)' onclick='event.stopPropagation()'>"
-"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:12px'><span style='font-weight:700;font-size:1rem;color:var(--text)'>Device Identity QR</span><span style='cursor:pointer;font-size:1.4rem;color:var(--muted);line-height:1' onclick='closeQRModal()'>&times;</span></div>"
-"<canvas id='qr-modal-canvas' width='280' height='280' style='border-radius:10px;background:#fff;display:block;margin:0 auto'></canvas>"
-"<div style='margin-top:10px;font-size:.75rem;color:var(--muted)'>Scan to identify device</div>"
-"<button class='btn btn-primary' style='margin-top:12px;width:100%' onclick='closeQRModal()'>Close</button>"
-"</div>"
-"</div>"
 "<div id='app'>"
 
 /* ============ HEADER ============ */
@@ -285,10 +276,10 @@ static const char KONTRX_HTML[] =
 "</div>"
 
 /* QR */
-"<div class='card' style='grid-column:span 1;cursor:pointer' onclick='showQRModal()'>"
+"<div class='card' style='grid-column:span 1'>"
 "<div class='card-title'>Board Identity QR</div>"
-"<div id='qr-container' style='cursor:pointer'><canvas id='qr-canvas' width='140' height='140'></canvas></div>"
-"<div id='qr-label' style='text-align:center;font-size:.68rem;color:var(--muted);margin-top:6px'>click to zoom</div>"
+"<div id='qr-container'><canvas id='qr-canvas' width='140' height='140'></canvas></div>"
+"<div style='text-align:center;font-size:.68rem;color:var(--muted);margin-top:6px'>Scan to identify device</div>"
 "</div>"
 "</div>"
 
@@ -831,10 +822,7 @@ static const char KONTRX_HTML[] =
 "</div>"
 "</div>"
 "<script>"
-"function $(i){return document.getElementById(i);}function showQRModal(){var m=$('qr-modal');if(!m)return;m.classList.rem"
-"ove('hidden');var s=$('qr-canvas'),d=$('qr-modal-canvas');if(s&&d){var x=d.getContext('2d');x.imageSmoothingEnabled=fals"
-"e;x.drawImage(s,0,0,d.width,d.height);}}function closeQRModal(){var m=$('qr-modal');if(m)m.classList.add('hidden');}func"
-"tion showLoader(msg){var el=$('kontrx-loader');var txt=$('loader-text');if(txt)txt.innerText=msg||'Loading...';if(el)el."
+"function $(i){return document.getElementById(i);}function showLoader(msg){var el=$('kontrx-loader');var txt=$('loader-text');if(txt)txt.innerText=msg||'Loading...';if(el)el."
 "classList.add('active');}function hideLoader(){var el=$('kontrx-loader');if(el)el.classList.remove('active');}var native"
 "Fetch=window.fetch.bind(window);var fetchQueue=[];var fetchRunning=false;function processFetchQueue(){if(fetchRunning||f"
 "etchQueue.length===0)return;fetchRunning=true;var item=fetchQueue.shift();var ns=$('net-spinner');if(ns)ns.style.display"
