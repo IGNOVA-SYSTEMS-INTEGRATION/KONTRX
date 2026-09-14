@@ -285,10 +285,10 @@ static const char KONTRX_HTML[] =
 "</div>"
 
 /* QR */
-"<div class='card' style='grid-column:span 1'>"
+"<div class='card' style='grid-column:span 1;cursor:pointer' onclick='showQRModal()'>"
 "<div class='card-title'>Board Identity QR</div>"
-"<div id='qr-container' style='cursor:pointer' onclick='showQRModal()' title='click to zoom'><canvas id='qr-canvas' width='140' height='140'></canvas></div>"
-"<div id='qr-label' style='text-align:center;font-size:.68rem;color:var(--muted);margin-top:6px;cursor:pointer' onclick='showQRModal()'>click to zoom</div>"
+"<div id='qr-container' style='cursor:pointer'><canvas id='qr-canvas' width='140' height='140'></canvas></div>"
+"<div id='qr-label' style='text-align:center;font-size:.68rem;color:var(--muted);margin-top:6px'>click to zoom</div>"
 "</div>"
 "</div>"
 
