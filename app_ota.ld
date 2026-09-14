@@ -4,6 +4,7 @@ MEMORY
 {
   FLASH (rx)      : ORIGIN = 0x08008000, LENGTH = 224K
   RAM (xrw)       : ORIGIN = 0x20000000, LENGTH = 128K
+  CCMRAM (xrw)    : ORIGIN = 0x10000000, LENGTH = 64K
 }
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);
@@ -54,4 +55,12 @@ SECTIONS
 
   PROVIDE ( end = _ebss );
   PROVIDE ( _end = _ebss );
+
+  .ccmram (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.ccmram)
+    *(.ccmram*)
+    . = ALIGN(4);
+  } >CCMRAM
 }

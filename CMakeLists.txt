@@ -6,8 +6,8 @@ set(TARGET_MCU "STM32F4" CACHE STRING "Target Microcontroller")
 
 # CPU Specific Flags
 set(CPU_FLAGS "-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -ffunction-sections -fdata-sections -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -ffunction-sections -fdata-sections -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${CPU_FLAGS} -g")
 
 # Include Directories
@@ -18,6 +18,7 @@ include_directories(. FreeRTOS/include FreeRTOS/portable/GCC/ARM_CM4F)
 set(MCAL_SOURCES
     startup_stm32f407xx.c
     HAL/led.c
+    MCAL/STM32F4/rcc_stm32.c
     MCAL/STM32F4/gpio_stm32.c
     MCAL/STM32F4/uart_stm32.c
     MCAL/STM32F4/spi_stm32.c
@@ -52,6 +53,22 @@ set(FREERTOS_SOURCES
 )
 
 # -------------------------------------------------------------------
+# Universal Controller Sources (PWM, PTO, 4-20mA, 0-10V, Modbus TCP Server)
+# -------------------------------------------------------------------
+set(UNIVERSAL_CTRL_SOURCES
+    MCAL/STM32F4/timer_stm32.c
+    MCAL/STM32F4/exti_stm32.c
+    MCAL/STM32F4/spi3_stm32.c
+    MCAL/STM32F4/uart2_stm32.c
+    HAL/pwm_controller.c
+    HAL/pto_motion.c
+    HAL/dac_420ma.c
+    HAL/analog_010v.c
+    HAL/interface_discovery.c
+    HAL/modbus_tcp_server.c
+)
+
+# -------------------------------------------------------------------
 # Kontrx RTOS Application Sources
 # -------------------------------------------------------------------
 set(RTOS_APP_SOURCES
@@ -64,6 +81,7 @@ set(RTOS_APP_SOURCES
     APP/dsp_filter.c
     HAL/sdcard.c
     HAL/modbus_dma.c
+    ${UNIVERSAL_CTRL_SOURCES}
     ioLibrary_Driver/Internet/MQTT/MQTTClient.c
     ioLibrary_Driver/Internet/MQTT/mqtt_interface.c
     ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTConnectClient.c

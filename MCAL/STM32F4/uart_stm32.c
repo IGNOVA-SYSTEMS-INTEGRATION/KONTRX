@@ -1,5 +1,13 @@
 #include "uart_stm32.h"
 #include "stm32f407_regs.h"
+#include "rcc_stm32.h"
+
+static uint32_t UART_ComputeBRR(uint32_t pclk, uint32_t baud) {
+    uint32_t div_x16 = (2U * pclk + baud) / (2U * baud);
+    uint32_t mantissa = div_x16 / 16U;
+    uint32_t fraction = div_x16 % 16U;
+    return (mantissa << 4) | (fraction & 0xFU);
+}
 
 void UART_Init(void) {
     // Enable Clock for USART3
@@ -8,10 +16,8 @@ void UART_Init(void) {
     // Disable USART3
     USART3->CR1 &= ~(1U << 13); // UE = 0
 
-    // Set Baud Rate to 9600 (Assuming 16 MHz APB1 Clock)
-    // BRR = 104.1875 -> Mantissa = 104 (0x68), Fraction = 3 (0x03)
-    // BRR = 0x0683
-    USART3->BRR = 0x0683;
+    // Set Baud Rate to 9600 using exact APB1 clock (42 MHz @ 168 MHz SYSCLK -> BRR = 0x1117)
+    USART3->BRR = UART_ComputeBRR(RCC_GetPCLK1Freq(), 9600);
 
     // Set Data bits to 8, Parity none, 1 Stop bit
     USART3->CR1 &= ~(1U << 12); // M = 0 (8 bits)
@@ -72,9 +78,8 @@ void UART_Debug_Init(void) {
     // 5. Configure USART6
     USART6->CR1 &= ~(1U << 13);   // Disable while configuring
 
-    // BRR for 9600 baud @ 16 MHz APB2:
-    // BRR = 16000000 / 9600 = 1666.67  → Mantissa=104(0x68), Frac=3(0x3) → 0x0683
-    USART6->BRR = 0x0683;
+    // BRR for 9600 baud using exact APB2 clock (84 MHz @ 168 MHz SYSCLK -> BRR = 0x222E)
+    USART6->BRR = UART_ComputeBRR(RCC_GetPCLK2Freq(), 9600);
 
     USART6->CR1 &= ~(1U << 12);   // 8 data bits
     USART6->CR1 &= ~(1U << 10);   // No parity
