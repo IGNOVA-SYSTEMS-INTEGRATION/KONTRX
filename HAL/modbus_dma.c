@@ -78,6 +78,9 @@ void Modbus_DMA_Init(void) {
         cfg.serial = 1; /* default serial for a fresh device */
         cfg.mqtt_port = 1883;
         cfg.mqtt_send_mode = 0;
+        strncpy(cfg.admin_username, "admin", sizeof(cfg.admin_username));
+        strncpy(cfg.admin_password, "adminkontrx", sizeof(cfg.admin_password));
+        cfg.actuator_mask = 0x0F;
         Update_Shared_Config(&cfg);
     }
 }
@@ -158,6 +161,7 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
 
             /* Reject leading noise: first byte must be the target slave ID */
             if (received == 0 && b != slave) {
+                osDelay(1);
                 continue;
             }
             
@@ -167,6 +171,7 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
                 if (b == slave) {
                     rx[received++] = b;
                 }
+                osDelay(1);
                 continue;
             }
             
@@ -420,7 +425,7 @@ void Modbus_DMA_PollSensors(void) {
         } else {
             fail_cnt[s]++;
             if (fail_cnt[s] >= 2) {
-                fail_until_s[s] = g_uptime_seconds + 4;
+                fail_until_s[s] = g_uptime_seconds + 8;
             }
             /* Keep last-known-good value; mark as not valid THIS cycle */
             rd->valid = 0;

@@ -10,8 +10,8 @@
 #define MAX_MULTI_US   4
 
 #define SENSOR_TYPE_MULTI_US 7
-/* Bumped 0xC01D0005 -> 0xC01D0006: Added mqtt_payload_shape to Gateway_Config_t. */
-#define CONFIG_MAGIC_CURRENT 0xC01D0006U
+/* Bumped 0xC01D0006 -> 0xC01D0007: Added admin auth & actuator mask to Gateway_Config_t. */
+#define CONFIG_MAGIC_CURRENT 0xC01D0007U
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. (beta 1.0.1) */
@@ -138,6 +138,11 @@ typedef struct {
     /* Dynamic Schema Mapping */
     Mqtt_Field_Mapping_t mqtt_mappings[MAX_MQTT_MAPPINGS];
     uint8_t              mqtt_mapping_count;
+
+    /* Web Authentication & Dynamic Actuators */
+    char                 admin_username[32];
+    char                 admin_password[32];
+    uint8_t              actuator_mask; /* bit0=PTO, bit1=0-10V, bit2=4-20mA, bit3=PWM */
 
     uint32_t checksum;
 } Gateway_Config_t;

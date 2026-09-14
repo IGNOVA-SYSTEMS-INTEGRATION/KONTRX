@@ -7,13 +7,7 @@
 #include "stm32f407_regs.h"
 #include <stdio.h>
 
-#define PWR_BASE_ADDR     (APB1PERIPH_BASE + 0x7000U)
 #define RTC_BASE_ADDR     (APB1PERIPH_BASE + 0x2800U)
-
-typedef struct {
-    volatile uint32_t CR;
-    volatile uint32_t CSR;
-} PWR_TypeDef;
 
 typedef struct {
     volatile uint32_t TR;       /* 0x00 Time register */
@@ -28,7 +22,6 @@ typedef struct {
     volatile uint32_t WPR;      /* 0x24 Write protection register */
 } RTC_TypeDef;
 
-#define PWR   ((PWR_TypeDef *)PWR_BASE_ADDR)
 #define RTC   ((RTC_TypeDef *)RTC_BASE_ADDR)
 
 #define RCC_BDCR   (*((volatile uint32_t *)(RCC_BASE + 0x70U)))
@@ -108,6 +101,8 @@ void RTC_Init(void) {
     }
 }
 
+extern volatile uint32_t g_uptime_seconds;
+
 void RTC_GetTime(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
     uint32_t tr = RTC->TR;
     uint32_t dr = RTC->DR; /* Reading DR unlocks shadow registers */
@@ -116,6 +111,13 @@ void RTC_GetTime(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
     uint8_t s = (uint8_t)(((tr >> 4) & 0x07) * 10 + (tr & 0x0F));
     uint8_t m = (uint8_t)(((tr >> 12) & 0x07) * 10 + ((tr >> 8) & 0x0F));
     uint8_t h = (uint8_t)(((tr >> 20) & 0x03) * 10 + ((tr >> 16) & 0x0F));
+
+    if (h == 0 && m == 0 && s == 0 && g_uptime_seconds > 0) {
+        uint32_t u = g_uptime_seconds;
+        h = (uint8_t)((u / 3600U) % 24U);
+        m = (uint8_t)((u / 60U) % 60U);
+        s = (uint8_t)(u % 60U);
+    }
 
     if (hours)   *hours   = h;
     if (minutes) *minutes = m;
@@ -132,4 +134,21 @@ void RTC_GetTimeString(char *buf, uint32_t buflen) {
     uint8_t h, m, s;
     RTC_GetTime(&h, &m, &s);
     snprintf(buf, buflen, "%02u:%02u:%02u", h, m, s);
+}
+
+void RTC_GetDateTime(uint16_t *year, uint8_t *month, uint8_t *day, uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
+    uint8_t h, m, s;
+    RTC_GetTime(&h, &m, &s);
+
+    uint32_t dr = RTC->DR;
+    uint8_t d  = (uint8_t)(((dr >> 4) & 0x03) * 10 + (dr & 0x0F));
+    uint8_t mo = (uint8_t)(((dr >> 12) & 0x01) * 10 + ((dr >> 8) & 0x0F));
+    uint8_t y  = (uint8_t)(((dr >> 20) & 0x0F) * 10 + ((dr >> 16) & 0x0F));
+
+    if (year)    *year    = (y > 0) ? (2000 + y) : 2026;
+    if (month)   *month   = (mo > 1) ? mo : 9;
+    if (day)     *day     = (d > 1) ? d : 14;
+    if (hours)   *hours   = h;
+    if (minutes) *minutes = m;
+    if (seconds) *seconds = s;
 }

@@ -35,6 +35,8 @@
  */
 
 #include "freertos_tasks.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "modbus_dma.h"
 #include "flash_partition.h"
 #include "http_server_task.h"
@@ -43,6 +45,7 @@
 #include "MQTTClient.h"
 #include "mqtt_interface.h"
 #include "sparkplug_b_enc.h"
+#include "modbus_tcp_server.h"
 
 static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay tasks */
 #include "socket.h"
@@ -129,9 +132,12 @@ void Log_Event(const char *category, const char *message) {
     else if (strcmp(category, "RELAY") == 0) cat_id = 3;
     else if (strcmp(category, "OTA") == 0) cat_id = 4;
     else if (strcmp(category, "SD") == 0) cat_id = 5;
+    else if (strcmp(category, "AUTH") == 0) cat_id = 6;
     else cat_id = 0; // SYS
 
-    SDCard_Log_Append(g_uptime_seconds, cat_id, message);
+    uint32_t ts = RTC_GetUptimeSeconds();
+    if (ts == 0) ts = g_uptime_seconds;
+    SDCard_Log_Append(ts, cat_id, message);
 }
 
 /* ======================================================================
@@ -173,8 +179,7 @@ void Update_CPU_Usage(void) {
     uint32_t now_idle = g_total_idle_cycles;
 
     /* If the idle task is currently running, add its accumulated cycles so far */
-    extern void* pxCurrentTCB;
-    if (pxCurrentTCB == xTaskGetIdleTaskHandle()) {
+    if (xTaskGetCurrentTaskHandle() == xTaskGetIdleTaskHandle()) {
         if (g_idle_task_start_time != 0) {
             now_idle += (now_cyc - g_idle_task_start_time);
         }
@@ -184,7 +189,7 @@ void Update_CPU_Usage(void) {
     uint32_t idle_cycles = now_idle - last_idle_cycles;
 
     if (total_cycles > 0) {
-        uint32_t idle_pct = (idle_cycles * 100U) / total_cycles;
+        uint32_t idle_pct = (uint32_t)(((uint64_t)idle_cycles * 100ULL) / total_cycles);
         if (idle_pct > 100U) idle_pct = 100U;
         g_cpu_usage_pct = (uint8_t)(100U - idle_pct);
     }
@@ -226,7 +231,7 @@ void KontrxDWT_Init(void) {
 }
 
 void vApplicationIdleHook(void) {
-    /* No-op: CPU cycles are tracked via scheduler trace hooks */
+    /* Kept active for FreeRTOS idle loop */
 }
 
 
@@ -504,6 +509,9 @@ static void Task_ControlEngine(void *arg) {
     Modbus_SensorData_t sd = { .last_update_time = 0 };
 
     for (;;) {
+        /* Poll Modbus TCP Server for incoming SCADA / PLC commands */
+        Modbus_TCP_Server_Poll();
+
         /* --- Read latest sensor snapshot (mutex-protected, non-blocking) --- */
         if (osMutexAcquire(sensorMutex, 0) == osOK) {
             sd = sharedSensorData;
@@ -511,7 +519,7 @@ static void Task_ControlEngine(void *arg) {
         }
 
         if (sd.last_update_time == 0 && !activeRules.bypass_validation) {
-            osDelay(10);
+            osDelay(25);
             continue;
         }
         /* If mutex was unavailable, we proceed with the last known snapshot — 
@@ -637,9 +645,9 @@ static void Task_ModbusSensorPoll(void *arg) {
             vTaskPrioritySet(NULL, 3);
             osDelay(2000); /* 2s cool-down after a full 247-address scan. */
         } else {
-            /* Poll sensors and yield 200ms between scan cycles to keep CPU cool & idle */
+            /* Poll sensors and yield 350ms between scan cycles to keep CPU cool & idle */
             Modbus_DMA_PollSensors();
-            osDelay(200);
+            osDelay(350);
         }
     }
 }

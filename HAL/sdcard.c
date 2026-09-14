@@ -35,7 +35,8 @@ void SDCard_Init(void) {
     if (sdMutex == NULL) {
         sdMutex = xSemaphoreCreateMutex();
     }
-    printf("[SDCARD] Subsystem initialized. SD Card Mounted (32 GB SDHC/SDXC).\r\n");
+    s_sd_status.log_entry_count = Partition_Log_Count(&s_sd_status.log_file_bytes);
+    printf("[SDCARD] Ready.\r\n");
 }
 
 uint8_t SDCard_IsMounted(void) {
@@ -46,6 +47,7 @@ void SDCard_GetStatus(SDCard_Status_t *status) {
     if (!status) return;
     SD_Lock();
     s_sd_status.queue_record_count = Partition_Queue_Count();
+    s_sd_status.log_entry_count = Partition_Log_Count(&s_sd_status.log_file_bytes);
 
     /* Calculate dynamic used MB from actual log file size and offline queue records */
     uint32_t used_bytes = s_sd_status.log_file_bytes + (s_sd_status.queue_record_count * sizeof(OfflineRecord_t));
@@ -100,8 +102,7 @@ void SDCard_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg) {
     if (!msg) return;
     SD_Lock();
     Partition_Log_Append(timestamp, cat_id, msg);
-    s_sd_status.log_entry_count++;
-    s_sd_status.log_file_bytes += strlen(msg) + sizeof(PartitionLogHeader_t);
+    s_sd_status.log_entry_count = Partition_Log_Count(&s_sd_status.log_file_bytes);
     SD_Unlock();
 }
 
@@ -113,6 +114,7 @@ static const char *Get_Category_Name(uint8_t cat_id) {
         case 3: return "RELAY";
         case 4: return "OTA";
         case 5: return "SD";
+        case 6: return "AUTH";
         default: return "SYS";
     }
 }
@@ -170,7 +172,15 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
         );
     }
 
-    pos += snprintf(out_json + pos, max_len - pos, "]}");
+    pos += snprintf(out_json + pos, max_len - pos,
+        "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
+        s_sd_status.mounted, s_sd_status.card_type,
+        (unsigned long)s_sd_status.total_capacity_mb,
+        (unsigned long)s_sd_status.free_capacity_mb,
+        (unsigned long)(s_sd_status.total_capacity_mb - s_sd_status.free_capacity_mb),
+        (unsigned long)s_sd_status.queue_record_count,
+        (unsigned long)s_sd_status.log_entry_count,
+        (unsigned long)s_sd_status.log_file_bytes);
     SD_Unlock();
     return pos;
 }
