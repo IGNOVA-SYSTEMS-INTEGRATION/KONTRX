@@ -6,8 +6,8 @@ set(TARGET_MCU "STM32F4" CACHE STRING "Target Microcontroller")
 
 # CPU Specific Flags
 set(CPU_FLAGS "-mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -Os -flto -g -Wall -Wextra -ffunction-sections -fdata-sections -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -Os -flto -g -Wall -Wextra -ffunction-sections -fdata-sections -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -ffunction-sections -fdata-sections -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CPU_FLAGS} -Os -g -Wall -Wextra -ffunction-sections -fdata-sections -D_WIZCHIP_=W5500 -DUSE_FREERTOS")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} ${CPU_FLAGS} -g")
 
 # Include Directories
@@ -150,8 +150,10 @@ add_executable(KontrxRTOS
 )
 
 set_target_properties(KontrxRTOS PROPERTIES
-    LINK_FLAGS "-flto -T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=KontrxRTOS.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float"
+    LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=KontrxRTOS.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float"
 )
+target_compile_options(KontrxRTOS PRIVATE -flto)
+target_link_options(KontrxRTOS PRIVATE -flto)
 
 add_custom_command(TARGET KontrxRTOS POST_BUILD
     COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:KontrxRTOS> KontrxRTOS.bin

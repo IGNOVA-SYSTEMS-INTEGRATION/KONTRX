@@ -21,6 +21,3 @@ void LED_On(void) {
 void LED_Off(void) {
     GPIOA->BSRR = (1U << (6 + 16));
 }
-
-__attribute__((weak)) int _write(int file, char *ptr, int len) { (void)file; (void)ptr; return len; }
-__attribute__((weak)) int _read(int file, char *ptr, int len) { (void)file; (void)ptr; (void)len; return 0; }
