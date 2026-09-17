@@ -521,13 +521,14 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     size_t heap_total = configTOTAL_HEAP_SIZE;
 
     pos += snprintf(buf + pos, buflen - pos,
-        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"},",
+        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"actuator_mask\":%u},",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
         (unsigned)g_sys_log_full,
         (unsigned)has_pending,
-        pending_ver);
+        pending_ver,
+        (unsigned)s_cfg.actuator_mask);
 
     pos += snprintf(buf + pos, buflen - pos, "\"interfaces\":");
     pos += Interface_BuildArrayJSON(buf + pos, buflen - pos);
@@ -1897,6 +1898,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                     gpio->PUPDR &= ~(3U << (pin * 2));
                 }
             }
+        }
+
+        int mask = JSON_ReadInt(body, "actuator_mask");
+        if (mask >= 0) {
+            s_http_cfg_temp.actuator_mask = (uint8_t)mask;
         }
 
         uint8_t actuator_count = 0;
