@@ -410,6 +410,44 @@ graph LR
 
 ---
 
+## 🎨 Modern SPA & Categorized Actuators Subsystem
+
+The web dashboard (`APP/web_assets.h`) has been upgraded with a responsive, high-density industrial control panel featuring type-specific actuator cards, SVG iconography, and zero-flicker live telemetry updates.
+
+### 1. Actuator Categorization & Dynamic Control
+
+Actuators are organized into four distinct operational groups, each equipped with dedicated control widgets and real-time state feedback:
+
+| Category | Target Hardware | UI Control Widgets & Features |
+|---|---|---|
+| **⚡ Digital Relays & Switches** | 10x Isolated Output Relays (NO/NC) | Individual On/Off toggle switches, pin mapping badge, active status pill indicator. |
+| **🌀 PWM & Fan Controllers** | Multi-channel Industrial Timers | Dual dynamic sliders for **Frequency (0 Hz – 100 kHz)** and **Duty Cycle (0% – 100%)** with live numeric displays. |
+| **🎯 Motion & Stepper Axes (PTO)** | 4x PTO Servo/Stepper Pulse Output | **Speed (Hz)** slider, **Target Step Count** input, **Direction** switch (CW/CCW), and emergency stop control. |
+| **📐 Analog Output Loops** | 0–10V VFD Drivers & 4–20mA DAC | Voltage level slider (**0.0V – 10.0V**) and current loop slider (**4.0mA – 20.0mA**) with high-precision decibel/value badges. |
+
+### 2. High-Performance SVG Icon System
+
+All raw unicode emojis were replaced with light-weight, resolution-independent **inline SVG vector icons** generated dynamically via the `actI(index)` JavaScript renderer. This approach saved **~2.2 KB of MCU flash string literals** while maintaining clean UI alignment across Light and Dark themes.
+
+### 3. MCU Internal Flash Web Streaming Architecture
+
+```
+Client HTTP Request GET / ──► W5500 Socket ──► HTTP Server Task (http_server_task.c)
+                                                    │
+                                                    ▼
+                                     Stream Direct from Internal MCU Flash
+                                      (0x08008000 + offset to KONTRX_HTML)
+                                                    │
+                                                    ▼
+                                      Zero-Copy Chunked TCP Transmission
+```
+
+* **Garbled Symbol Fix**: Legacy versions read web assets from external W25Q16 SPI flash, which caused garbled symbols (``) during OTA updates due to unwritten sector trailing padding (`0xFF`).
+* **Direct Internal Streaming**: `Stream_Web_Asset(uint8_t sn)` in `APP/http_server_task.c` now streams `KONTRX_HTML` directly from internal MCU flash memory.
+* **Atomic OTA Synchronization**: Upgrading firmware via HTTP/OTA automatically updates the Web SPA in lockstep with the core MCU application binary.
+
+---
+
 ## 📂 Complete File-by-File Catalog
 
 For exhaustive documentation of every file, see [docs/FILE_STRUCTURE_GUIDE.md](docs/FILE_STRUCTURE_GUIDE.md).
