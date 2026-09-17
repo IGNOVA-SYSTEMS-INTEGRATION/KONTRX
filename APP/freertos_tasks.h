@@ -50,7 +50,7 @@ void KontrxDWT_Init(void);
 
 typedef struct {
     char topic[64];
-    char payload[128];
+    char payload[512];
     uint8_t success;
     uint32_t timestamp; /* uptime seconds when sent */
 } MqttLogEntry_t;

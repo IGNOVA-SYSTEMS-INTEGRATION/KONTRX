@@ -107,18 +107,6 @@ void SDCard_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg) {
     SD_Unlock();
 }
 
-static const char *Get_Category_Name(uint8_t cat_id) {
-    switch (cat_id) {
-        case 0: return "SYS";
-        case 1: return "MQTT";
-        case 2: return "MODBUS";
-        case 3: return "RELAY";
-        case 4: return "OTA";
-        case 5: return "SD";
-        case 6: return "AUTH";
-        default: return "SYS";
-    }
-}
 
 int SDCard_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit, const char *cat_filter, const char *search_kw) {
     (void)cat_filter;
@@ -157,41 +145,46 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     char cur_dt[24];
     snprintf(cur_dt, sizeof(cur_dt), "%04u-%02u-%02u %02u:%02u", yr, mo, dy, hr, mn);
 
+    uint32_t log_sz = (s_sd_status.log_file_bytes > 0) ? s_sd_status.log_file_bytes : (s_sd_status.log_entry_count * 48);
+    uint32_t q_sz = s_sd_status.queue_record_count * sizeof(OfflineRecord_t);
+    uint32_t total_used_bytes = log_sz + q_sz;
+
     if (strcmp(curr_path, "/") == 0 || strcmp(curr_path, "%2F") == 0 || strcmp(curr_path, "%2f") == 0) {
         pos += snprintf(out_json + pos, max_len - pos,
             "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"telemetry_queue.dat\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"LOGS\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
             "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"}",
-            (unsigned long)(s_sd_status.log_entry_count * 48), cur_dt,
-            (unsigned long)(s_sd_status.queue_record_count * sizeof(OfflineRecord_t)), cur_dt,
+            (unsigned long)log_sz, cur_dt,
+            (unsigned long)q_sz, cur_dt,
             cur_dt, cur_dt
         );
     } else if (strstr(curr_path, "LOGS") != NULL || strstr(curr_path, "logs") != NULL) {
         pos += snprintf(out_json + pos, max_len - pos,
             "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"boot_history.log\",\"is_dir\":false,\"size\":1024,\"date\":\"%s\"}",
-            (unsigned long)(s_sd_status.log_entry_count * 48), cur_dt,
+            (unsigned long)log_sz, cur_dt,
             cur_dt
         );
     } else if (strstr(curr_path, "QUEUE") != NULL || strstr(curr_path, "queue") != NULL) {
         pos += snprintf(out_json + pos, max_len - pos,
             "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
-            (unsigned long)(s_sd_status.queue_record_count * sizeof(OfflineRecord_t)), cur_dt
+            (unsigned long)q_sz, cur_dt
         );
     } else {
         pos += snprintf(out_json + pos, max_len - pos,
             "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
-            (unsigned long)(s_sd_status.log_entry_count * 48), cur_dt
+            (unsigned long)log_sz, cur_dt
         );
     }
 
     pos += snprintf(out_json + pos, max_len - pos,
-        "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
+        "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
         s_sd_status.mounted, s_sd_status.card_type,
         (unsigned long)s_sd_status.total_capacity_mb,
         (unsigned long)s_sd_status.free_capacity_mb,
         (unsigned long)(s_sd_status.total_capacity_mb - s_sd_status.free_capacity_mb),
+        (unsigned long)total_used_bytes,
         (unsigned long)s_sd_status.queue_record_count,
         (unsigned long)s_sd_status.log_entry_count,
         (unsigned long)s_sd_status.log_file_bytes);
@@ -199,28 +192,30 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     return pos;
 }
 
-int SDCard_Read_File(const char *path, char *out_json, int max_len) {
+int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, char *out_json, int max_len) {
     if (!out_json || max_len <= 0) return 0;
     SD_Lock();
     int pos = 0;
-    const char *curr_path = (path && path[0] != '\0') ? path : "system.log";
-    pos += snprintf(out_json + pos, max_len - pos, "{\"path\":\"%s\",\"content\":\"", curr_path);
+    const char *curr_path = (path && path[0] != '\0') ? path : "system_event.log";
 
-    static char content_buf[2048];
-    memset(content_buf, 0, sizeof(content_buf));
-    int len = Partition_Log_FormatJSON(content_buf, sizeof(content_buf) - 1, 30);
-    if (len > 0) {
-        for (int i = 0; i < len && pos < max_len - 64; i++) {
-            char c = content_buf[i];
-            if (c == '"' || c == '\\') out_json[pos++] = '\'';
-            else if ((unsigned char)c >= 32 && (unsigned char)c <= 126) out_json[pos++] = c;
-            else out_json[pos++] = ' ';
-        }
+    if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
+        uint32_t q_cnt = s_sd_status.queue_record_count;
+        pos = snprintf(out_json, max_len,
+            "{\"path\":\"%s\",\"total_count\":%lu,\"offset\":0,\"limit\":1,\"count\":0,"
+            "\"content\":\"[OFFLINE TELEMETRY QUEUE]\\r\\nPending Records: %lu\\r\\nPartition: 512 KB\"}",
+            curr_path, (unsigned long)q_cnt, (unsigned long)q_cnt);
+    } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
+        pos = snprintf(out_json, max_len,
+            "{\"path\":\"%s\",\"total_count\":1,\"offset\":0,\"limit\":1,\"count\":1,"
+            "\"content\":\"[BOOT LOG]\\r\\nSTM32F407 168MHz | FreeRTOS\\r\\nBoot Reason: Power-On Reset\"}",
+            curr_path);
     } else {
-        pos += snprintf(out_json + pos, max_len - pos, "[SD LOG DATA] Log file empty or uninitialized.");
+        pos = Partition_Log_FormatJSON_Paged(out_json, max_len, offset, (limit > 0 && limit <= 50) ? limit : 50);
     }
-
-    pos += snprintf(out_json + pos, max_len - pos, "\"}");
     SD_Unlock();
     return pos;
+}
+
+int SDCard_Read_File(const char *path, char *out_json, int max_len) {
+    return SDCard_Read_File_Paged(path, 0, 50, out_json, max_len);
 }
