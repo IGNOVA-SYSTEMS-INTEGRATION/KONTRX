@@ -80,8 +80,12 @@ typedef struct {
 /* Actuator Protocol & State Configuration */
 typedef enum {
     ACTUATOR_TYPE_LOCAL_GPIO = 0,   // Local onboard Relays (PA0, PE2, etc.)
-    ACTUATOR_TYPE_MODBUS_TCP,       // Modbus TCP remote PLC Port
-    ACTUATOR_TYPE_OPC_UA_CLIENT     // Direct OPC UA Client Write Node
+    ACTUATOR_TYPE_MODBUS_TCP = 1,   // Modbus TCP remote PLC Port
+    ACTUATOR_TYPE_OPC_UA_CLIENT = 2, // Direct OPC UA Client Write Node
+    ACTUATOR_TYPE_PWM = 3,          // PWM Output Channel
+    ACTUATOR_TYPE_PTO = 4,          // PTO Motion Axis Channel
+    ACTUATOR_TYPE_ANALOG_MA = 5,    // 4-20mA Current Output Channel
+    ACTUATOR_TYPE_ANALOG_V = 6      // 0-10V Voltage Output Channel
 } ActuatorType_t;
 
 typedef struct {
