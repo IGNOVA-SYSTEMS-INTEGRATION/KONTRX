@@ -33,7 +33,6 @@
 #include "freertos_tasks.h"
 #include "flash_partition.h"
 #include "w25q16.h"
-#include "web_assets.h"
 #include "w5500.h"
 #include "socket.h"
 #include "dhcp.h"
@@ -187,24 +186,7 @@ static void Load_Config_From_Flash(void) {
         printf("[CFG] Default configurations written to flash partitions.\r\n");
     }
 
-    // 3. Extract default embedded Web Assets to External Flash if missing
-    uint32_t first_word = 0;
-    W25Q_Read(PARTITION_WEB_ADDR, (uint8_t *)&first_word, 4);
-    if (first_word != 0x4F44213CU || 1) { // Force re-extract to update UI with PLC support
-        printf("[SYS] External Web Assets blank. Extracting embedded web assets (HTML/CSS/JS) to W25Q16...\r\n");
-        // Dynamically erase enough 4KB sectors to fit the full embedded web assets
-        uint32_t needed_sectors = (strlen(KONTRX_HTML) + 4095) / 4096;
-        if (needed_sectors < 32) needed_sectors = 32;
-        for (uint32_t s = 0; s < needed_sectors; s++) {
-            W25Q_EraseSector(PARTITION_WEB_ADDR + s * 4096);
-        }
-        // Write embedded HTML file
-        W25Q_Write(PARTITION_WEB_ADDR, (const uint8_t *)KONTRX_HTML, strlen(KONTRX_HTML));
-        printf("[SYS] Web Assets successfully written to External Flash (%lu bytes, %lu sectors)!\r\n",
-               (unsigned long)strlen(KONTRX_HTML), (unsigned long)needed_sectors);
-    } else {
-        printf("[SYS] Onboard W25Q16 Web Assets partition verified.\r\n");
-    }
+    // 3. Web Assets are served directly from MCU Internal Flash (KONTRX_HTML in APP/web_assets.h)
 }
 
 /* ======================================================================

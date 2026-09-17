@@ -101,6 +101,27 @@ static Modbus_SensorData_t s_sd;
 static Gateway_Config_t    s_cfg;
 static wiz_NetInfo         s_ni;
 
+static void ParseQueryStringParam(const char *line, const char *param_name, char *out_buf, size_t out_buf_size) {
+    if (!line || !param_name || !out_buf || out_buf_size == 0) return;
+    char key[16];
+    snprintf(key, sizeof(key), "%s=", param_name);
+    char *p = strstr(line, key);
+    if (p) {
+        p += strlen(key);
+        char *end = strchr(p, '&');
+        if (!end) end = strchr(p, ' ');
+        if (end) {
+            size_t len = (size_t)(end - p);
+            if (len >= out_buf_size) len = out_buf_size - 1;
+            strncpy(out_buf, p, len);
+            out_buf[len] = '\0';
+        } else {
+            strncpy(out_buf, p, out_buf_size - 1);
+            out_buf[out_buf_size - 1] = '\0';
+        }
+    }
+}
+
 /* ======================================================================
  *  Web Authentication & Session State
  * ====================================================================== */
@@ -223,15 +244,29 @@ static int JSON_HardwareResponse(char *buf, int buflen) {
     pos += snprintf(buf + pos, buflen - pos, "],\"relays\":[");
     for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
         char pin_val[32] = {0};
+        const char *act_type_name = "unknown";
         if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
             snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
-        } else {
+            act_type_name = "GPIO";
+        } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_MODBUS_TCP) {
             snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
+            act_type_name = "Modbus TCP";
+        } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_OPC_UA_CLIENT) {
+            snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
+            act_type_name = "OPC UA";
+        } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_PWM) {
+            snprintf(pin_val, sizeof(pin_val), "CH %u", s_cfg.actuators[i].pin_or_slave + 1);
+            act_type_name = "PWM";
+        } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_PTO) {
+            snprintf(pin_val, sizeof(pin_val), "Axis %u", s_cfg.actuators[i].pin_or_slave + 1);
+            act_type_name = "PTO Motion";
+        } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_ANALOG_MA) {
+            snprintf(pin_val, sizeof(pin_val), "CH %u", s_cfg.actuators[i].pin_or_slave + 1);
+            act_type_name = "4-20mA";
+        } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_ANALOG_V) {
+            snprintf(pin_val, sizeof(pin_val), "CH %u", s_cfg.actuators[i].pin_or_slave + 1);
+            act_type_name = "0-10V";
         }
-        const char *act_type_name = "unknown";
-        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) act_type_name = "GPIO";
-        else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_MODBUS_TCP) act_type_name = "Modbus TCP";
-        else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_OPC_UA_CLIENT) act_type_name = "OPC UA";
 
         pos += snprintf(buf + pos, buflen - pos,
             "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"type_name\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"nc\":%u}%s",
@@ -459,13 +494,15 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         }
     }
     for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
-        char clean_payload[128];
-        memset(clean_payload, 0, sizeof(clean_payload));
-        strncpy(clean_payload, (const char *)g_mqtt_status.log[i].payload, sizeof(clean_payload) - 1);
-        for (size_t k = 0; k < strlen(clean_payload); k++) {
-            if ((unsigned char)clean_payload[k] < 32 || (unsigned char)clean_payload[k] > 126) clean_payload[k] = ' ';
-            else if (clean_payload[k] == '"' || clean_payload[k] == '\\') clean_payload[k] = '\'';
+        char clean_payload[512];
+        uint32_t cpos = 0;
+        const char *raw = (const char *)g_mqtt_status.log[i].payload;
+        while (*raw && cpos < sizeof(clean_payload) - 4) {
+            char ch = *raw++;
+            if (ch == '"' || ch == '\\') clean_payload[cpos++] = '\\';
+            clean_payload[cpos++] = ((unsigned char)ch < 32 || (unsigned char)ch > 126) ? ' ' : ch;
         }
+        clean_payload[cpos] = '\0';
 
         pos += snprintf(buf + pos, buflen - pos,
             "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu}",
@@ -630,14 +667,30 @@ static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen
  *  HTTP response helpers
  * ====================================================================== */
 #define HTTP_200_HTML "HTTP/1.1 200 OK\r\nContent-Type:text/html;charset=UTF-8\r\nConnection:close\r\n\r\n"
-#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token, Cookie\r\nConnection:close\r\n\r\n"
+#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
 #define HTTP_400      "HTTP/1.1 400 Bad Request\r\nConnection:close\r\n\r\n{\"ok\":false}"
-#define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type:application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nConnection:close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\",\"unauth\":true}"
+#define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\"}"
 #define HTTP_200_OK_JSON "{\"ok\":true}"
 
 static void Send_Response(uint8_t sn, const char *header, const char *body) {
-    send(sn, (uint8_t *)header, strlen(header));
-    if (body) send(sn, (uint8_t *)body, strlen(body));
+    if (!body || body[0] == '\0') {
+        send(sn, (uint8_t *)header, (uint16_t)strlen(header));
+        return;
+    }
+    int body_len = (int)strlen(body);
+    char hdr[384];
+    const char *end = strstr(header, "\r\n\r\n");
+    int prefix_len = end ? (int)(end - header) : (int)strlen(header);
+    int hdr_len = end ? snprintf(hdr, sizeof(hdr), "%.*s\r\nContent-Length: %d\r\n\r\n%s", prefix_len, header, body_len, body)
+                      : snprintf(hdr, sizeof(hdr), "%s%s", header, body);
+
+    if (hdr_len > 0 && hdr_len < (int)sizeof(hdr)) {
+        send(sn, (uint8_t *)hdr, (uint16_t)hdr_len);
+    } else {
+        if (end) hdr_len = snprintf(hdr, sizeof(hdr), "%.*s\r\nContent-Length: %d\r\n\r\n", prefix_len, header, body_len);
+        send(sn, (uint8_t *)hdr, (uint16_t)hdr_len);
+        Send_Chunked(sn, (const uint8_t *)body, (uint32_t)body_len);
+    }
 }
 
 /**
@@ -717,8 +770,9 @@ static void Safe_Write_Config_To_Flash(const Gateway_Config_t *cfg_in, const cha
 }
 
 static void Stream_Web_Asset(uint8_t sn) {
-    uint32_t html_len = strlen(KONTRX_HTML);
-    printf("[HTTP] Streaming web asset: %lu bytes\r\n", (unsigned long)html_len);
+    uint32_t html_len = (uint32_t)(sizeof(KONTRX_HTML) - 1);
+
+    printf("[HTTP] Streaming web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
     char hdr[256];
     snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
@@ -732,29 +786,10 @@ static void Stream_Web_Asset(uint8_t sn) {
         (unsigned long)html_len);
     send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
 
-    // Stream from W25Q16 in 1024-byte chunks
-    uint8_t chunk_buf[1024];
-    uint32_t addr = PARTITION_WEB_ADDR;
-    uint32_t remaining = html_len;
-    uint32_t chunks_sent = 0;
-    while (remaining > 0) {
-        uint32_t read_len = (remaining > 1024) ? 1024 : remaining;
-        W25Q_Read(addr, chunk_buf, read_len);
-        int32_t result = send(sn, chunk_buf, (uint16_t)read_len);
-        if (result > 0) {
-            addr += read_len;
-            remaining -= read_len;
-            chunks_sent++;
-            if ((chunks_sent % 4) == 0) {
-                osDelay(1); // Yield every 4KB to let other RTOS tasks run
-            }
-        } else if (result == SOCK_BUSY) {
-            osDelay(2);  // TX buffer full, wait for W5500 hardware transmission
-        } else {
-            printf("[HTTP] Streaming socket error, aborting stream! (result=%ld)\r\n", (long)result);
-            break;  // Socket error, abort
-        }
-    }
+    /* Stream KONTRX_HTML directly from internal MCU Flash memory.
+     * Prevents SPI flash mismatch, outdated W25Q16 content, or trailing 0xFF bytes. */
+    Send_Chunked(sn, (const uint8_t *)KONTRX_HTML, html_len);
+    printf("[HTTP] Web asset stream complete: %lu bytes sent.\r\n", (unsigned long)html_len);
 }
 
 /* ======================================================================
@@ -802,11 +837,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * Serves the full SPA HTML asset from W25Q16 for all registered UI paths.
      * ----------------------------------------------------------------- */
     if (Is_Page_Route(line)) {
-        if (strstr(line, "kx-spa-v110") != NULL) {
-            const char *r304 = "HTTP/1.1 304 Not Modified\r\nETag: \"kx-spa-v110\"\r\nConnection: close\r\n\r\n";
-            send(sn, (uint8_t *)r304, strlen(r304));
-            return;
-        }
         Stream_Web_Asset(sn);
         return;
     }
@@ -1687,13 +1717,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (strncmp(line, "GET /api/sdcard/status", 22) == 0) {
         SDCard_Status_t st;
         SDCard_GetStatus(&st);
-        char sd_buf[256];
+        uint32_t total_used_bytes = st.log_file_bytes + (st.queue_record_count * sizeof(OfflineRecord_t));
+        char sd_buf[280];
         snprintf(sd_buf, sizeof(sd_buf),
-                 "{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}",
+                 "{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}",
                  st.mounted, st.card_type,
                  (unsigned long)st.total_capacity_mb,
                  (unsigned long)st.free_capacity_mb,
                  (unsigned long)(st.total_capacity_mb - st.free_capacity_mb),
+                 (unsigned long)total_used_bytes,
                  (unsigned long)st.queue_record_count,
                  (unsigned long)st.log_entry_count,
                  (unsigned long)st.log_file_bytes);
@@ -1706,75 +1738,46 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/sdcard/browse", 22) == 0) {
         char path_param[64] = "/";
-        char *p = strstr(line, "path=");
-        if (p) {
-            p += 5;
-            char *end = strchr(p, ' ');
-            if (!end) end = strchr(p, '&');
-            if (end) {
-                size_t len = end - p;
-                if (len < sizeof(path_param)) {
-                    strncpy(path_param, p, len);
-                    path_param[len] = '\0';
-                }
-            } else {
-                strncpy(path_param, p, sizeof(path_param) - 1);
-            }
-        }
+        ParseQueryStringParam(line, "path", path_param, sizeof(path_param));
         if (strcmp(path_param, "%2F") == 0 || strcmp(path_param, "%2f") == 0 || path_param[0] == '\0') {
             strcpy(path_param, "/");
         }
         int n = SDCard_List_Dir(path_param, tx_buf, sizeof(tx_buf));
-        char sd_hdr[320];
+        char sd_hdr[160];
         snprintf(sd_hdr, sizeof(sd_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            n);
+            "Connection: close\r\n\r\n", n);
         send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
         return;
     }
 
     /* -----------------------------------------------------------------
-     * GET /api/sdcard/read?path=...  → Read SD Card file content data
+     * GET /api/sdcard/read?path=... OR GET /api/sdcard/download?path=...
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "GET /api/sdcard/read", 20) == 0) {
+    if (strncmp(line, "GET /api/sdcard/read", 20) == 0 || strncmp(line, "GET /api/sdcard/download", 24) == 0) {
+        uint8_t is_dl = (line[17] == 'd');
         char path_param[64] = "system.log";
-        char *p = strstr(line, "path=");
-        if (p) {
-            p += 5;
-            char *end = strchr(p, ' ');
-            if (!end) end = strchr(p, '&');
-            if (end) {
-                size_t len = end - p;
-                if (len < sizeof(path_param)) {
-                    strncpy(path_param, p, len);
-                    path_param[len] = '\0';
-                }
-            } else {
-                strncpy(path_param, p, sizeof(path_param) - 1);
-            }
-        }
-        int n = SDCard_Read_File(path_param, tx_buf, sizeof(tx_buf));
-        char sd_hdr[320];
+        uint32_t offset = 0;
+        uint32_t limit = 50;
+        ParseQueryStringParam(line, "path", path_param, sizeof(path_param));
+        char *poff = strstr(line, "offset=");
+        if (poff) offset = (uint32_t)atoi(poff + 7);
+        char *plim = strstr(line, "limit=");
+        if (plim) limit = (uint32_t)atoi(plim + 6);
+        int n = SDCard_Read_File_Paged(path_param, offset, limit, tx_buf, sizeof(tx_buf));
+        char sd_hdr[200];
         snprintf(sd_hdr, sizeof(sd_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
+            "%s"
             "Content-Length: %d\r\n"
-            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
             "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            n);
+            "Connection: close\r\n\r\n",
+            is_dl ? "Content-Disposition: attachment\r\n" : "", n);
         send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
         return;
@@ -1956,6 +1959,30 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 strncpy(temp_actuators[actuator_count].port_or_ip, endpoint, sizeof(temp_actuators[actuator_count].port_or_ip) - 1);
                 temp_actuators[actuator_count].port = (uint16_t)port;
                 strncpy(temp_actuators[actuator_count].opc_node_id, node, sizeof(temp_actuators[actuator_count].opc_node_id) - 1);
+            }
+            else if (type == ACTUATOR_TYPE_PWM) {
+                int ch = JSON_ReadInt(obj_start, "channel");
+                int freq = JSON_ReadInt(obj_start, "freq");
+                if (ch < 0) ch = 0;
+                if (freq <= 0) freq = 1000;
+                temp_actuators[actuator_count].pin_or_slave = (uint8_t)ch;
+                temp_actuators[actuator_count].reg_addr = (uint16_t)freq;
+                snprintf(temp_actuators[actuator_count].port_or_ip, sizeof(temp_actuators[actuator_count].port_or_ip), "CH%d", ch + 1);
+            }
+            else if (type == ACTUATOR_TYPE_PTO) {
+                int axis = JSON_ReadInt(obj_start, "channel");
+                int speed = JSON_ReadInt(obj_start, "speed");
+                if (axis < 0) axis = 0;
+                if (speed <= 0) speed = 1000;
+                temp_actuators[actuator_count].pin_or_slave = (uint8_t)axis;
+                temp_actuators[actuator_count].reg_addr = (uint16_t)speed;
+                snprintf(temp_actuators[actuator_count].port_or_ip, sizeof(temp_actuators[actuator_count].port_or_ip), "AXIS%d", axis + 1);
+            }
+            else if (type == ACTUATOR_TYPE_ANALOG_MA || type == ACTUATOR_TYPE_ANALOG_V) {
+                int ch = JSON_ReadInt(obj_start, "channel");
+                if (ch < 0) ch = 0;
+                temp_actuators[actuator_count].pin_or_slave = (uint8_t)ch;
+                snprintf(temp_actuators[actuator_count].port_or_ip, sizeof(temp_actuators[actuator_count].port_or_ip), "CH%d", ch + 1);
             }
 
             actuator_count++;
@@ -2645,42 +2672,29 @@ void Task_HTTPServer(void *arg) {
 
         /* ---------------------------------------------------------------
          * CLOSED → create TCP socket and prepare to listen.
-         * After socket() the W5500 needs a few ms to allocate the
-         * socket and transition to SOCK_INIT.  5ms is sufficient.
          * -------------------------------------------------------------- */
         case SOCK_CLOSED:
             if (socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
-                printf("[HTTP] Socket open failed! Performing self-healing W5500 network check...\r\n");
+                printf("[HTTP] Socket open failed! Checking network...\r\n");
                 Ensure_W5500_Network_Alive();
                 osDelay(200); /* backoff on W5500 socket allocation failure */
-            } else {
-                osDelay(5);   /* let W5500 settle to SOCK_INIT state */
             }
             break;
 
         /* ---------------------------------------------------------------
-         * INIT → start listening for incoming connections.
-         * After listen() the W5500 needs a few ms to transition its
-         * internal state machine from SOCK_INIT to SOCK_LISTEN.  Without
-         * the delay getSn_SR() still returns SOCK_INIT on the very next
-         * 1ms loop tick, so listen() is called (and printed) again and
-         * again.  10ms is more than enough for the W5500 to settle.
+         * INIT → start listening for incoming connections immediately.
          * --------------------------------------------------------------- */
         case SOCK_INIT:
             if (listen(HTTP_SOCK) != SOCK_OK) {
-                printf("[HTTP] Listen failed\r\n");
-                osDelay(100);
-            } else {
-                printf("[HTTP] Listening on port %u\r\n", HTTP_PORT);
-                osDelay(10);  /* let W5500 settle to SOCK_LISTEN state */
+                osDelay(50);
             }
             break;
 
         /* ---------------------------------------------------------------
-         * LISTEN → idle, waiting for browser SYN  (no action needed)
+         * LISTEN → idle, waiting for browser SYN. 1ms yield.
          * -------------------------------------------------------------- */
         case SOCK_LISTEN:
-            osDelay(20);
+            osDelay(1);
             break;
 
         /* ---------------------------------------------------------------
@@ -2695,7 +2709,6 @@ void Task_HTTPServer(void *arg) {
             if (getSn_IR(HTTP_SOCK) & Sn_IR_CON) {
                 setSn_IR(HTTP_SOCK, Sn_IR_CON);
             }
-            printf("[HTTP] SOCK_ESTABLISHED: Browser connected!\r\n");
             {
                 uint16_t size = 0;
                 /* Retry loop: wait for at least 8 bytes (shortest valid
@@ -2704,13 +2717,10 @@ void Task_HTTPServer(void *arg) {
                     size = getSn_RX_RSR(HTTP_SOCK);
                     if (size >= 8) break;
                     osDelay(5); /* 5ms poll step while waiting for the browser's
-                                 * request bytes to arrive from the network.
-                                 * Max wait = 10 x 5ms = 50ms, then 404 fallback.
-                                 * HTTP task only; unrelated to the 1ms engine. */
+                                 * request bytes to arrive from the network. */
                 }
 
                 if (size > 0) {
-                    printf("[HTTP] Received %u bytes of request data\r\n", size);
                     if (size > (uint16_t)(sizeof(rx_buf) - 1))
                         size = (uint16_t)(sizeof(rx_buf) - 1);
                     recv(HTTP_SOCK, rx_buf, size);
@@ -2728,8 +2738,9 @@ void Task_HTTPServer(void *arg) {
                     }
                     
                     /* Wait for W5500 hardware TX buffer to be fully sent and ACKed by the client.
-                     * For a 2KB socket buffer, getSn_TX_FSR returning 2048 means the buffer is empty. */
-                    for (int wait_ack = 0; wait_ack < 200; wait_ack++) {
+                     * For a 2KB socket buffer, getSn_TX_FSR returning 2048 means the buffer is empty.
+                     * Use longer timeout (2s) for large web asset streaming (~112KB). */
+                    for (int wait_ack = 0; wait_ack < 2000; wait_ack++) {
                         if (getSn_TX_FSR(HTTP_SOCK) >= 2048) {
                             break;
                         }
@@ -2737,7 +2748,6 @@ void Task_HTTPServer(void *arg) {
                     }
                     disconnect(HTTP_SOCK);
                 } else {
-                    printf("[HTTP] No request bytes received (size=0), disconnecting...\r\n");
                     /* Socket leak fix: disconnect if no request bytes received */
                     disconnect(HTTP_SOCK);
                 }
