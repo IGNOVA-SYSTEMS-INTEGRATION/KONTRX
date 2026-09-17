@@ -770,9 +770,39 @@ static void Safe_Write_Config_To_Flash(const Gateway_Config_t *cfg_in, const cha
 }
 
 static void Stream_Web_Asset(uint8_t sn) {
-    uint32_t html_len = (uint32_t)(sizeof(KONTRX_HTML) - 1);
+    uint32_t html_len = (uint32_t)strlen(KONTRX_HTML);
 
-    printf("[HTTP] Streaming web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
+    /* Verify W25Q16 flash content integrity before streaming.
+     * Read first 15 bytes and check for "<!DOCTYPE html>" marker. */
+    uint8_t verify_buf[16];
+    W25Q_Read(PARTITION_WEB_ADDR, verify_buf, 15);
+    verify_buf[15] = '\0';
+    if (memcmp(verify_buf, "<!DOCTYPE html>", 15) != 0) {
+        printf("[HTTP] ERROR: W25Q16 web asset corrupted! First bytes: %02X %02X %02X %02X\r\n",
+               verify_buf[0], verify_buf[1], verify_buf[2], verify_buf[3]);
+        /* Serve a minimal diagnostic error page */
+        const char *err_page =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Connection: close\r\n\r\n"
+            "<!DOCTYPE html><html><head><title>Kontrx Edge Gateway</title></head>"
+            "<body style='font-family:sans-serif;text-align:center;padding:60px'>"
+            "<h1 style='color:#e02424'>Web UI Flash Error</h1>"
+            "<p>The web interface stored in W25Q16 external flash is corrupted.</p>"
+            "<p>Please reboot the device to re-extract the UI, or re-flash firmware.</p>"
+            "<p style='color:#999;font-size:0.8em'>First flash bytes: ";
+        send(sn, (uint8_t *)err_page, (uint16_t)strlen(err_page));
+        char hex_str[64];
+        snprintf(hex_str, sizeof(hex_str), "%02X %02X %02X %02X %02X %02X %02X %02X",
+                 verify_buf[0], verify_buf[1], verify_buf[2], verify_buf[3],
+                 verify_buf[4], verify_buf[5], verify_buf[6], verify_buf[7]);
+        send(sn, (uint8_t *)hex_str, (uint16_t)strlen(hex_str));
+        const char *err_end = "</p></body></html>";
+        send(sn, (uint8_t *)err_end, (uint16_t)strlen(err_end));
+        return;
+    }
+
+    printf("[HTTP] Streaming web asset: %lu bytes\r\n", (unsigned long)html_len);
     char hdr[256];
     snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
@@ -786,10 +816,34 @@ static void Stream_Web_Asset(uint8_t sn) {
         (unsigned long)html_len);
     send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
 
-    /* Stream KONTRX_HTML directly from internal MCU Flash memory.
-     * Prevents SPI flash mismatch, outdated W25Q16 content, or trailing 0xFF bytes. */
-    Send_Chunked(sn, (const uint8_t *)KONTRX_HTML, html_len);
-    printf("[HTTP] Web asset stream complete: %lu bytes sent.\r\n", (unsigned long)html_len);
+    // Stream from W25Q16 in 1024-byte chunks
+    uint8_t chunk_buf[1024];
+    uint32_t addr = PARTITION_WEB_ADDR;
+    uint32_t remaining = html_len;
+    uint32_t chunks_sent = 0;
+    uint32_t total_bytes_sent = 0;
+    while (remaining > 0) {
+        uint32_t read_len = (remaining > 1024) ? 1024 : remaining;
+        W25Q_Read(addr, chunk_buf, read_len);
+        int32_t result = send(sn, chunk_buf, (uint16_t)read_len);
+        if (result > 0) {
+            addr += read_len;
+            remaining -= read_len;
+            total_bytes_sent += read_len;
+            chunks_sent++;
+            if ((chunks_sent % 4) == 0) {
+                osDelay(1); // Yield every 4KB to let other RTOS tasks run
+            }
+        } else if (result == SOCK_BUSY) {
+            osDelay(2);  // TX buffer full, wait for W5500 hardware transmission
+        } else {
+            printf("[HTTP] Streaming error at byte %lu (result=%ld)\r\n",
+                   (unsigned long)total_bytes_sent, (long)result);
+            break;  // Socket error, abort
+        }
+    }
+    printf("[HTTP] Stream complete: %lu/%lu bytes in %lu chunks\r\n",
+           (unsigned long)total_bytes_sent, (unsigned long)html_len, (unsigned long)chunks_sent);
 }
 
 /* ======================================================================
