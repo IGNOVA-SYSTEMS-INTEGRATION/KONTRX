@@ -46,6 +46,7 @@
 #include "mqtt_interface.h"
 #include "sparkplug_b_enc.h"
 #include "modbus_tcp_server.h"
+#include "interface_discovery.h"
 
 static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay tasks */
 #include "socket.h"
@@ -509,8 +510,11 @@ static void Task_ControlEngine(void *arg) {
     Modbus_SensorData_t sd = { .last_update_time = 0 };
 
     for (;;) {
-        /* Poll Modbus TCP Server for incoming SCADA / PLC commands */
-        Modbus_TCP_Server_Poll();
+        /* Poll Modbus TCP Server for incoming SCADA / PLC commands if enabled */
+        const Hardware_Interface_Desc_t *if10 = Interface_GetDesc(10);
+        if (!if10 || if10->enabled) {
+            Modbus_TCP_Server_Poll();
+        }
 
         /* --- Read latest sensor snapshot (mutex-protected, non-blocking) --- */
         if (osMutexAcquire(sensorMutex, 0) == osOK) {
@@ -645,8 +649,11 @@ static void Task_ModbusSensorPoll(void *arg) {
             vTaskPrioritySet(NULL, 3);
             osDelay(2000); /* 2s cool-down after a full 247-address scan. */
         } else {
-            /* Poll sensors and yield 350ms between scan cycles to keep CPU cool & idle */
-            Modbus_DMA_PollSensors();
+            /* Poll sensors if RS485 Bus 1 (index 3) is enabled; yield 350ms between cycles */
+            const Hardware_Interface_Desc_t *if3 = Interface_GetDesc(3);
+            if (!if3 || if3->enabled) {
+                Modbus_DMA_PollSensors();
+            }
             osDelay(350);
         }
     }
@@ -765,7 +772,7 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
     pos += snprintf(json_buf + pos, max_len - pos,
                     "{"
                     "\"deviceId\":\"%s\","
-                    "\"tenantId\":\"11111111-2222-3333-4444-555555555555\","
+                    "\"tenantId\":\"1111-2222\","
                     "\"facilityType\":\"Aquaculture\","
                     "\"timestamp\":\"%s\","
                     "\"status\":\"Online\","
@@ -957,35 +964,39 @@ static void Do_Offline_Telemetry_Queueing(void) {
             rec.timestamp = g_uptime_seconds;
             rec.source_type = s_tasks_cfg.mqtt_mappings[m].source_type;
             rec.source_id = s_tasks_cfg.mqtt_mappings[m].source_id;
-            rec.valid = 1;
+            rec.valid = 0;
             rec.value = 0.0f;
             rec.temp = 0.0f;
             
             if (rec.source_type == MAP_SOURCE_SENSOR) {
-                uint8_t found = 0;
                 for (int s = 0; s < batch.count; s++) {
-                    if (batch.records[s].id == rec.source_id) {
+                    if (batch.records[s].id == rec.source_id && batch.records[s].valid) {
                         rec.value = batch.records[s].avg_value;
                         rec.temp = batch.records[s].avg_temp;
-                        found = 1;
+                        rec.valid = 1;
                         break;
                     }
                 }
-                if (!found) {
-                    Get_Sensor_Value_Helper(rec.source_id, &rec.value, &rec.temp);
-                }
+                /* Only queue if sensor is ONLINE & valid */
+                if (!rec.valid) continue;
             } else if (rec.source_type == MAP_SOURCE_ACTUATOR) {
                 if (rec.source_id < MAX_RELAYS) {
                     rec.value = (float)relayStates[rec.source_id];
+                    rec.valid = 1;
                 }
             }
             
-            SDCard_Queue_Push(&rec);
-            cached_any = 1;
+            if (rec.valid) {
+                SDCard_Queue_Push(&rec);
+                cached_any = 1;
+            }
         }
     } else {
-        /* Auto-cache all active sensors & relays if no custom mapping set */
+        /* Auto-cache all ONLINE active sensors & relays if no custom mapping set */
         for (int s = 0; s < batch.count; s++) {
+            /* Only queue online & valid sensors */
+            if (!batch.records[s].valid) continue;
+
             OfflineRecord_t rec;
             rec.timestamp = g_uptime_seconds;
             rec.source_type = MAP_SOURCE_SENSOR;
@@ -995,21 +1006,6 @@ static void Do_Offline_Telemetry_Queueing(void) {
             rec.temp = batch.records[s].avg_temp;
             SDCard_Queue_Push(&rec);
             cached_any = 1;
-        }
-        
-        if (batch.count == 0 && s_tasks_cfg.sensors.count > 0) {
-            for (int s = 0; s < s_tasks_cfg.sensors.count && s < MAX_SENSORS; s++) {
-                OfflineRecord_t rec;
-                rec.timestamp = g_uptime_seconds;
-                rec.source_type = MAP_SOURCE_SENSOR;
-                rec.source_id = s_tasks_cfg.sensors.entries[s].id;
-                rec.valid = 1;
-                rec.value = 0.0f;
-                rec.temp = 0.0f;
-                Get_Sensor_Value_Helper(rec.source_id, &rec.value, &rec.temp);
-                SDCard_Queue_Push(&rec);
-                cached_any = 1;
-            }
         }
 
         uint8_t relay_cnt = (s_tasks_cfg.actuator_count > 0) ? s_tasks_cfg.actuator_count : MAX_RELAYS;
@@ -1107,10 +1103,10 @@ static void Task_MQTTClient(void *arg) {
             int8_t dns_res = DNS_run(net_info.dns, (uint8_t *)s_tasks_cfg.mqtt_broker, broker_ip);
             if (dns_res != 1) {
                 printf("[MQTT] DNS resolution failed for: %s\r\n", s_tasks_cfg.mqtt_broker);
-                snprintf(log_msg, sizeof(log_msg), "DNS failed to resolve: %s", s_tasks_cfg.mqtt_broker);
+                snprintf(log_msg, sizeof(log_msg), "DNS fail: %s", s_tasks_cfg.mqtt_broker);
                 Log_Event("MQTT", log_msg);
                 g_mqtt_status.connected = 0;
-                snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "DNS failed to resolve broker hostname '%s'", s_tasks_cfg.mqtt_broker);
+                snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "DNS fail: %s", s_tasks_cfg.mqtt_broker);
 
                 uint32_t interval_sec = (s_tasks_cfg.mqtt_interval > 0) ? s_tasks_cfg.mqtt_interval : 5;
                 if ((osKernelGetTickCount() - last_publish) >= pdMS_TO_TICKS(interval_sec * 1000)) {
@@ -1203,53 +1199,6 @@ static void Task_MQTTClient(void *arg) {
                 g_mqtt_status.connected = 1;
                 g_mqtt_status.last_error[0] = '\0';
 
-                /* Flush offline queue before NBIRTH and live telemetry */
-                uint32_t cached_count = Partition_Queue_Count();
-                if (cached_count > 0) {
-                    printf("[MQTT] Connected! Flushing %lu cached offline records...\r\n", (unsigned long)cached_count);
-                    char cache_log[64];
-                    snprintf(cache_log, sizeof(cache_log), "Flushing %lu offline records...", (unsigned long)cached_count);
-                    Log_Event("MQTT", cache_log);
-
-                    OfflineRecord_t rec;
-                    while (Partition_Queue_Pop(&rec)) {
-                        char key_name[24] = {0};
-                        for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
-                            if (s_tasks_cfg.mqtt_mappings[m].source_type == rec.source_type &&
-                                s_tasks_cfg.mqtt_mappings[m].source_id == rec.source_id &&
-                                s_tasks_cfg.mqtt_mappings[m].enabled) {
-                                strncpy(key_name, s_tasks_cfg.mqtt_mappings[m].json_key, sizeof(key_name) - 1);
-                                break;
-                            }
-                        }
-                        if (key_name[0] == '\0') {
-                            if (rec.source_type == MAP_SOURCE_SENSOR) {
-                                snprintf(key_name, sizeof(key_name), "sensor_%u", rec.source_id);
-                            } else {
-                                snprintf(key_name, sizeof(key_name), "relay_%u", rec.source_id);
-                            }
-                        }
-                        
-                        char cache_payload[128];
-                        snprintf(cache_payload, sizeof(cache_payload),
-                                 "{\"timestamp\":%lu,\"%s\":%.2f}",
-                                 (unsigned long)rec.timestamp, key_name, rec.value);
-                        
-                        MQTTMessage msg;
-                        msg.qos = QOS1;
-                        msg.retained = 0;
-                        msg.dup = 0;
-                        msg.payload = (void*)cache_payload;
-                        msg.payloadlen = strlen(cache_payload);
-                        
-                        int cache_pub_rc = MQTTPublish(&client, active_topic, &msg);
-                        Log_Mqtt_Topic(active_topic, cache_payload, cache_pub_rc == SUCCESSS);
-                        osDelay(50); // Yield to prevent buffer congestion
-                    }
-                    printf("[MQTT] Cache flushing completed.\r\n");
-                    Log_Event("MQTT", "Cache flushing completed successfully.");
-                }
-
                 /* ── Send NBIRTH (Node Birth) ──────────────────────────────────
                  * Immediately after connecting, announce online state and all metric
                  * definitions/initial values as a binary protobuf NBIRTH payload.
@@ -1297,6 +1246,7 @@ static void Task_MQTTClient(void *arg) {
                 last_publish = osKernelGetTickCount();
                 
                 while (client.isconnected) {
+                    uint8_t live_event_published = 0;
                     /* ── Detect any MQTT configuration changes (from provisioning or web UI) ── */
                     static uint32_t local_mqtt_version = 0;
                     if (local_mqtt_version != g_config_version) {
@@ -1478,7 +1428,50 @@ static void Task_MQTTClient(void *arg) {
                         }
 
                         if (!has_change) {
-                            osDelay(20);
+                            if (Partition_Queue_Count() > 0) {
+                                OfflineRecord_t rec;
+                                if (Partition_Queue_Pop(&rec)) {
+                                    char key_name[24] = {0};
+                                    for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
+                                        if (s_tasks_cfg.mqtt_mappings[m].source_type == rec.source_type &&
+                                            s_tasks_cfg.mqtt_mappings[m].source_id == rec.source_id &&
+                                            s_tasks_cfg.mqtt_mappings[m].enabled) {
+                                            strncpy(key_name, s_tasks_cfg.mqtt_mappings[m].json_key, sizeof(key_name) - 1);
+                                            break;
+                                        }
+                                    }
+                                    if (key_name[0] == '\0') {
+                                        if (rec.source_type == MAP_SOURCE_SENSOR) {
+                                            snprintf(key_name, sizeof(key_name), "sensor_%u", rec.source_id);
+                                        } else {
+                                            snprintf(key_name, sizeof(key_name), "relay_%u", rec.source_id);
+                                        }
+                                    }
+                                    
+                                     char cache_payload[192];
+                                     if (s_tasks_cfg.mqtt_payload_shape == 0) {
+                                         const char *d_id = s_tasks_cfg.device_id[0] ? s_tasks_cfg.device_id : (s_tasks_cfg.mqtt_client_id[0] ? s_tasks_cfg.mqtt_client_id : "kontrx-gateway-01");
+                                         snprintf(cache_payload, sizeof(cache_payload),
+                                                  "{\"deviceId\":\"%s\",\"timestamp\":%lu,\"sensors\":{\"%s\":%.2f},\"status\":\"Queued\"}",
+                                                  d_id, (unsigned long)rec.timestamp, key_name, rec.value);
+                                     } else {
+                                         snprintf(cache_payload, sizeof(cache_payload),
+                                                  "{\"timestamp\":%lu,\"%s\":%.2f}",
+                                                  (unsigned long)rec.timestamp, key_name, rec.value);
+                                     }
+                                    
+                                    MQTTMessage msg;
+                                    msg.qos = QOS1;
+                                    msg.retained = 0;
+                                    msg.dup = 0;
+                                    msg.payload = (void*)cache_payload;
+                                    msg.payloadlen = strlen(cache_payload);
+                                    
+                                    int cache_pub_rc = MQTTPublish(&client, active_topic, &msg);
+                                    Log_Mqtt_Topic(active_topic, cache_payload, cache_pub_rc == SUCCESSS);
+                                }
+                            }
+                            osDelay(50);
                             continue;
                         }
 
@@ -1558,10 +1551,11 @@ static void Task_MQTTClient(void *arg) {
                         }
 
                         if (pub_rc == SUCCESSS) {
+                            live_event_published = 1;
                             cov_last_pub_tick = osKernelGetTickCount();
                             last_publish = cov_last_pub_tick;
                             char pub_msg[128];
-                            snprintf(pub_msg, sizeof(pub_msg), "Published telemetry data to: %s", active_topic);
+                            snprintf(pub_msg, sizeof(pub_msg), "Pub %s", active_topic);
                             Log_Event("MQTT", pub_msg);
                             Log_Mqtt_Topic(active_topic, pub_payload_str, 1);
                         } else {
@@ -1604,8 +1598,8 @@ static void Task_MQTTClient(void *arg) {
                 }
             } else {
                 printf("[MQTT] Connect failed, rc = %d\r\n", rc);
-                Log_Event("MQTT", "MQTT connect rejected by broker.");
-                snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "MQTT CONNECT rejected by broker (code %d)", rc);
+                Log_Event("MQTT", "MQTT connect rejected");
+                snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "MQTT rejected (code %d)", rc);
             }
             g_mqtt_status.connected = 0;
             memset((void*)g_mqtt_status.active_topic, 0, sizeof(g_mqtt_status.active_topic));
@@ -1615,9 +1609,9 @@ static void Task_MQTTClient(void *arg) {
             close(n.my_socket);
         } else {
             printf("[MQTT] TCP Connection failed.\r\n");
-            Log_Event("MQTT", "TCP connection to broker failed.");
+            Log_Event("MQTT", "TCP conn failed");
             g_mqtt_status.connected = 0;
-            snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "TCP connection to %s:%d failed (Connection refused / Host unreachable)", s_tasks_cfg.mqtt_broker, s_tasks_cfg.mqtt_port);
+            snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "TCP fail: %s:%d", s_tasks_cfg.mqtt_broker, s_tasks_cfg.mqtt_port);
             close(n.my_socket);
             osDelay(3000);
         }

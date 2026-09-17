@@ -39,5 +39,6 @@ void SDCard_Log_Clear(void);
 /* SD Card Interactive Directory & File Explorer */
 int SDCard_List_Dir(const char *path, char *out_json, int max_len);
 int SDCard_Read_File(const char *path, char *out_json, int max_len);
+int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, char *out_json, int max_len);
 
 #endif // SDCARD_H
