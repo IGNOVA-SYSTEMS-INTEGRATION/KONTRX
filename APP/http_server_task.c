@@ -521,14 +521,13 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     size_t heap_total = configTOTAL_HEAP_SIZE;
 
     pos += snprintf(buf + pos, buflen - pos,
-        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"actuator_mask\":%u},",
+        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"},",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
         (unsigned)g_sys_log_full,
         (unsigned)has_pending,
-        pending_ver,
-        (unsigned)s_cfg.actuator_mask);
+        pending_ver);
 
     pos += snprintf(buf + pos, buflen - pos, "\"interfaces\":");
     pos += Interface_BuildArrayJSON(buf + pos, buflen - pos);
@@ -701,7 +700,6 @@ static void Send_Response(uint8_t sn, const char *header, const char *body) {
 #define SEND_CHUNK_SIZE 1024U
 static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
     uint32_t sent = 0;
-    uint32_t busy_retries = 0;
     while (sent < total) {
         uint16_t chunk = (uint16_t)((total - sent) > SEND_CHUNK_SIZE
                                     ? SEND_CHUNK_SIZE
@@ -709,17 +707,12 @@ static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
         int32_t result = send(sn, (uint8_t *)(data + sent), chunk);
         if (result > 0) {
             sent += (uint32_t)result;
-            busy_retries = 0;
-            osDelay(1);   /* 1ms yield between successful chunk writes */
+            osDelay(1);   /* 1ms yield between successful chunk writes to prevent SPI lock starvation */
         } else if (result == SOCK_BUSY) {
-            busy_retries++;
-            if (busy_retries > 500) {
-                printf("[HTTP] Send_Chunked: socket busy timeout at %lu/%lu bytes\r\n", (unsigned long)sent, (unsigned long)total);
-                break;
-            }
-            osDelay(1);   /* 1ms yield and retry */
+            osDelay(1);   /* 1ms yield — W5500 TX buffer full; wait a tick and
+                             retry. Allows other tasks (incl. 1ms Control Engine)
+                             to run meanwhile. Well within 1ms budget. */
         } else {
-            printf("[HTTP] Send_Chunked: socket error %ld at %lu/%lu bytes\r\n", (long)result, (unsigned long)sent, (unsigned long)total);
             break;        /* Socket error — abort */
         }
     }
@@ -781,7 +774,7 @@ static void Stream_Web_Asset(uint8_t sn) {
 
     printf("[HTTP] Streaming web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
     char hdr[256];
-    int hdr_len = snprintf(hdr, sizeof(hdr),
+    snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: %lu\r\n"
@@ -791,17 +784,10 @@ static void Stream_Web_Asset(uint8_t sn) {
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
+    send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
 
-    uint32_t retries = 0;
-    while (retries < 50) {
-        int32_t res = send(sn, (uint8_t *)hdr, (uint16_t)hdr_len);
-        if (res > 0) break;
-        osDelay(2);
-        retries++;
-    }
-    osDelay(5);
-
-    /* Stream KONTRX_HTML directly from internal MCU Flash memory. */
+    /* Stream KONTRX_HTML directly from internal MCU Flash memory.
+     * Prevents SPI flash mismatch, outdated W25Q16 content, or trailing 0xFF bytes. */
     Send_Chunked(sn, (const uint8_t *)KONTRX_HTML, html_len);
     printf("[HTTP] Web asset stream complete: %lu bytes sent.\r\n", (unsigned long)html_len);
 }
@@ -1898,11 +1884,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                     gpio->PUPDR &= ~(3U << (pin * 2));
                 }
             }
-        }
-
-        int mask = JSON_ReadInt(body, "actuator_mask");
-        if (mask >= 0) {
-            s_http_cfg_temp.actuator_mask = (uint8_t)mask;
         }
 
         uint8_t actuator_count = 0;
