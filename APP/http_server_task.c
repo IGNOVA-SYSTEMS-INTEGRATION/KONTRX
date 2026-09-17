@@ -700,6 +700,7 @@ static void Send_Response(uint8_t sn, const char *header, const char *body) {
 #define SEND_CHUNK_SIZE 1024U
 static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
     uint32_t sent = 0;
+    uint32_t busy_retries = 0;
     while (sent < total) {
         uint16_t chunk = (uint16_t)((total - sent) > SEND_CHUNK_SIZE
                                     ? SEND_CHUNK_SIZE
@@ -707,12 +708,17 @@ static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
         int32_t result = send(sn, (uint8_t *)(data + sent), chunk);
         if (result > 0) {
             sent += (uint32_t)result;
-            osDelay(1);   /* 1ms yield between successful chunk writes to prevent SPI lock starvation */
+            busy_retries = 0;
+            osDelay(1);   /* 1ms yield between successful chunk writes */
         } else if (result == SOCK_BUSY) {
-            osDelay(1);   /* 1ms yield — W5500 TX buffer full; wait a tick and
-                             retry. Allows other tasks (incl. 1ms Control Engine)
-                             to run meanwhile. Well within 1ms budget. */
+            busy_retries++;
+            if (busy_retries > 500) {
+                printf("[HTTP] Send_Chunked: socket busy timeout at %lu/%lu bytes\r\n", (unsigned long)sent, (unsigned long)total);
+                break;
+            }
+            osDelay(1);   /* 1ms yield and retry */
         } else {
+            printf("[HTTP] Send_Chunked: socket error %ld at %lu/%lu bytes\r\n", (long)result, (unsigned long)sent, (unsigned long)total);
             break;        /* Socket error — abort */
         }
     }
@@ -774,7 +780,7 @@ static void Stream_Web_Asset(uint8_t sn) {
 
     printf("[HTTP] Streaming web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
     char hdr[256];
-    snprintf(hdr, sizeof(hdr),
+    int hdr_len = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: %lu\r\n"
@@ -784,10 +790,17 @@ static void Stream_Web_Asset(uint8_t sn) {
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
-    send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
 
-    /* Stream KONTRX_HTML directly from internal MCU Flash memory.
-     * Prevents SPI flash mismatch, outdated W25Q16 content, or trailing 0xFF bytes. */
+    uint32_t retries = 0;
+    while (retries < 50) {
+        int32_t res = send(sn, (uint8_t *)hdr, (uint16_t)hdr_len);
+        if (res > 0) break;
+        osDelay(2);
+        retries++;
+    }
+    osDelay(5);
+
+    /* Stream KONTRX_HTML directly from internal MCU Flash memory. */
     Send_Chunked(sn, (const uint8_t *)KONTRX_HTML, html_len);
     printf("[HTTP] Web asset stream complete: %lu bytes sent.\r\n", (unsigned long)html_len);
 }
