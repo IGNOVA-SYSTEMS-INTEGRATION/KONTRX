@@ -463,7 +463,7 @@ static const char KONTRX_HTML[] =
 "uest',true));}function toggleBypassValidation(checked){var enableVal=checked?1:0;fetch('/api/rules/bypass?enable='+enabl"
 "eVal,{method:'POST'}).then(r=>r.json()).then(data=>{if(data.ok){showToast('Sensor validation bypass '+(checked?'enabled'"
 ":'disabled')+'!');loadRulesTab();}else{showToast('Failed to change bypass setting',true);$('rules-bypass-validation').ch"
-"ecked=!checked;}}).catch(err=>{showToast('Error sending request',true);$('rules-bypass-validation').checked=!checked;});"
+"ecked=!checked;}}).catch(err=>{showToast('Error sending request',true);$('rules-bypass-validation').checked=!checked;});}"
 "function pwmGroupSet(d){for(var i=0;i<relays.length;i++)if(relays[i].type==3)setPWMDuty(relays[i].channel||1,d);}"
 "function anSet(t,v){for(var i=0;i<relays.length;i++){var c=relays[i].channel||1;if(t=='ma'&&relays[i].type==5)setAnalogMA(c,v);else if(t=='v'&&relays[i].type==6)setAnalogV(c,v);}}"
 "function analogZeroAll(){for(var i=0;i<relays.length;i++){var c=relays[i].channel||1;if(relays[i].type==5)setAnalogMA(c,4);else if(relays[i].type==6)setAnalogV(c,0);}}"
