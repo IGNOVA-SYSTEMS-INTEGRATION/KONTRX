@@ -160,7 +160,7 @@ static const char KONTRX_HTML[] =
 "div><div class='card' style='grid-column:span 1;cursor:pointer' onclick='showQRModal()'><div class='card-title'>Board Id"
 "entity QR</div><div id='qr-container'><canvas id='qr-canvas' width='140' height='140'></canvas></div><div style='text-al"
 "ign:center;font-size:.68rem;color:var(--muted);margin-top:6px'></div></div></div><div class='form"
-"-section'><h3>Actuator Status</h3><div class='relay-grid' id='relay-status-grid'></div></div><div class='form-section' s"
+"-section'><h3>Actuator Status</h3><div id='relay-status-grid' style='width:100%'></div></div><div class='form-section' s"
 "tyle='margin-top:16px'><h3>System Resources</h3><div style='display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-t"
 "op:12px'><div class='card' style='padding:16px'><div class='card-title' style='margin-bottom:10px'>CPU Usage</div><div s"
 "tyle='position:relative;height:10px;background:var(--border);border-radius:8px;overflow:hidden'><div id='cpu-bar' style="
