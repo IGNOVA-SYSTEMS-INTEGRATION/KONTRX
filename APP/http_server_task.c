@@ -398,31 +398,61 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
 
-    /* --- relays (dynamic) --- */
+    /* --- pto live status --- */
+    pos += snprintf(buf + pos, buflen - pos, "\"pto\":[");
+    for (uint8_t p = 0; p < PTO_GetChannelCount() && p < MAX_PTO_CHANNELS; p++) {
+        const PTO_Channel_Status_t *st = PTO_GetStatus(p);
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"position\":%ld,\"moving\":%u}%s",
+            (long)(st ? st->position : 0), (st ? st->moving : 0),
+            (p < PTO_GetChannelCount() - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "],");
+
     /* --- actuators (dynamic) --- */
     pos += snprintf(buf + pos, buflen - pos, "\"relays\":[");
     for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
         char pin_val[32] = {0};
-        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+        uint8_t atype = s_cfg.actuators[i].type;
+        uint8_t ch = s_cfg.actuators[i].pin_or_slave;
+
+        if (atype == ACTUATOR_TYPE_LOCAL_GPIO) {
             snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
         } else {
             snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
         }
-        
+
         pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"state\":%u,\"pin\":\"%s\",\"nc\":%u,\"name\":\"%s\","
-            "\"type\":%u,\"port\":%u,\"slave_id\":%u,\"reg_addr\":%u,\"opc_node_id\":\"%s\"}%s",
-            i,
-            relayStates[i],
-            pin_val,
-            s_cfg.actuators[i].is_active_low,
+            "{\"id\":%u,\"channel\":%u,\"state\":%u,\"pin\":\"%s\",\"nc\":%u,\"name\":\"%s\","
+            "\"type\":%u,\"slave_id\":%u,\"reg_addr\":%u",
+            i, ch + 1, relayStates[i], pin_val, s_cfg.actuators[i].is_active_low,
             s_cfg.actuators[i].name[0] ? s_cfg.actuators[i].name : "Actuator",
-            s_cfg.actuators[i].type,
-            s_cfg.actuators[i].port,
-            s_cfg.actuators[i].pin_or_slave,
-            s_cfg.actuators[i].reg_addr,
-            s_cfg.actuators[i].opc_node_id,
-            (i < s_cfg.actuator_count - 1) ? "," : "");
+            atype, s_cfg.actuators[i].pin_or_slave, s_cfg.actuators[i].reg_addr);
+
+        if (atype == ACTUATOR_TYPE_PWM) {
+            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
+            int d = pw ? (int)pw->duty_pct : 0;
+            pos += snprintf(buf + pos, buflen - pos, ",\"duty\":%d,\"freq\":%u",
+                d, pw ? (unsigned)pw->freq_hz : 1000);
+        } else if (atype == ACTUATOR_TYPE_PTO) {
+            const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
+            pos += snprintf(buf + pos, buflen - pos, ",\"speed\":%u,\"position\":%ld,\"moving\":%u",
+                pt ? (unsigned)pt->speed_pps : 5000, (long)(pt ? pt->position : 0), pt ? pt->moving : 0);
+        } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
+            float ma = DAC_420MA_GetCurrent(ch < MAX_420MA_CHANNELS ? ch : 0);
+            int m_i = (int)ma;
+            int m_f = (int)((ma - (float)m_i) * 100.0f);
+            if (m_f < 0) m_f = 0;
+            pos += snprintf(buf + pos, buflen - pos, ",\"current_ma\":%d.%02d", m_i, m_f);
+        } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
+            float v = Analog_010V_GetVoltage(ch < MAX_010V_CHANNELS ? ch : 0);
+            int v_i = (int)v;
+            int v_f = (int)((v - (float)v_i) * 100.0f);
+            if (v_f < 0) v_f = 0;
+            pos += snprintf(buf + pos, buflen - pos, ",\"voltage_v\":%d.%02d", v_i, v_f);
+        }
+
+        pos += snprintf(buf + pos, buflen - pos, "}%s", (i < s_cfg.actuator_count - 1) ? "," : "");
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
 
