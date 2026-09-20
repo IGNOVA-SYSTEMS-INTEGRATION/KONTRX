@@ -2754,6 +2754,7 @@ void Task_HTTPServer(void *arg) {
                         }
                         osDelay(1);
                     }
+                    osDelay(30); /* 30ms graceful delay for PC browser TCP stack to receive & process final TCP segments before disconnect FIN */
                     disconnect(HTTP_SOCK);
                 } else {
                     /* Socket leak fix: disconnect if no request bytes received */
