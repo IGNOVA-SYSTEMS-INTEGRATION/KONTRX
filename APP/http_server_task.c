@@ -2001,6 +2001,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             else if (type == ACTUATOR_TYPE_PWM) {
                 int ch = JSON_ReadInt(obj_start, "channel");
                 int freq = JSON_ReadInt(obj_start, "freq");
+                if (ch > 0) ch = ch - 1;
                 if (ch < 0) ch = 0;
                 if (freq <= 0) freq = 1000;
                 temp_actuators[actuator_count].pin_or_slave = (uint8_t)ch;
@@ -2010,6 +2011,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             else if (type == ACTUATOR_TYPE_PTO) {
                 int axis = JSON_ReadInt(obj_start, "channel");
                 int speed = JSON_ReadInt(obj_start, "speed");
+                if (axis > 0) axis = axis - 1;
                 if (axis < 0) axis = 0;
                 if (speed <= 0) speed = 1000;
                 temp_actuators[actuator_count].pin_or_slave = (uint8_t)axis;
@@ -2018,6 +2020,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
             else if (type == ACTUATOR_TYPE_ANALOG_MA || type == ACTUATOR_TYPE_ANALOG_V) {
                 int ch = JSON_ReadInt(obj_start, "channel");
+                if (ch > 0) ch = ch - 1;
                 if (ch < 0) ch = 0;
                 temp_actuators[actuator_count].pin_or_slave = (uint8_t)ch;
                 snprintf(temp_actuators[actuator_count].port_or_ip, sizeof(temp_actuators[actuator_count].port_or_ip), "CH%d", ch + 1);
