@@ -847,7 +847,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     } else {
         strncpy(first_line, line, sizeof(first_line) - 1);
     }
-    printf("[HTTP] Dispatch_Request: %s\r\n", first_line);
+    /* printf("[HTTP] Dispatch_Request: %s\r\n", first_line); */
 
     /* OPTIONS check for CORS pre-flight requests */
     if (strncmp(line, "OPTIONS ", 8) == 0) {
@@ -1615,7 +1615,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
 
         int rules_count = cJSON_GetArraySize(rules_arr);
-        printf("[HTTP] POST /api/rules: Parsing %d rules, version '%s'\r\n", rules_count, version_item->valuestring);
+        /* printf("[HTTP] POST /api/rules: Parsing %d rules, version '%s'\r\n", rules_count, version_item->valuestring); */
         if (rules_count > MAX_RULES) {
             cJSON_Delete(root);
             Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule count exceeds MAX_RULES\"}");
@@ -2705,7 +2705,7 @@ void Task_HTTPServer(void *arg) {
         static uint32_t last_heartbeat = 0;
         uint32_t now = osKernelGetTickCount();
         if (now - last_heartbeat >= 2000) {
-            printf("[HTTP] Heartbeat: socket state = 0x%02X\r\n", state);
+            /* printf("[HTTP] Heartbeat: socket state = 0x%02X\r\n", state); */
             last_heartbeat = now;
         }
 
