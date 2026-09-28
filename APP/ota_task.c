@@ -72,11 +72,13 @@ void Task_OTAUpdate(void *arg) {
         g_ota_debug.fw_size = fw_size;
         g_ota_debug.step = 3; // Copied fw_size
 
-        /* Suspend Modbus and MQTT tasks during validation to prevent CPU starvation and W5500 SPI contention */
+        /* Suspend Modbus, MQTT, and Control Engine tasks during validation and Sector 1 write */
+        extern osThreadId_t g_tid_control;
         extern osThreadId_t g_tid_modbus;
         extern osThreadId_t g_tid_mqtt;
-        if (g_tid_modbus) vTaskSuspend((TaskHandle_t)g_tid_modbus);
-        if (g_tid_mqtt)   vTaskSuspend((TaskHandle_t)g_tid_mqtt);
+        if (g_tid_control) vTaskSuspend((TaskHandle_t)g_tid_control);
+        if (g_tid_modbus)  vTaskSuspend((TaskHandle_t)g_tid_modbus);
+        if (g_tid_mqtt)    vTaskSuspend((TaskHandle_t)g_tid_mqtt);
 
         /* Step 1: Compute CRC32 of staged firmware */
         osDelay(10);
@@ -98,8 +100,9 @@ void Task_OTAUpdate(void *arg) {
             g_ota_debug.write_ok = 0;
             osSemaphoreRelease(sem_ota_done);
             /* Resume suspended tasks since we are aborting */
-            if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
-            if (g_tid_mqtt)   vTaskResume((TaskHandle_t)g_tid_mqtt);
+            if (g_tid_control) vTaskResume((TaskHandle_t)g_tid_control);
+            if (g_tid_modbus)  vTaskResume((TaskHandle_t)g_tid_modbus);
+            if (g_tid_mqtt)    vTaskResume((TaskHandle_t)g_tid_mqtt);
             continue;
         }
 
@@ -148,8 +151,9 @@ void Task_OTAUpdate(void *arg) {
             while (1);
         } else {
             /* Resume suspended tasks since validation failed */
-            if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
-            if (g_tid_mqtt)   vTaskResume((TaskHandle_t)g_tid_mqtt);
+            if (g_tid_control) vTaskResume((TaskHandle_t)g_tid_control);
+            if (g_tid_modbus)  vTaskResume((TaskHandle_t)g_tid_modbus);
+            if (g_tid_mqtt)    vTaskResume((TaskHandle_t)g_tid_mqtt);
         }
     }
 }
