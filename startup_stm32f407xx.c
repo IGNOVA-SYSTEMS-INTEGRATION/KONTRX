@@ -6,6 +6,8 @@ extern uint32_t _sdata;
 extern uint32_t _edata;
 extern uint32_t _sbss;
 extern uint32_t _ebss;
+extern uint32_t _sccmram __attribute__((weak));
+extern uint32_t _eccmram __attribute__((weak));
 
 extern int main(void);
 
@@ -209,6 +211,14 @@ void Reset_Handler(void) {
     dest = &_sbss;
     while (dest < &_ebss) {
         *dest++ = 0;
+    }
+
+    // Zero fill .ccmram section if defined
+    if (&_sccmram && &_eccmram) {
+        dest = &_sccmram;
+        while (dest < &_eccmram) {
+            *dest++ = 0;
+        }
     }
 
     // Call main

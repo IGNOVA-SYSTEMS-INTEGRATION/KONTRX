@@ -59,8 +59,10 @@ SECTIONS
   .ccmram (NOLOAD) :
   {
     . = ALIGN(4);
+    _sccmram = .;
     *(.ccmram)
     *(.ccmram*)
     . = ALIGN(4);
+    _eccmram = .;
   } >CCMRAM
 }
