@@ -14,8 +14,8 @@
 #define CONFIG_MAGIC_CURRENT 0xC01D0007U
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
- * Keep this in sync with the actual release. (beta 1.0.1) */
-#define FW_VERSION "2.0.0"
+ * Keep this in sync with the actual release. */
+#define FW_VERSION "2.2.0"
 
 /* Sensor types: 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US */
 typedef struct {
@@ -85,7 +85,8 @@ typedef enum {
     ACTUATOR_TYPE_PWM = 3,          // PWM Output Channel
     ACTUATOR_TYPE_PTO = 4,          // PTO Motion Axis Channel
     ACTUATOR_TYPE_ANALOG_MA = 5,    // 4-20mA Current Output Channel
-    ACTUATOR_TYPE_ANALOG_V = 6      // 0-10V Voltage Output Channel
+    ACTUATOR_TYPE_ANALOG_V = 6,     // 0-10V Voltage Output Channel
+    ACTUATOR_TYPE_DIGITAL_OUT = 7   // General Digital Output (D/O)
 } ActuatorType_t;
 
 typedef struct {
@@ -147,6 +148,9 @@ typedef struct {
     char                 admin_username[32];
     char                 admin_password[32];
     uint8_t              actuator_mask; /* bit0=PTO, bit1=0-10V, bit2=4-20mA, bit3=PWM */
+    uint8_t              test_mode;     /* 0 = Normal/Rules Automation, 1 = Manual Test Mode */
+    uint8_t              mqtt_tx_enabled; /* 0 = Publishing Paused, 1 = Publishing Active */
+    uint8_t              mqtt_skip_offline; /* 1 = Skip offline sensors in MQTT messages */
 
     uint32_t checksum;
 } Gateway_Config_t;

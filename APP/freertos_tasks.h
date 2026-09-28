@@ -40,17 +40,20 @@ void Relay_Init(void);
 /** @brief Global uptime counter, incremented by vApplicationTickHook */
 extern volatile uint32_t g_uptime_seconds;
 
+/** @brief Global flag indicating OTA firmware write is actively running */
+extern volatile uint8_t g_ota_in_progress;
+
 /** @brief CPU usage 0-100%, updated every second by vApplicationIdleHook */
 extern volatile uint8_t g_cpu_usage_pct;
 
 /** @brief Initialise DWT cycle counter for CPU usage measurement. Call before RTOS_Tasks_Init(). */
 void KontrxDWT_Init(void);
 
-#define MQTT_LOG_MAX 10
+#define MQTT_LOG_MAX 8
 
 typedef struct {
     char topic[64];
-    char payload[512];
+    char payload[2048];
     uint8_t success;
     uint32_t timestamp; /* uptime seconds when sent */
 } MqttLogEntry_t;
@@ -84,6 +87,7 @@ void Log_Event(const char *category, const char *message);
 
 extern volatile MqttStatus_t g_mqtt_status;
 
+extern osThreadId_t g_tid_control;
 extern osThreadId_t g_tid_modbus;
 extern osThreadId_t g_tid_mqtt;
 

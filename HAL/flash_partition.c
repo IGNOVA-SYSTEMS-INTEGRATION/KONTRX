@@ -112,35 +112,181 @@ void Partition_Init(void) {
 /* ======================================================================
  *  Gateway Configuration Storage (Dual-Sector Redundancy)
  * ====================================================================== */
+static uint8_t Sanitize_Config(Gateway_Config_t *cfg) {
+    uint8_t changed = 0;
+
+    if (cfg->magic != CONFIG_MAGIC_CURRENT) {
+        cfg->magic = CONFIG_MAGIC_CURRENT;
+        changed = 1;
+    }
+    if (cfg->actuator_count > MAX_RELAYS) {
+        cfg->actuator_count = 0;
+        changed = 1;
+    }
+    if (cfg->sensors.count > MAX_SENSORS) {
+        cfg->sensors.count = 0;
+        changed = 1;
+    }
+    if (cfg->mqtt_mapping_count > MAX_MQTT_MAPPINGS) {
+        cfg->mqtt_mapping_count = 0;
+        changed = 1;
+    }
+    if (cfg->mqtt_port == 0) {
+        cfg->mqtt_port = 1883;
+        changed = 1;
+    }
+    if (cfg->mqtt_interval == 0 || cfg->mqtt_interval > 86400) {
+        cfg->mqtt_interval = 2;
+        changed = 1;
+    }
+    if (cfg->mqtt_send_mode > 1) {
+        cfg->mqtt_send_mode = 0;
+        changed = 1;
+    }
+    if (cfg->mqtt_payload_shape > 2) {
+        cfg->mqtt_payload_shape = 0;
+        changed = 1;
+    }
+    if (cfg->test_mode > 1) {
+        cfg->test_mode = 0;
+        changed = 1;
+    }
+    if (cfg->mqtt_tx_enabled > 1) {
+        cfg->mqtt_tx_enabled = 1;
+        changed = 1;
+    }
+    if (cfg->mqtt_skip_offline > 1) {
+        cfg->mqtt_skip_offline = 0;
+        changed = 1;
+    }
+
+    #define SANITIZE_FIELD(field) do { \
+        field[sizeof(field) - 1] = '\0'; \
+        for (size_t _idx = 0; _idx < sizeof(field) && field[_idx] != '\0'; _idx++) { \
+            uint8_t _ch = (uint8_t)field[_idx]; \
+            if (_ch < 0x20 || _ch > 0x7E || _ch == '"' || _ch == '\\') { \
+                field[_idx] = '\0'; \
+                changed = 1; \
+                break; \
+            } \
+        } \
+    } while (0)
+
+    SANITIZE_FIELD(cfg->mqtt_broker);
+    SANITIZE_FIELD(cfg->mqtt_client_id);
+    SANITIZE_FIELD(cfg->mqtt_username);
+    SANITIZE_FIELD(cfg->mqtt_password);
+    SANITIZE_FIELD(cfg->device_id);
+    SANITIZE_FIELD(cfg->sparkplug_topic);
+    SANITIZE_FIELD(cfg->pending_sparkplug_topic);
+    SANITIZE_FIELD(cfg->provision_status);
+    SANITIZE_FIELD(cfg->provision_message);
+    SANITIZE_FIELD(cfg->admin_username);
+    SANITIZE_FIELD(cfg->admin_password);
+
+    for (int i = 0; i < MAX_RELAYS; i++) {
+        SANITIZE_FIELD(cfg->actuators[i].name);
+        SANITIZE_FIELD(cfg->actuators[i].port_or_ip);
+        SANITIZE_FIELD(cfg->actuators[i].opc_node_id);
+        if (cfg->actuators[i].type > 7) {
+            cfg->actuators[i].type = 0;
+            changed = 1;
+        }
+    }
+
+    for (int i = 0; i < MAX_MQTT_MAPPINGS; i++) {
+        SANITIZE_FIELD(cfg->mqtt_mappings[i].json_key);
+    }
+    #undef SANITIZE_FIELD
+
+    /* Validate sparkplug_topic looks like a real topic */
+    if (cfg->sparkplug_topic[0] != '\0') {
+        int valid_topic = 1;
+        for (int i = 0; cfg->sparkplug_topic[i] != '\0'; i++) {
+            char c = cfg->sparkplug_topic[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '/' || c == '_' || c == '-' || c == '+' || c == '#' || c == '.' || c == ':')) {
+                valid_topic = 0;
+                break;
+            }
+        }
+        if (!valid_topic) {
+            strncpy(cfg->sparkplug_topic, "spBv1.0/farm/kontrx-0000001/KontrxDevice-01/DDATA", sizeof(cfg->sparkplug_topic) - 1);
+            cfg->sparkplug_topic[sizeof(cfg->sparkplug_topic) - 1] = '\0';
+            changed = 1;
+        }
+    }
+
+    if (cfg->admin_username[0] == '\0') {
+        strncpy(cfg->admin_username, "admin", sizeof(cfg->admin_username) - 1);
+        changed = 1;
+    }
+    if (cfg->admin_password[0] == '\0') {
+        strncpy(cfg->admin_password, "adminkontrx", sizeof(cfg->admin_password) - 1);
+        changed = 1;
+    }
+    if (cfg->provision_status[0] == '\0') {
+        strncpy(cfg->provision_status, "Active", sizeof(cfg->provision_status) - 1);
+        changed = 1;
+    }
+
+    return changed;
+}
+
 uint8_t Partition_LoadConfig(Gateway_Config_t *cfg) {
     static Gateway_Config_t temp;
-    
+    uint8_t loaded = 0;
+
     // Try Primary Config (Sector 128)
     W25Q_Read(CONFIG_PRIMARY_ADDR, (uint8_t *)&temp, sizeof(Gateway_Config_t));
     uint32_t cal_crc = Compute_CRC32((const uint8_t *)&temp, offsetof(Gateway_Config_t, checksum));
     
     if (temp.magic == CONFIG_MAGIC_CURRENT && temp.checksum == cal_crc) {
         memcpy(cfg, &temp, sizeof(Gateway_Config_t));
-        return 1; // Primary config loaded successfully
+        loaded = 1;
+    } else {
+        printf("[Partition] Primary config CRC/Magic mismatch! Trying backup...\r\n");
+        // Try Backup Config (Sector 129)
+        W25Q_Read(CONFIG_BACKUP_ADDR, (uint8_t *)&temp, sizeof(Gateway_Config_t));
+        cal_crc = Compute_CRC32((const uint8_t *)&temp, offsetof(Gateway_Config_t, checksum));
+        
+        if (temp.magic == CONFIG_MAGIC_CURRENT && temp.checksum == cal_crc) {
+            memcpy(cfg, &temp, sizeof(Gateway_Config_t));
+            printf("[Partition] Restored primary config from backup sector.\r\n");
+            loaded = 1;
+        } else {
+            printf("[Partition] Backup also failed!\r\n");
+            // Check magic-only migration from primary
+            W25Q_Read(CONFIG_PRIMARY_ADDR, (uint8_t *)&temp, sizeof(Gateway_Config_t));
+            if (temp.magic == CONFIG_MAGIC_CURRENT) {
+                printf("[Partition] CRC-skip migration from primary...\r\n");
+                memcpy(cfg, &temp, sizeof(Gateway_Config_t));
+                loaded = 1;
+            } else {
+                // Check magic-only migration from backup
+                W25Q_Read(CONFIG_BACKUP_ADDR, (uint8_t *)&temp, sizeof(Gateway_Config_t));
+                if (temp.magic == CONFIG_MAGIC_CURRENT) {
+                    printf("[Partition] CRC-skip migration from backup...\r\n");
+                    memcpy(cfg, &temp, sizeof(Gateway_Config_t));
+                    loaded = 1;
+                }
+            }
+        }
     }
-    
-    printf("[Partition] Primary config CRC/Magic mismatch! Trying backup...\r\n");
 
-    // Try Backup Config (Sector 129)
-    W25Q_Read(CONFIG_BACKUP_ADDR, (uint8_t *)&temp, sizeof(Gateway_Config_t));
-    cal_crc = Compute_CRC32((const uint8_t *)&temp, offsetof(Gateway_Config_t, checksum));
-    
-    if (temp.magic == CONFIG_MAGIC_CURRENT && temp.checksum == cal_crc) {
-        // Restore Primary from Backup
-        W25Q_EraseSector(CONFIG_PRIMARY_ADDR);
-        W25Q_Write(CONFIG_PRIMARY_ADDR, (const uint8_t *)&temp, sizeof(Gateway_Config_t));
-        memcpy(cfg, &temp, sizeof(Gateway_Config_t));
-        printf("[Partition] Restored primary config from backup sector.\r\n");
+    if (loaded) {
+        uint8_t dirty = Sanitize_Config(cfg);
+        uint32_t cur_crc = Compute_CRC32((const uint8_t *)cfg, offsetof(Gateway_Config_t, checksum));
+        if (dirty || cfg->checksum != cur_crc) {
+            cfg->magic = CONFIG_MAGIC_CURRENT;
+            cfg->checksum = cur_crc;
+            Partition_SaveConfig(cfg);
+            printf("[Partition] Config sanitized and re-saved to flash partitions.\r\n");
+        }
         return 1;
     }
-    
-    printf("[Partition] Backup config also corrupted or missing!\r\n");
-    return 0; // Config failed to load
+
+    return 0; // Config failed to load (blank or invalid magic)
 }
 
 uint8_t Partition_SaveConfig(const Gateway_Config_t *cfg) {
@@ -292,6 +438,12 @@ uint32_t Partition_Queue_Count(void) {
     } else {
         return (32768 - q_read_ptr) + q_write_ptr;
     }
+}
+
+void Partition_Queue_Reset(void) {
+    q_read_ptr = q_write_ptr;
+    printf("[Partition] Queue reset: read_ptr=%lu, write_ptr=%lu\r\n",
+           (unsigned long)q_read_ptr, (unsigned long)q_write_ptr);
 }
 
 /* ======================================================================
@@ -488,3 +640,240 @@ void Partition_Log_Clear(void) {
     s_log_entry_count = 0;
     s_log_total_bytes = 0;
 }
+
+uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total)) {
+    if (!send_fn) return 0;
+
+    static char buf[2048];
+    int pos = 0;
+    uint32_t total_sent = 0;
+
+    uint16_t yr = 2026;
+    uint8_t mo = 9, dy = 14, hr = 0, mn = 0, sc = 0;
+    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "# ==============================================================================\r\n"
+        "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
+        "# System Event Audit Log Export\r\n"
+        "# Date: %04u-%02u-%02u %02u:%02u:%02u\r\n"
+        "# ==============================================================================\r\n",
+        yr, mo, dy, hr, mn, sc);
+
+    static const char * const cats[] = {"SYS", "MQTT", "MODBUS", "RELAY", "OTA", "SD", "AUTH"};
+
+    for (uint32_t sec = 0; sec < 252; sec++) {
+        uint32_t sec_addr = PARTITION_LOG_ADDR + sec * 4096;
+        uint32_t marker = 0xFFFFFFFF;
+        W25Q_Read(sec_addr, (uint8_t *)&marker, 4);
+        if (marker == 0xFFFFFFFF) break;
+
+        uint32_t off = 0;
+        while (off + sizeof(PartitionLogHeader_t) <= 4096) {
+            PartitionLogHeader_t hdr;
+            uint32_t entry_addr = sec_addr + off;
+            W25Q_Read(entry_addr, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
+            if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) break;
+
+            char msg_temp[64];
+            uint32_t len = hdr.msg_len;
+            if (len >= sizeof(msg_temp)) len = sizeof(msg_temp) - 1;
+            W25Q_Read(entry_addr + sizeof(PartitionLogHeader_t), (uint8_t *)msg_temp, len);
+            msg_temp[len] = '\0';
+
+            for (uint32_t k = 0; k < len; k++) {
+                if ((unsigned char)msg_temp[k] < 32 || (unsigned char)msg_temp[k] > 126) {
+                    msg_temp[k] = ' ';
+                }
+            }
+
+            uint32_t s = hdr.timestamp;
+            uint32_t hrs = (s / 3600) % 24;
+            uint32_t mins = (s % 3600) / 60;
+            uint32_t secs = s % 60;
+            const char *cat_str = (hdr.category_id <= 6) ? cats[hdr.category_id] : "SYS";
+
+            char line_buf[128];
+            int line_len = snprintf(line_buf, sizeof(line_buf),
+                "%04u-%02u-%02u %02lu:%02lu:%02lu [%s] %s\r\n",
+                (unsigned int)yr, (unsigned int)mo, (unsigned int)dy,
+                (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
+                cat_str, msg_temp);
+
+            if (line_len > 0) {
+                if (pos + line_len >= (int)sizeof(buf)) {
+                    if (!send_fn(sn, (const uint8_t *)buf, (uint32_t)pos)) {
+                        return total_sent;
+                    }
+                    pos = 0;
+                }
+                memcpy(buf + pos, line_buf, line_len);
+                pos += line_len;
+                total_sent++;
+            }
+
+            off += sizeof(PartitionLogHeader_t) + hdr.msg_len;
+        }
+    }
+
+    if (pos > 0) {
+        send_fn(sn, (const uint8_t *)buf, (uint32_t)pos);
+    }
+
+    return total_sent;
+}
+
+uint32_t Partition_Log_StreamSize(void) {
+    static const uint8_t cat_lens[] = {3, 4, 6, 5, 3, 2, 4};
+
+    uint16_t yr = 2026;
+    uint8_t mo = 9, dy = 14, hr = 0, mn = 0, sc = 0;
+    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+
+    uint32_t total = 0;
+
+    /* Header block size — same format as Partition_Log_Stream */
+    total += (uint32_t)snprintf(NULL, 0,
+        "# ==============================================================================\r\n"
+        "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
+        "# System Event Audit Log Export\r\n"
+        "# Date: %04u-%02u-%02u %02u:%02u:%02u\r\n"
+        "# ==============================================================================\r\n",
+        yr, mo, dy, hr, mn, sc);
+
+    /* Each log entry formatted line */
+    for (uint32_t sec = 0; sec < 252; sec++) {
+        uint32_t sec_addr = PARTITION_LOG_ADDR + sec * 4096;
+        uint32_t marker = 0xFFFFFFFF;
+        W25Q_Read(sec_addr, (uint8_t *)&marker, 4);
+        if (marker == 0xFFFFFFFF) break;
+
+        uint32_t off = 0;
+        while (off + sizeof(PartitionLogHeader_t) <= 4096) {
+            PartitionLogHeader_t hdr;
+            W25Q_Read(sec_addr + off, (uint8_t *)&hdr, sizeof(PartitionLogHeader_t));
+            if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) break;
+
+            uint8_t clen = (hdr.category_id <= 6) ? cat_lens[hdr.category_id] : 3;
+            /* "YYYY-MM-DD HH:MM:SS [CAT] msg\r\n" = 19 + 2 + clen + 2 + msg_len + 2 */
+            total += 25 + clen + hdr.msg_len;
+
+            off += sizeof(PartitionLogHeader_t) + hdr.msg_len;
+        }
+    }
+
+    return total;
+}
+
+uint32_t Partition_Queue_StreamSize(void) {
+    uint32_t count = Partition_Queue_Count();
+
+    uint16_t yr = 2026;
+    uint8_t mo = 9, dy = 14, hr = 0, mn = 0, sc = 0;
+    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+
+    /* Header block */
+    uint32_t total = (uint32_t)snprintf(NULL, 0,
+        "# ==============================================================================\r\n"
+        "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
+        "# Offline Telemetry Queue Export\r\n"
+        "# Status: %s | Total Buffered Records: %lu\r\n"
+        "# ==============================================================================\r\n"
+        "# Index\tTimestamp(Epoch)\tType\tID\tStatus\tValue\tTemp\r\n",
+        (count > 0) ? "BUFFERING" : "SYNCHRONIZED (Empty)",
+        (unsigned long)count);
+
+    if (count == 0) {
+        total += (uint32_t)snprintf(NULL, 0,
+            "# Offline telemetry queue is currently empty. All data published to broker.\r\n");
+        return total;
+    }
+
+    /* Each record line — iterate to compute exact formatted lengths */
+    uint32_t cur_ptr = q_read_ptr;
+    uint32_t idx = 0;
+    while (cur_ptr != q_write_ptr) {
+        uint32_t addr = PARTITION_QUEUE_ADDR + cur_ptr * 16;
+        OfflineRecord_t rec;
+        W25Q_Read(addr, (uint8_t *)&rec, sizeof(OfflineRecord_t));
+
+        total += (uint32_t)snprintf(NULL, 0,
+            "%lu\t%lu\t%s\t%u\t0x%02X\t%.2f\t%.2f\r\n",
+            (unsigned long)idx,
+            (unsigned long)rec.timestamp,
+            (rec.source_type == 1) ? "SENSOR" : "ACTUATOR",
+            rec.source_id,
+            rec.valid,
+            rec.value,
+            rec.temp);
+
+        idx++;
+        cur_ptr = (cur_ptr + 1) % 32768;
+    }
+
+    return total;
+}
+
+uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total)) {
+    if (!send_fn) return 0;
+
+    static char buf[2048];
+    int pos = 0;
+    uint32_t count = Partition_Queue_Count();
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "# ==============================================================================\r\n"
+        "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
+        "# Offline Telemetry Queue Export\r\n"
+        "# Status: %s | Total Buffered Records: %lu\r\n"
+        "# ==============================================================================\r\n"
+        "# Index\tTimestamp(Epoch)\tType\tID\tStatus\tValue\tTemp\r\n",
+        (count > 0) ? "BUFFERING" : "SYNCHRONIZED (Empty)",
+        (unsigned long)count);
+
+    if (count == 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "# Offline telemetry queue is currently empty. All data published to broker.\r\n");
+        send_fn(sn, (const uint8_t *)buf, (uint32_t)pos);
+        return 0;
+    }
+
+    uint32_t cur_ptr = q_read_ptr;
+    uint32_t idx = 0;
+    while (cur_ptr != q_write_ptr) {
+        uint32_t addr = PARTITION_QUEUE_ADDR + cur_ptr * 16;
+        OfflineRecord_t rec;
+        W25Q_Read(addr, (uint8_t *)&rec, sizeof(OfflineRecord_t));
+
+        char line_buf[128];
+        int line_len = snprintf(line_buf, sizeof(line_buf),
+            "%lu\t%lu\t%s\t%u\t0x%02X\t%.2f\t%.2f\r\n",
+            (unsigned long)idx,
+            (unsigned long)rec.timestamp,
+            (rec.source_type == 1) ? "SENSOR" : "ACTUATOR",
+            rec.source_id,
+            rec.valid,
+            rec.value,
+            rec.temp);
+
+        if (line_len > 0) {
+            if (pos + line_len >= (int)sizeof(buf)) {
+                if (!send_fn(sn, (const uint8_t *)buf, (uint32_t)pos)) {
+                    return idx;
+                }
+                pos = 0;
+            }
+            memcpy(buf + pos, line_buf, line_len);
+            pos += line_len;
+            idx++;
+        }
+
+        cur_ptr = (cur_ptr + 1) % 32768;
+    }
+
+    if (pos > 0) {
+        send_fn(sn, (const uint8_t *)buf, (uint32_t)pos);
+    }
+    return idx;
+}
+

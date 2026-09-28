@@ -62,6 +62,10 @@ static const char *s_default_descs[TOTAL_SYSTEM_INTERFACES] = {
 
 void Interface_SetEnabled(uint8_t idx, uint8_t enabled) {
     if (idx < TOTAL_SYSTEM_INTERFACES) {
+        /* Industrial Ethernet (W5500) and ASIC slots cannot be disabled */
+        if (idx == 0 || s_interfaces[idx].status == IF_STATUS_WAITING_ASIC) {
+            return;
+        }
         s_interfaces[idx].enabled = enabled ? 1 : 0;
         if (!enabled) {
             s_interfaces[idx].status = IF_STATUS_DISABLED;
@@ -83,10 +87,12 @@ uint32_t Interface_BuildArrayJSON(char *buffer, uint32_t max_len) {
         else if (s_interfaces[i].status == IF_STATUS_WAITING_ASIC) st_str = "waiting_asic";
         else if (s_interfaces[i].status == IF_STATUS_DISABLED) st_str = "disabled";
 
+        uint8_t can_disable = (i != 0 && s_interfaces[i].status != IF_STATUS_WAITING_ASIC) ? 1 : 0;
+
         len += snprintf(buffer + len, max_len - len,
             "%s{\"id\":%d,\"name\":\"%s\",\"type\":\"%s\",\"hardware\":\"%s\","
             "\"status\":\"%s\",\"desc\":\"%s\",\"channels_total\":%d,"
-            "\"channels_used\":%d,\"enabled\":%s}",
+            "\"channels_used\":%d,\"enabled\":%s,\"can_disable\":%s}",
             (i > 0) ? "," : "",
             i,
             s_interfaces[i].name,
@@ -96,7 +102,8 @@ uint32_t Interface_BuildArrayJSON(char *buffer, uint32_t max_len) {
             s_interfaces[i].status_desc,
             s_interfaces[i].channels_available,
             s_interfaces[i].channels_used,
-            s_interfaces[i].enabled ? "true" : "false");
+            s_interfaces[i].enabled ? "true" : "false",
+            can_disable ? "true" : "false");
 
         if (len >= max_len - 32) break;
     }

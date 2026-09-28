@@ -78,6 +78,7 @@ void Modbus_DMA_Init(void) {
         cfg.serial = 1; /* default serial for a fresh device */
         cfg.mqtt_port = 1883;
         cfg.mqtt_send_mode = 0;
+        cfg.mqtt_tx_enabled = 1;
         strncpy(cfg.admin_username, "admin", sizeof(cfg.admin_username));
         strncpy(cfg.admin_password, "adminkontrx", sizeof(cfg.admin_password));
         cfg.actuator_mask = 0x0F;
@@ -567,6 +568,8 @@ void Get_Shared_Config(Gateway_Config_t *dest) {
     if (osMutexAcquire(configMutex, 100) == osOK) {
         memcpy(dest, &sharedConfig, sizeof(Gateway_Config_t));
         osMutexRelease(configMutex);
+    } else {
+        memcpy(dest, &sharedConfig, sizeof(Gateway_Config_t));
     }
 }
 
