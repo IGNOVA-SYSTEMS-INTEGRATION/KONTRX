@@ -6,8 +6,15 @@
 #include "task.h"
 #include <stdio.h>
 
-#define W25Q_CS_LOW()   (GPIOB->BSRR = (1U << (0 + 16))) // PB0 CS = 0
-#define W25Q_CS_HIGH()  (GPIOB->BSRR = (1U << 0))        // PB0 CS = 1
+static inline void W25Q_CS_LOW(void) {
+    GPIOB->BSRR = (1U << (0 + 16)); // PB0 CS = 0
+    for (volatile int _d = 0; _d < 20; _d++) __asm__("nop");
+}
+
+static inline void W25Q_CS_HIGH(void) {
+    GPIOB->BSRR = (1U << 0);        // PB0 CS = 1
+    for (volatile int _d = 0; _d < 40; _d++) __asm__("nop");
+}
 
 static SemaphoreHandle_t flashMutex = NULL;
 

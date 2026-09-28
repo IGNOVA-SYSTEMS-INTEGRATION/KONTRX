@@ -13,6 +13,9 @@ void SPI1_Init(void) {
     GPIOB->OSPEEDR &= ~((3U << (3 * 2)) | (3U << (4 * 2)) | (3U << (5 * 2)));
     GPIOB->OSPEEDR |=  ((2U << (3 * 2)) | (2U << (4 * 2)) | (2U << (5 * 2)));
 
+    GPIOB->PUPDR   &= ~((3U << (4 * 2)));
+    GPIOB->PUPDR   |=  ((1U << (4 * 2))); // Pull-up on MISO (PB4)
+
     GPIOB->AFR[0] &= ~((0xFU << (3 * 4)) | (0xFU << (4 * 4)) | (0xFU << (5 * 4)));
     GPIOB->AFR[0] |=  ((5U << (3 * 4)) | (5U << (4 * 4)) | (5U << (5 * 4)));
 
