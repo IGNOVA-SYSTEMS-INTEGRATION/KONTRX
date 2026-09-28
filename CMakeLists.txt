@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.10)
 
 project(Kontrx C CXX ASM)
 
+get_filename_component(TOOLCHAIN_BIN_DIR ${CMAKE_C_COMPILER} DIRECTORY)
+set(OBJCOPY "${TOOLCHAIN_BIN_DIR}/arm-none-eabi-objcopy")
+set(SIZE_TOOL "${TOOLCHAIN_BIN_DIR}/arm-none-eabi-size")
+
 set(TARGET_MCU "STM32F4" CACHE STRING "Target Microcontroller")
 
 # CPU Specific Flags
@@ -86,7 +90,6 @@ set(RTOS_APP_SOURCES
     ioLibrary_Driver/Internet/MQTT/mqtt_interface.c
     ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTConnectClient.c
     ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTDeserializePublish.c
-    ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTFormat.c
     ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTPacket.c
     ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSerializePublish.c
     ioLibrary_Driver/Internet/MQTT/MQTTPacket/src/MQTTSubscribeClient.c
@@ -101,8 +104,8 @@ add_executable(Bootloader APP/bootloader.c ${MCAL_SOURCES})
 set_target_properties(Bootloader PROPERTIES LINK_FLAGS "-T${BOOTLOADER_LINKER} ${CPU_FLAGS} -Wl,-Map=Bootloader.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs")
 
 add_custom_command(TARGET Bootloader POST_BUILD
-    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:Bootloader> Bootloader.bin
-    COMMAND arm-none-eabi-size $<TARGET_FILE:Bootloader>
+    COMMAND "${OBJCOPY}" -O binary $<TARGET_FILE:Bootloader> Bootloader.bin
+    COMMAND "${SIZE_TOOL}" $<TARGET_FILE:Bootloader>
     COMMENT "Generating Bootloader.bin"
 )
 
@@ -115,8 +118,8 @@ add_executable(Kontrx APP/main_w5500_test.c ${MCAL_SOURCES} ${ETHERNET_SOURCES})
 set_target_properties(Kontrx PROPERTIES LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=Kontrx.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float")
 
 add_custom_command(TARGET Kontrx POST_BUILD
-    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:Kontrx> Kontrx.bin
-    COMMAND arm-none-eabi-size $<TARGET_FILE:Kontrx>
+    COMMAND "${OBJCOPY}" -O binary $<TARGET_FILE:Kontrx> Kontrx.bin
+    COMMAND "${SIZE_TOOL}" $<TARGET_FILE:Kontrx>
     COMMENT "Generating Kontrx.bin (Application for OTA)"
 )
 
@@ -130,8 +133,8 @@ add_executable(RS485_Diag APP/main_rs485_diag_test.c ${MCAL_SOURCES})
 set_target_properties(RS485_Diag PROPERTIES LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=RS485_Diag.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs")
 
 add_custom_command(TARGET RS485_Diag POST_BUILD
-    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:RS485_Diag> RS485_Diag.bin
-    COMMAND arm-none-eabi-size $<TARGET_FILE:RS485_Diag>
+    COMMAND "${OBJCOPY}" -O binary $<TARGET_FILE:RS485_Diag> RS485_Diag.bin
+    COMMAND "${SIZE_TOOL}" $<TARGET_FILE:RS485_Diag>
     COMMENT "Generating RS485_Diag.bin (standalone RS485 raw-byte diagnostic)"
 )
 
@@ -156,8 +159,8 @@ target_compile_options(KontrxRTOS PRIVATE -flto)
 target_link_options(KontrxRTOS PRIVATE -flto)
 
 add_custom_command(TARGET KontrxRTOS POST_BUILD
-    COMMAND arm-none-eabi-objcopy -O binary $<TARGET_FILE:KontrxRTOS> KontrxRTOS.bin
-    COMMAND arm-none-eabi-objcopy -O ihex $<TARGET_FILE:KontrxRTOS> KontrxRTOS.hex
-    COMMAND arm-none-eabi-size $<TARGET_FILE:KontrxRTOS>
+    COMMAND "${OBJCOPY}" -O binary $<TARGET_FILE:KontrxRTOS> KontrxRTOS.bin
+    COMMAND "${OBJCOPY}" -O ihex $<TARGET_FILE:KontrxRTOS> KontrxRTOS.hex
+    COMMAND "${SIZE_TOOL}" $<TARGET_FILE:KontrxRTOS>
     COMMENT "Generating KontrxRTOS.bin and KontrxRTOS.hex (RTOS Application)"
 )
