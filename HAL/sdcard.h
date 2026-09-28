@@ -40,5 +40,7 @@ void SDCard_Log_Clear(void);
 int SDCard_List_Dir(const char *path, char *out_json, int max_len);
 int SDCard_Read_File(const char *path, char *out_json, int max_len);
 int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, char *out_json, int max_len);
+uint32_t SDCard_Stream_Download(uint8_t sn, const char *path, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total));
+uint32_t SDCard_Stream_DownloadSize(const char *path);
 
 #endif // SDCARD_H

@@ -43,6 +43,7 @@
 #include "dac_420ma.h"
 #include "analog_010v.h"
 #include "interface_discovery.h"
+#include "sdcard.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,9 +64,10 @@ osSemaphoreId_t   sem_ota_done  = NULL;
 /* ======================================================================
  *  Private constants
  * ====================================================================== */
-#define HTTP_SOCK        0
 #define HTTP_PORT        80U
-#define RX_BUF_SIZE      1536U   /* Must fit a full HTTP request header */
+#define HTTP_NUM_SOCKS   3U
+static const uint8_t s_http_socks[HTTP_NUM_SOCKS] = {0, 3, 6};
+#define RX_BUF_SIZE      4096U   /* Sized to fit large HTTP POST payloads (e.g. 16 actuators config JSON ~3.3KB) */
 
 #define OTA_OTP_SECRET   "KontrxOTA2026"
 #define STAGING_ADDR     0x08040000U
@@ -86,7 +88,7 @@ void Relay_SetState(uint8_t idx, uint8_t state);
  *  Buffer — kept static to avoid stack pressure
  * ====================================================================== */
 static uint8_t rx_buf[RX_BUF_SIZE];
-static char    tx_buf[10240] __attribute__((section(".ccmram")));  /* Sized for complete /api/status JSON in CCMRAM */
+static char    tx_buf[32768] __attribute__((section(".ccmram")));  /* Sized for complete /api/status JSON in CCMRAM (64KB total) */
 
 
 
@@ -100,6 +102,34 @@ static Gateway_Config_t s_http_cfg_temp;  /* Shared config scratch for all HTTP 
 static Modbus_SensorData_t s_sd;
 static Gateway_Config_t    s_cfg;
 static wiz_NetInfo         s_ni;
+
+static void UrlDecode(char *str) {
+    if (!str) return;
+    char *src = str;
+    char *dst = str;
+    while (*src) {
+        if (*src == '%' && src[1] && src[2]) {
+            int h1 = src[1], h2 = src[2];
+            int v1 = (h1 >= '0' && h1 <= '9') ? (h1 - '0') :
+                     (h1 >= 'a' && h1 <= 'f') ? (h1 - 'a' + 10) :
+                     (h1 >= 'A' && h1 <= 'F') ? (h1 - 'A' + 10) : -1;
+            int v2 = (h2 >= '0' && h2 <= '9') ? (h2 - '0') :
+                     (h2 >= 'a' && h2 <= 'f') ? (h2 - 'a' + 10) :
+                     (h2 >= 'A' && h2 <= 'F') ? (h2 - 'A' + 10) : -1;
+            if (v1 >= 0 && v2 >= 0) {
+                *dst++ = (char)((v1 << 4) | v2);
+                src += 3;
+                continue;
+            }
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+            continue;
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
 
 static void ParseQueryStringParam(const char *line, const char *param_name, char *out_buf, size_t out_buf_size) {
     if (!line || !param_name || !out_buf || out_buf_size == 0) return;
@@ -119,18 +149,30 @@ static void ParseQueryStringParam(const char *line, const char *param_name, char
             strncpy(out_buf, p, out_buf_size - 1);
             out_buf[out_buf_size - 1] = '\0';
         }
+        UrlDecode(out_buf);
     }
 }
 
 /* ======================================================================
  *  Web Authentication & Session State
  * ====================================================================== */
-static char s_session_token[33] = {0};
+static char s_session_token[42] = {0};
+static uint8_t  s_login_fail_count = 0;
+static uint32_t s_login_lockout_until = 0;
+#define LOGIN_MAX_ATTEMPTS   5
+#define LOGIN_LOCKOUT_SEC   30
 
 static void Generate_Session_Token(char *out, size_t maxlen) {
+    volatile uint32_t *dwt_cyccnt = (volatile uint32_t *)0xE0001004U;
     uint32_t t = xTaskGetTickCount();
-    uint32_t r = (t * 1103515245U + 12345U) ^ (uint32_t)g_uptime_seconds;
-    snprintf(out, maxlen, "kx%08lx%08lx", (unsigned long)t, (unsigned long)r);
+    uint32_t cyc = *dwt_cyccnt;
+    uint32_t r1 = (t * 1103515245U + 12345U) ^ cyc;
+    uint32_t r2 = (cyc * 214013U + 2531011U) ^ (uint32_t)g_uptime_seconds;
+    uint32_t r3 = r1 ^ (r2 << 13) ^ (t >> 7);
+    uint32_t r4 = (r2 * 16807U) ^ (r1 >> 3) ^ cyc;
+    snprintf(out, maxlen, "kx%08lx%08lx%08lx%08lx",
+             (unsigned long)r1, (unsigned long)r2,
+             (unsigned long)r3, (unsigned long)r4);
 }
 
 static uint8_t Is_Session_Valid(const char *req) {
@@ -158,9 +200,12 @@ static uint8_t Is_Page_Route(const char *line) {
         strncmp(line, "GET /index", 10) == 0 ||
         strncmp(line, "GET /dashboard", 14) == 0 ||
         strncmp(line, "GET /configs", 12) == 0 ||
+        strncmp(line, "GET /config", 11) == 0 ||
+        strncmp(line, "GET /sensors", 12) == 0 ||
+        strncmp(line, "GET /actuators", 14) == 0 ||
         strncmp(line, "GET /rules", 10) == 0 ||
         (strncmp(line, "GET /interfaces", 15) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
-        strncmp(line, "GET /mqtt", 9) == 0 ||
+        (strncmp(line, "GET /mqtt", 9) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
         (strncmp(line, "GET /logs", 9) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
         (strncmp(line, "GET /sdcard", 11) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
         (strncmp(line, "GET /ota", 8) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
@@ -189,7 +234,7 @@ const char *SensorTypeName(uint8_t type) {
 
 #include "sdcard.h"
 
-static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total);
+static uint8_t Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total);
 
 static void Send_JSON_Logs(uint8_t sn, const char *line) {
     static char json_buf[7168];
@@ -245,9 +290,9 @@ static int JSON_HardwareResponse(char *buf, int buflen) {
     for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
         char pin_val[32] = {0};
         const char *act_type_name = "unknown";
-        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+        if (s_cfg.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO || s_cfg.actuators[i].type == ACTUATOR_TYPE_DIGITAL_OUT) {
             snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
-            act_type_name = "GPIO";
+            act_type_name = (s_cfg.actuators[i].type == ACTUATOR_TYPE_DIGITAL_OUT) ? "DO" : "GPIO";
         } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_MODBUS_TCP) {
             snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
             act_type_name = "Modbus TCP";
@@ -255,16 +300,20 @@ static int JSON_HardwareResponse(char *buf, int buflen) {
             snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
             act_type_name = "OPC UA";
         } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_PWM) {
-            snprintf(pin_val, sizeof(pin_val), "CH %u", s_cfg.actuators[i].pin_or_slave + 1);
+            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(s_cfg.actuators[i].pin_or_slave < MAX_PWM_CHANNELS ? s_cfg.actuators[i].pin_or_slave : 0);
+            snprintf(pin_val, sizeof(pin_val), "%s", pw ? pw->pin_name : (s_cfg.actuators[i].pin_or_slave == 0 ? "PD12" : "PD13"));
             act_type_name = "PWM";
         } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_PTO) {
-            snprintf(pin_val, sizeof(pin_val), "Axis %u", s_cfg.actuators[i].pin_or_slave + 1);
+            const PTO_Channel_Status_t *pt = PTO_GetStatus(s_cfg.actuators[i].pin_or_slave < MAX_PTO_CHANNELS ? s_cfg.actuators[i].pin_or_slave : 0);
+            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (s_cfg.actuators[i].pin_or_slave == 0 ? "PE9" : s_cfg.actuators[i].pin_or_slave == 1 ? "PE5" : s_cfg.actuators[i].pin_or_slave == 2 ? "PC8" : "PA3");
+            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (s_cfg.actuators[i].pin_or_slave == 0 ? "PE8" : s_cfg.actuators[i].pin_or_slave == 1 ? "PE3" : s_cfg.actuators[i].pin_or_slave == 2 ? "PC9" : "PA5");
+            snprintf(pin_val, sizeof(pin_val), "PUL:%s,DIR:%s", pul, dir);
             act_type_name = "PTO Motion";
         } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_ANALOG_MA) {
-            snprintf(pin_val, sizeof(pin_val), "CH %u", s_cfg.actuators[i].pin_or_slave + 1);
+            snprintf(pin_val, sizeof(pin_val), "%s", (s_cfg.actuators[i].pin_or_slave == 0 ? "PA4" : s_cfg.actuators[i].pin_or_slave == 1 ? "PA5" : "PA4"));
             act_type_name = "4-20mA";
         } else if (s_cfg.actuators[i].type == ACTUATOR_TYPE_ANALOG_V) {
-            snprintf(pin_val, sizeof(pin_val), "CH %u", s_cfg.actuators[i].pin_or_slave + 1);
+            snprintf(pin_val, sizeof(pin_val), "%s", (s_cfg.actuators[i].pin_or_slave == 0 ? "PD14" : s_cfg.actuators[i].pin_or_slave == 1 ? "PD15" : "PD14"));
             act_type_name = "0-10V";
         }
 
@@ -416,8 +465,20 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         uint8_t atype = s_cfg.actuators[i].type;
         uint8_t ch = s_cfg.actuators[i].pin_or_slave;
 
-        if (atype == ACTUATOR_TYPE_LOCAL_GPIO) {
+        if (atype == ACTUATOR_TYPE_LOCAL_GPIO || atype == ACTUATOR_TYPE_DIGITAL_OUT) {
             snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
+        } else if (atype == ACTUATOR_TYPE_PWM) {
+            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
+            snprintf(pin_val, sizeof(pin_val), "%s", pw ? pw->pin_name : (ch == 0 ? "PD12" : "PD13"));
+        } else if (atype == ACTUATOR_TYPE_PTO) {
+            const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
+            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
+            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
+            snprintf(pin_val, sizeof(pin_val), "PUL:%s,DIR:%s", pul, dir);
+        } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
+            snprintf(pin_val, sizeof(pin_val), "%s", (ch == 0 ? "PA4" : ch == 1 ? "PA5" : "PA4"));
+        } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
+            snprintf(pin_val, sizeof(pin_val), "%s", (ch == 0 ? "PD14" : ch == 1 ? "PD15" : "PD14"));
         } else {
             snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
         }
@@ -436,8 +497,10 @@ static int JSON_StatusResponse(char *buf, int buflen) {
                 d, pw ? (unsigned)pw->freq_hz : 1000);
         } else if (atype == ACTUATOR_TYPE_PTO) {
             const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
-            pos += snprintf(buf + pos, buflen - pos, ",\"speed\":%u,\"position\":%ld,\"moving\":%u",
-                pt ? (unsigned)pt->speed_pps : 5000, (long)(pt ? pt->position : 0), pt ? pt->moving : 0);
+            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
+            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
+            pos += snprintf(buf + pos, buflen - pos, ",\"speed\":%u,\"position\":%ld,\"moving\":%u,\"axis\":%u,\"pul_pin\":\"%s\",\"dir_pin\":\"%s\"",
+                pt ? (unsigned)pt->speed_pps : 5000, (long)(pt ? pt->position : 0), pt ? pt->moving : 0, ch + 1, pul, dir);
         } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
             float ma = DAC_420MA_GetCurrent(ch < MAX_420MA_CHANNELS ? ch : 0);
             int m_i = (int)ma;
@@ -476,12 +539,14 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"ip\":\"%d.%d.%d.%d\","
         "\"fw\":\"" FW_VERSION "\","
         "\"model\":\"KX-F407\","
+        "\"test_mode\":%u,"
         "\"rules_version_id\":\"%s\","
         ,
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         (unsigned long)s_cfg.serial,
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
+        s_cfg.test_mode,
         active_ver[0] ? active_ver : "default");
 
     pos += snprintf(buf + pos, buflen - pos,
@@ -491,6 +556,8 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"provision_message\":\"%s\","
         "\"mqtt\":{"
         "\"connected\":%u,"
+        "\"tx_enabled\":%u,"
+        "\"skip_offline\":%u,"
         "\"active_topic\":\"%s\","
         "\"last_error\":\"%s\","
         "\"broker\":\"%s\","
@@ -506,6 +573,8 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         s_cfg.provision_status[0] ? s_cfg.provision_status : "Active",
         s_cfg.provision_message,
         g_mqtt_status.connected,
+        s_cfg.mqtt_tx_enabled,
+        s_cfg.mqtt_skip_offline,
         g_mqtt_status.active_topic,
         g_mqtt_status.last_error,
         s_cfg.mqtt_broker,
@@ -523,8 +592,11 @@ static int JSON_StatusResponse(char *buf, int buflen) {
             locked = 1;
         }
     }
+    uint8_t emitted_log = 0;
     for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
-        char clean_payload[512];
+        if (buflen - pos < 4096) break;
+        if (g_mqtt_status.log[i].topic[0] == '\0') continue;
+        static char clean_payload[2560] __attribute__((section(".ccmram")));
         uint32_t cpos = 0;
         const char *raw = (const char *)g_mqtt_status.log[i].payload;
         while (*raw && cpos < sizeof(clean_payload) - 4) {
@@ -536,11 +608,12 @@ static int JSON_StatusResponse(char *buf, int buflen) {
 
         pos += snprintf(buf + pos, buflen - pos,
             "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu}",
-            (i > 0) ? "," : "",
+            emitted_log ? "," : "",
             g_mqtt_status.log[i].topic,
             clean_payload,
             g_mqtt_status.log[i].success,
             (unsigned long)g_mqtt_status.log[i].timestamp);
+        emitted_log = 1;
     }
     if (locked) {
         osMutexRelease(sensorMutex);
@@ -575,6 +648,11 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     pos += JSON_Analog_Object(buf + pos, buflen - pos);
     pos += snprintf(buf + pos, buflen - pos, "}");
 
+    if (pos >= buflen) {
+        pos = buflen - 1;
+        buf[pos] = '\0';
+    }
+
     return pos;
 }
 
@@ -587,6 +665,8 @@ static int ParseQueryInt(const char *url, const char *key) {
     p += strlen(key);
     if (*p != '=') return -1;
     p++;
+    if (*p == 't' || *p == 'T') return 1;
+    if (*p == 'f' || *p == 'F') return 0;
     int val = 0;
     while (*p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); p++; }
     return val;
@@ -628,6 +708,8 @@ static int JSON_ReadInt(const char *src, const char *key) {
     const char *v = JSON_FindValue(src, key);
     if (!v) return -1;
     if (*v == '"') v++;
+    if (*v == 't' || *v == 'T') return 1;
+    if (*v == 'f' || *v == 'F') return 0;
     int val = 0, sign = 1;
     if (*v == '-') { sign = -1; v++; }
     while (*v >= '0' && *v <= '9') {
@@ -728,7 +810,7 @@ static void Send_Response(uint8_t sn, const char *header, const char *body) {
  *        Prevents the W5500 2KB socket TX buffer from stalling on large payloads.
  */
 #define SEND_CHUNK_SIZE 1024U
-static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
+static uint8_t Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
     uint32_t sent = 0;
     uint32_t busy_retries = 0;
     while (sent < total) {
@@ -743,13 +825,14 @@ static void Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
         } else if (result == SOCK_BUSY) {
             if (++busy_retries > 500) {
                 printf("[HTTP] Send_Chunked: socket busy timeout at %lu/%lu bytes\r\n", (unsigned long)sent, (unsigned long)total);
-                break;
+                return 0;
             }
             osDelay(1);   /* 1ms yield — W5500 TX buffer full; wait a tick and retry */
         } else {
-            break;        /* Socket error — abort */
+            return 0;     /* Socket error / client disconnected */
         }
     }
+    return 1;
 }
 
 /* ======================================================================
@@ -774,7 +857,14 @@ static void Flash_Writer_Write(Flash_Aligned_Writer_t *w, const uint8_t *data, u
                             ((uint32_t)w->cache[1] << 8) |
                             ((uint32_t)w->cache[2] << 16) |
                             ((uint32_t)w->cache[3] << 24);
-            FLASH_WriteWord(w->write_addr, word);
+            uint32_t timeout = 200000;
+            while ((FLASH_CTRL->SR & FLASH_SR_BSY) && timeout--) __asm__("nop");
+            if (FLASH_CTRL->SR & 0xF2U) {
+                FLASH_CTRL->SR = 0xF3U; /* Clear any previous flash errors */
+            }
+            *(__IO uint32_t *)w->write_addr = word;
+            timeout = 200000;
+            while ((FLASH_CTRL->SR & FLASH_SR_BSY) && timeout--) __asm__("nop");
             w->write_addr += 4;
             w->cache_len = 0;
         }
@@ -788,7 +878,14 @@ static void Flash_Writer_Flush(Flash_Aligned_Writer_t *w) {
         for (uint8_t i = 0; i < w->cache_len; i++) {
             p[i] = w->cache[i];
         }
-        FLASH_WriteWord(w->write_addr, word);
+        uint32_t timeout = 200000;
+        while ((FLASH_CTRL->SR & FLASH_SR_BSY) && timeout--) __asm__("nop");
+        if (FLASH_CTRL->SR & 0xF2U) {
+            FLASH_CTRL->SR = 0xF3U;
+        }
+        *(__IO uint32_t *)w->write_addr = word;
+        timeout = 200000;
+        while ((FLASH_CTRL->SR & FLASH_SR_BSY) && timeout--) __asm__("nop");
         w->write_addr += 4;
         w->cache_len = 0;
     }
@@ -808,13 +905,14 @@ static void Safe_Write_Config_To_Flash(const Gateway_Config_t *cfg_in, const cha
 }
 
 static void Stream_Web_Asset(uint8_t sn) {
-    uint32_t html_len = (uint32_t)strlen(KONTRX_HTML);
+    uint32_t html_len = KONTRX_HTML_LEN;
 
-    printf("[HTTP] Streaming web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
+    printf("[HTTP] Streaming gzipped web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
     char hdr[256];
     snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
+        "Content-Encoding: gzip\r\n"
         "Content-Length: %lu\r\n"
         "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Pragma: no-cache\r\n"
@@ -824,16 +922,45 @@ static void Stream_Web_Asset(uint8_t sn) {
         (unsigned long)html_len);
     send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
 
-    /* Stream KONTRX_HTML directly from internal MCU Flash memory.
-     * Eliminates SPI flash mismatch, corrupted reads, and trailing 0xFF garbage bytes. */
-    Send_Chunked(sn, (const uint8_t *)KONTRX_HTML, html_len);
+    /* Stream gzipped KONTRX_HTML directly from internal MCU Flash memory. */
+    Send_Chunked(sn, KONTRX_HTML, html_len);
     printf("[HTTP] Stream complete: %lu bytes sent.\r\n", (unsigned long)html_len);
+}
+
+static void Extract_Origin_Header(const char *req, char *out, size_t maxlen) {
+    out[0] = '\0';
+    const char *p = strstr(req, "Origin: ");
+    if (!p) p = strstr(req, "origin: ");
+    if (p) {
+        p += 8;
+        size_t i = 0;
+        while (i < maxlen - 1 && p[i] != '\r' && p[i] != '\n' && p[i] != '\0') {
+            out[i] = p[i];
+            i++;
+        }
+        out[i] = '\0';
+    }
+}
+
+static void Build_CORS_Headers(const char *req, char *out_cors, size_t maxlen) {
+    char origin[64] = {0};
+    Extract_Origin_Header(req, origin, sizeof(origin));
+    if (origin[0]) {
+        snprintf(out_cors, maxlen,
+            "Access-Control-Allow-Origin: %s\r\n"
+            "Access-Control-Allow-Credentials: true\r\n",
+            origin);
+    } else {
+        snprintf(out_cors, maxlen,
+            "Access-Control-Allow-Origin: *\r\n");
+    }
 }
 
 /* ======================================================================
  *  Request dispatcher
  * ====================================================================== */
 static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
+    if (len >= RX_BUF_SIZE) len = RX_BUF_SIZE - 1;
     req[len] = '\0';
     char *line = (char *)req;
     
@@ -851,14 +978,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
     /* OPTIONS check for CORS pre-flight requests */
     if (strncmp(line, "OPTIONS ", 8) == 0) {
-        char cors_hdr[] =
+        char cors_part[128];
+        Build_CORS_Headers(line, cors_part, sizeof(cors_part));
+        char cors_hdr[320];
+        snprintf(cors_hdr, sizeof(cors_hdr),
             "HTTP/1.1 200 OK\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Credentials: true\r\n"
+            "%s"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token, Cookie\r\n"
-            "Connection: close\r\n"
-            "\r\n";
+            "Connection: close\r\n\r\n", cors_part);
         send(sn, (uint8_t *)cors_hdr, (uint16_t)strlen(cors_hdr));
         return;
     }
@@ -883,6 +1011,21 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/auth/login  → Authenticate credentials & issue session
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/auth/login", 20) == 0) {
+        uint32_t now_sec = g_uptime_seconds;
+        if (s_login_fail_count >= LOGIN_MAX_ATTEMPTS && now_sec < s_login_lockout_until) {
+            char cors_str[128];
+            Build_CORS_Headers(line, cors_str, sizeof(cors_str));
+            char locked[384];
+            snprintf(locked, sizeof(locked),
+                "HTTP/1.1 429 Too Many Requests\r\n"
+                "Content-Type: application/json\r\n"
+                "%s"
+                "Connection: close\r\n\r\n"
+                "{\"ok\":false,\"error\":\"Too many attempts. Try again in %lu seconds.\"}",
+                cors_str, (unsigned long)(s_login_lockout_until - now_sec));
+            send(sn, (uint8_t *)locked, strlen(locked));
+            return;
+        }
         char *body = strstr(line, "\r\n\r\n");
         char u[32] = {0};
         char p[32] = {0};
@@ -900,22 +1043,43 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
 
         if (strcmp(u, s_http_cfg_temp.admin_username) == 0 && strcmp(p, s_http_cfg_temp.admin_password) == 0) {
+            s_login_fail_count = 0;
             Generate_Session_Token(s_session_token, sizeof(s_session_token));
-            char resp_hdr[300];
-            snprintf(resp_hdr, sizeof(resp_hdr),
+            char cors_str[128];
+            Build_CORS_Headers(line, cors_str, sizeof(cors_str));
+            const char *body_fmt = "{\"ok\":true,\"token\":\"%s\",\"username\":\"%s\"}";
+            char body_json[128];
+            int b_len = snprintf(body_json, sizeof(body_json), body_fmt,
+                                 s_session_token, s_http_cfg_temp.admin_username);
+            if (b_len >= (int)sizeof(body_json)) b_len = (int)sizeof(body_json) - 1;
+            char resp[512];
+            int r_len = snprintf(resp, sizeof(resp),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
-                "Set-Cookie: kx_session=%s; Path=/; SameSite=Strict\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Access-Control-Allow-Credentials: true\r\n"
-                "Connection: close\r\n\r\n", s_session_token);
-            send(sn, (uint8_t *)resp_hdr, strlen(resp_hdr));
-            snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"token\":\"%s\",\"username\":\"%s\"}", s_session_token, s_http_cfg_temp.admin_username);
-            send(sn, (uint8_t *)tx_buf, strlen(tx_buf));
+                "Content-Length: %d\r\n"
+                "%s"
+                "Set-Cookie: kx_session=%s; Path=/; SameSite=Strict; HttpOnly\r\n"
+                "Connection: close\r\n\r\n%s", b_len, cors_str, s_session_token, body_json);
+            if (r_len >= (int)sizeof(resp)) r_len = (int)sizeof(resp) - 1;
+            send(sn, (uint8_t *)resp, (uint16_t)r_len);
             Log_Event("AUTH", "User logged in successfully");
         } else {
-            const char *err = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Invalid username or password\"}";
-            send(sn, (uint8_t *)err, strlen(err));
+            s_login_fail_count++;
+            if (s_login_fail_count >= LOGIN_MAX_ATTEMPTS) {
+                s_login_lockout_until = now_sec + LOGIN_LOCKOUT_SEC;
+            }
+            char cors_str[128];
+            Build_CORS_Headers(line, cors_str, sizeof(cors_str));
+            const char *body_err = "{\"ok\":false,\"error\":\"Invalid username or password\"}";
+            char resp_err[384];
+            int e_len = snprintf(resp_err, sizeof(resp_err),
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: %d\r\n"
+                "%s"
+                "Connection: close\r\n\r\n%s", (int)strlen(body_err), cors_str, body_err);
+            if (e_len >= (int)sizeof(resp_err)) e_len = (int)sizeof(resp_err) - 1;
+            send(sn, (uint8_t *)resp_err, (uint16_t)e_len);
             Log_Event("AUTH", "Failed login attempt");
         }
         return;
@@ -926,8 +1090,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/auth/logout", 21) == 0) {
         s_session_token[0] = '\0';
-        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: kx_session=; Path=/; Max-Age=0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nConnection: close\r\n\r\n{\"ok\":true}";
-        send(sn, (uint8_t *)resp, strlen(resp));
+        char cors_str[128];
+        Build_CORS_Headers(line, cors_str, sizeof(cors_str));
+        const char *body_out = "{\"ok\":true}";
+        char resp_out[256];
+        int o_len = snprintf(resp_out, sizeof(resp_out),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Set-Cookie: kx_session=; Path=/; Max-Age=0\r\n"
+            "%s"
+            "Connection: close\r\n\r\n%s", (int)strlen(body_out), cors_str, body_out);
+        send(sn, (uint8_t *)resp_out, (uint16_t)o_len);
         Log_Event("AUTH", "User logged out");
         return;
     }
@@ -985,13 +1159,36 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
     /* -----------------------------------------------------------------
      * Protected API Gatekeeper:
-     * Any subsequent /api/ or /update request requires an authenticated session.
+     * Restrict sensitive configuration writes & firmware updates to authenticated sessions.
+     * Note: POST /api/provision is exempt so mobile onboarding/provisioning can configure MQTT.
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "GET /api/", 9) == 0 || strncmp(line, "POST /api/", 10) == 0 || strncmp(line, "POST /update", 12) == 0) {
+    if ((strncmp(line, "POST /api/config/", 17) == 0 && strncmp(line, "POST /api/config/provision", 26) != 0) ||
+        strncmp(line, "POST /api/auth/change_password", 30) == 0 ||
+        strncmp(line, "POST /api/relay", 15) == 0 ||
+        strncmp(line, "POST /api/rules", 15) == 0 ||
+        strncmp(line, "POST /api/pto", 13) == 0 ||
+        strncmp(line, "POST /api/pwm", 13) == 0 ||
+        strncmp(line, "POST /api/analog", 16) == 0 ||
+        strncmp(line, "POST /api/modbus", 16) == 0 ||
+        strncmp(line, "POST /api/provision/delete", 26) == 0 ||
+        strncmp(line, "POST /api/provision/manual", 26) == 0 ||
+        strncmp(line, "POST /api/queue/clear", 21) == 0 ||
+        strncmp(line, "POST /update", 12) == 0) {
         if (!Is_Session_Valid(line)) {
             Send_Response(sn, HTTP_401, NULL);
             return;
         }
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/queue/clear  → Purge stale offline telemetry queue
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/queue/clear", 21) == 0) {
+        SDCard_Queue_Clear();
+        Log_Event("SYS", "Offline queue cleared via API");
+        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"queue_count\":0}");
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
+        return;
     }
 
     /* -----------------------------------------------------------------
@@ -1065,6 +1262,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/moveto?id=N&pos=P&speed=V  (Absolute motion)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/moveto?", 21) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int id = ParseQueryInt(line, "id");
         int32_t pos = ParseQuerySignedInt(line, "pos");
         int speed = ParseQueryInt(line, "speed");
@@ -1092,6 +1294,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/home?id=N
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/home?", 19) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int id = ParseQueryInt(line, "id");
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_SetHome((uint8_t)id);
@@ -1123,6 +1330,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pwm?id=N&duty=D
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pwm?", 14) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int id = ParseQueryInt(line, "id");
         float duty = ParseQueryFloat(line, "duty");
         if (id >= 0 && id < (int)PWM_GetChannelCount() && duty >= 0.0f) {
@@ -1136,6 +1348,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pwm/freq?id=N&freq=F
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pwm/freq?", 19) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int id = ParseQueryInt(line, "id");
         int freq = ParseQueryInt(line, "freq");
         if (id >= 0 && id < (int)PWM_GetChannelCount() && freq > 0) {
@@ -1168,6 +1385,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/analog/ma?id=N&val=M  (4-20mA current setpoint)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/analog/ma?", 20) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int id = ParseQueryInt(line, "id");
         float val = ParseQueryFloat(line, "val");
         if (val < 0.0f) val = ParseQueryFloat(line, "ma");
@@ -1182,6 +1404,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/analog/v?id=N&val=V  (0-10V voltage setpoint)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/analog/v?", 19) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int id = ParseQueryInt(line, "id");
         float val = ParseQueryFloat(line, "val");
         if (val < 0.0f) val = ParseQueryFloat(line, "v");
@@ -1708,7 +1935,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             resp_len);
             
         send(sn, (uint8_t *)resp_hdr, (uint16_t)strlen(resp_hdr));
-        send(sn, (uint8_t *)resp_body, (uint16_t)resp_len);
+        Send_Chunked(sn, (const uint8_t *)resp_body, (uint32_t)resp_len);
         return;
     }
 
@@ -1717,6 +1944,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/status ", 16) == 0 || strncmp(line, "GET /api/status?", 16) == 0) {
         int n = JSON_StatusResponse(tx_buf, sizeof(tx_buf));
+        if (n >= (int)sizeof(tx_buf)) {
+            n = (int)sizeof(tx_buf) - 1;
+            tx_buf[n] = '\0';
+        }
         char status_hdr[320];
         snprintf(status_hdr, sizeof(status_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1731,6 +1962,65 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             n);
         send(sn, (uint8_t *)status_hdr, (uint16_t)strlen(status_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+        return;
+    }
+
+    if (strncmp(line, "GET /api/config/mqtt", 20) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        char mq_json[384];
+        snprintf(mq_json, sizeof(mq_json),
+            "{\"broker\":\"%s\",\"port\":%u,\"client_id\":\"%s\",\"username\":\"%s\","
+            "\"interval\":%lu,\"send_mode\":%u,\"payload_shape\":%u,\"tx_enabled\":%u,\"skip_offline\":%u}",
+            s_http_cfg_temp.mqtt_broker,
+            s_http_cfg_temp.mqtt_port,
+            s_http_cfg_temp.mqtt_client_id,
+            s_http_cfg_temp.mqtt_username,
+            (unsigned long)s_http_cfg_temp.mqtt_interval,
+            s_http_cfg_temp.mqtt_send_mode,
+            s_http_cfg_temp.mqtt_payload_shape,
+            s_http_cfg_temp.mqtt_tx_enabled,
+            s_http_cfg_temp.mqtt_skip_offline);
+        Send_Response(sn, HTTP_200_JSON, mq_json);
+        return;
+    }
+
+    if (strncmp(line, "GET /api/config/sensors", 23) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        int pos = snprintf(tx_buf, sizeof(tx_buf), "{\"sensors\":[");
+        for (uint8_t i = 0; i < s_http_cfg_temp.sensors.count && i < MAX_SENSORS; i++) {
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "{\"type\":\"%s\",\"id\":%u}%s",
+                SensorTypeName(s_http_cfg_temp.sensors.entries[i].type),
+                s_http_cfg_temp.sensors.entries[i].id,
+                (i < s_http_cfg_temp.sensors.count - 1) ? "," : "");
+        }
+        snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
+        return;
+    }
+
+    if (strncmp(line, "GET /api/config/actuators", 25) == 0 ||
+        strncmp(line, "GET /api/config/relays", 22) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        int pos = snprintf(tx_buf, sizeof(tx_buf), "{\"relays\":[");
+        for (uint8_t i = 0; i < s_http_cfg_temp.actuator_count && i < MAX_RELAYS; i++) {
+            char pin_val[20] = {0};
+            uint8_t atype = s_http_cfg_temp.actuators[i].type;
+            if (atype == ACTUATOR_TYPE_LOCAL_GPIO || atype == ACTUATOR_TYPE_DIGITAL_OUT) {
+                snprintf(pin_val, sizeof(pin_val), "%s%u", s_http_cfg_temp.actuators[i].port_or_ip, s_http_cfg_temp.actuators[i].pin_or_slave);
+            } else {
+                snprintf(pin_val, sizeof(pin_val), "%s", s_http_cfg_temp.actuators[i].port_or_ip);
+            }
+            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
+                "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"pin\":\"%s\",\"nc\":%u,\"slave_id\":%u,\"reg_addr\":%u}%s",
+                i, s_http_cfg_temp.actuators[i].name, atype, pin_val,
+                s_http_cfg_temp.actuators[i].is_active_low,
+                s_http_cfg_temp.actuators[i].pin_or_slave,
+                s_http_cfg_temp.actuators[i].reg_addr,
+                (i < s_http_cfg_temp.actuator_count - 1) ? "," : "");
+        }
+        snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
         return;
     }
 
@@ -1756,14 +2046,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         SDCard_Status_t st;
         SDCard_GetStatus(&st);
         uint32_t total_used_bytes = st.log_file_bytes + (st.queue_record_count * sizeof(OfflineRecord_t));
-        char sd_buf[280];
+        uint32_t total_capacity_bytes = PARTITION_QUEUE_SIZE + PARTITION_LOG_SIZE;
+        char sd_buf[360];
         snprintf(sd_buf, sizeof(sd_buf),
-                 "{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}",
+                 "{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"total_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}",
                  st.mounted, st.card_type,
                  (unsigned long)st.total_capacity_mb,
                  (unsigned long)st.free_capacity_mb,
                  (unsigned long)(st.total_capacity_mb - st.free_capacity_mb),
                  (unsigned long)total_used_bytes,
+                 (unsigned long)total_capacity_bytes,
                  (unsigned long)st.queue_record_count,
                  (unsigned long)st.log_entry_count,
                  (unsigned long)st.log_file_bytes);
@@ -1794,11 +2086,38 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
-     * GET /api/sdcard/read?path=... OR GET /api/sdcard/download?path=...
+     * GET /api/sdcard/download?path=...  → Full file streaming download
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "GET /api/sdcard/read", 20) == 0 || strncmp(line, "GET /api/sdcard/download", 24) == 0) {
-        uint8_t is_dl = (line[17] == 'd');
-        char path_param[64] = "system.log";
+    if (strncmp(line, "GET /api/sdcard/download", 24) == 0) {
+        char path_param[64] = "system_event.log";
+        ParseQueryStringParam(line, "path", path_param, sizeof(path_param));
+
+        /* Extract filename */
+        const char *fname = strrchr(path_param, '/');
+        fname = (fname && *(fname + 1) != '\0') ? fname + 1 : path_param;
+        if (fname[0] == '\0') fname = "system_event.log";
+
+        uint32_t dl_size = SDCard_Stream_DownloadSize(path_param);
+        char sd_hdr[320];
+        snprintf(sd_hdr, sizeof(sd_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Disposition: attachment; filename=\"%s\"\r\n"
+            "Content-Length: %lu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n\r\n",
+            fname, (unsigned long)dl_size);
+        send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+
+        SDCard_Stream_Download(sn, path_param, Send_Chunked);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/sdcard/read?path=...  → Paged JSON preview
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/sdcard/read", 20) == 0) {
+        char path_param[64] = "system_event.log";
         uint32_t offset = 0;
         uint32_t limit = 50;
         ParseQueryStringParam(line, "path", path_param, sizeof(path_param));
@@ -1811,11 +2130,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         snprintf(sd_hdr, sizeof(sd_hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
-            "%s"
             "Content-Length: %d\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n",
-            is_dl ? "Content-Disposition: attachment\r\n" : "", n);
+            n);
         send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
         return;
@@ -1844,17 +2162,28 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     /* -----------------------------------------------------------------
      * POST /api/relay?id=N&state=S  → Toggle individual relay
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "POST /api/relay?", 16) == 0) {
+    if (strncmp(line, "POST /api/relay?", 16) == 0 ||
+        strncmp(line, "POST /api/relay ", 16) == 0) {
         int id    = ParseQueryInt(line, "id");
         int state = ParseQueryInt(line, "state");
+        char *body = strstr(line, "\r\n\r\n");
+        if (body) {
+            body += 4;
+            if (id < 0) id = JSON_ReadInt(body, "id");
+            if (state < 0) state = JSON_ReadInt(body, "state");
+        }
         Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         if (id >= 0 && id < (int)s_http_cfg_temp.actuator_count && id < MAX_RELAYS && state >= 0) {
             char api_log[64];
             snprintf(api_log, sizeof(api_log), "HTTP API: Actuator %d set to %s", id+1, state ? "ON" : "OFF");
             Log_Event("SYS", api_log);
             Relay_SetState((uint8_t)id, (uint8_t)state);
         }
-        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"id\":%d,\"state\":%d}", id, relayStates[id]);
+        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"id\":%d,\"state\":%d}", id, (id >= 0 && id < MAX_RELAYS) ? relayStates[id] : 0);
         
         // Include CORS headers in the response!
         char api_hdr[240];
@@ -1869,7 +2198,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "\r\n",
             (int)strlen(tx_buf));
         send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        send(sn, (uint8_t *)tx_buf, (uint16_t)strlen(tx_buf));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)strlen(tx_buf));
         return;
     }
 
@@ -1877,6 +2206,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/relay/all?state=S  → All relays
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/relay/all", 19) == 0) {
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (s_http_cfg_temp.test_mode != 1) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
+            return;
+        }
         int state = ParseQueryInt(line, "state");
         if (state >= 0) {
             char api_log[64];
@@ -1898,7 +2232,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "\r\n",
             (int)strlen(api_resp));
         send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        send(sn, (uint8_t *)api_resp, (uint16_t)strlen(api_resp));
+        Send_Chunked(sn, (const uint8_t *)api_resp, (uint32_t)strlen(api_resp));
         return;
     }
 
@@ -1913,7 +2247,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         /* De-assert old local pins first */
         for (int i = 0; i < (int)s_http_cfg_temp.actuator_count && i < MAX_RELAYS; i++) {
-            if (s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO) {
+            if (s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO ||
+                s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_DIGITAL_OUT) {
                 int port = GPIO_GetPortId(s_http_cfg_temp.actuators[i].port_or_ip);
                 uint8_t pin = s_http_cfg_temp.actuators[i].pin_or_slave;
                 if (port >= 0 && port <= 4 && pin <= 15) {
@@ -1938,7 +2273,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             char name[16] = {0};
             JSON_ReadStr(obj_start, "name", name, sizeof(name));
             
-            // Read Type: 0 = GPIO, 1 = Modbus TCP, 2 = OPC UA
+            // Read Type: 0 = GPIO/Relay, 1 = Modbus TCP, 2 = OPC UA, ... 7 = Digital Output
             int type = JSON_ReadInt(obj_start, "type");
             
             temp_actuators[actuator_count].id = actuator_count;
@@ -1950,7 +2285,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             temp_actuators[actuator_count].is_active_low = (active_low == 1) ? 1 : 0;
             temp_actuators[actuator_count].state = 0;
 
-            if (type == ACTUATOR_TYPE_LOCAL_GPIO) {
+            if (type == ACTUATOR_TYPE_LOCAL_GPIO || type == ACTUATOR_TYPE_DIGITAL_OUT) {
                 char pin_str[16] = {0};
                 JSON_ReadStr(obj_start, "pin", pin_str, sizeof(pin_str));
                 
@@ -2070,7 +2405,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "\r\n",
             (int)strlen(api_resp));
         send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        send(sn, (uint8_t *)api_resp, (uint16_t)strlen(api_resp));
+        Send_Chunked(sn, (const uint8_t *)api_resp, (uint32_t)strlen(api_resp));
         return;
     }
 
@@ -2083,6 +2418,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             strncpy(s_http_cfg_temp.sparkplug_topic, s_http_cfg_temp.pending_sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic) - 1);
             s_http_cfg_temp.sparkplug_topic[sizeof(s_http_cfg_temp.sparkplug_topic) - 1] = '\0';
             s_http_cfg_temp.pending_sparkplug_topic[0] = '\0';
+            s_http_cfg_temp.mqtt_tx_enabled = 1;
             s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
             Update_Shared_Config(&s_http_cfg_temp);
 
@@ -2147,9 +2483,71 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
+     * POST /api/config/mqtt/tx_switch or toggle → Master Telemetry Publish Switch
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/mqtt/tx_switch", 31) == 0 ||
+        strncmp(line, "POST /api/config/mqtt/toggle", 28) == 0) {
+        int state = ParseQueryInt(line, "state");
+        if (state < 0) state = ParseQueryInt(line, "enabled");
+        char *body = strstr(line, "\r\n\r\n");
+        if (body && state < 0) {
+            body += 4;
+            state = JSON_ReadInt(body, "state");
+            if (state < 0) state = JSON_ReadInt(body, "enabled");
+            if (state < 0) state = JSON_ReadInt(body, "tx_enabled");
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (state >= 0) {
+            s_http_cfg_temp.mqtt_tx_enabled = (uint8_t)state;
+            s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+            Update_Shared_Config(&s_http_cfg_temp);
+            Safe_Write_Config_To_Flash(&s_http_cfg_temp, "MQTT Tx Switch");
+            char tx_msg[64];
+            snprintf(tx_msg, sizeof(tx_msg), "HTTP API: MQTT Telemetry publishing %s.", state ? "ACTIVATED" : "PAUSED");
+            Log_Event("SYS", tx_msg);
+        }
+        char tx_resp[48];
+        snprintf(tx_resp, sizeof(tx_resp), "{\"ok\":true,\"tx_enabled\":%u}", s_http_cfg_temp.mqtt_tx_enabled);
+        Send_Response(sn, HTTP_200_JSON, tx_resp);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/config/mqtt/skip_offline → Toggle Skip Offline Sensors
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/mqtt/skip_offline", 34) == 0 ||
+        strncmp(line, "POST /api/config/mqtt/toggle_skip_offline", 41) == 0) {
+        int skip = ParseQueryInt(line, "skip_offline");
+        if (skip < 0) skip = ParseQueryInt(line, "skip");
+        if (skip < 0) skip = ParseQueryInt(line, "enabled");
+        char *body = strstr(line, "\r\n\r\n");
+        if (body && skip < 0) {
+            body += 4;
+            skip = JSON_ReadInt(body, "skip_offline");
+            if (skip < 0) skip = JSON_ReadInt(body, "skip");
+            if (skip < 0) skip = JSON_ReadInt(body, "enabled");
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (skip >= 0) {
+            s_http_cfg_temp.mqtt_skip_offline = (uint8_t)skip;
+            s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+            Update_Shared_Config(&s_http_cfg_temp);
+            Safe_Write_Config_To_Flash(&s_http_cfg_temp, "MQTT Skip Offline");
+            char so_msg[64];
+            snprintf(so_msg, sizeof(so_msg), "HTTP API: MQTT Skip Offline Sensors %s.", skip ? "ENABLED" : "DISABLED");
+            Log_Event("SYS", so_msg);
+        }
+        char so_resp[48];
+        snprintf(so_resp, sizeof(so_resp), "{\"ok\":true,\"skip_offline\":%u}", s_http_cfg_temp.mqtt_skip_offline);
+        Send_Response(sn, HTTP_200_JSON, so_resp);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
      * POST /api/config/mqtt  → MQTT broker config
      * ----------------------------------------------------------------- */
-    if (strncmp(line, "POST /api/config/mqtt", 21) == 0) {
+    if (strncmp(line, "POST /api/config/mqtt ", 22) == 0 ||
+        strncmp(line, "POST /api/config/mqtt?", 22) == 0) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
@@ -2204,30 +2602,27 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             s_http_cfg_temp.sparkplug_topic[sizeof(s_http_cfg_temp.sparkplug_topic) - 1] = '\0';
         }
 
-        const char *port_v = JSON_FindValue(body, "port");
-        if (port_v) {
-            uint16_t p = 0;
-            while (*port_v >= '0' && *port_v <= '9') { p = p * 10 + (*port_v - '0'); port_v++; }
-            s_http_cfg_temp.mqtt_port = p;
-        }
+        int p = JSON_ReadInt(body, "port");
+        if (p > 0 && p <= 65535) s_http_cfg_temp.mqtt_port = (uint16_t)p;
 
-        const char *int_v = JSON_FindValue(body, "interval");
-        if (int_v) {
-            uint32_t iv = 0;
-            while (*int_v >= '0' && *int_v <= '9') { iv = iv * 10 + (*int_v - '0'); int_v++; }
-            if (iv > 0) s_http_cfg_temp.mqtt_interval = iv;
-        }
+        int iv = JSON_ReadInt(body, "interval");
+        if (iv > 0) s_http_cfg_temp.mqtt_interval = (uint32_t)iv;
 
-        const char *sm_v = JSON_FindValue(body, "send_mode");
-        if (sm_v && *sm_v >= '0' && *sm_v <= '9') {
-            s_http_cfg_temp.mqtt_send_mode = (uint8_t)(*sm_v - '0');
-        }
+        int sm = JSON_ReadInt(body, "send_mode");
+        if (sm >= 0) s_http_cfg_temp.mqtt_send_mode = (uint8_t)sm;
 
-        const char *ps_v = JSON_FindValue(body, "payload_shape");
-        if (!ps_v) ps_v = JSON_FindValue(body, "shape");
-        if (ps_v && *ps_v >= '0' && *ps_v <= '9') {
-            s_http_cfg_temp.mqtt_payload_shape = (uint8_t)(*ps_v - '0');
-        }
+        int ps = JSON_ReadInt(body, "payload_shape");
+        if (ps < 0) ps = JSON_ReadInt(body, "shape");
+        if (ps >= 0) s_http_cfg_temp.mqtt_payload_shape = (uint8_t)ps;
+
+        int tx = JSON_ReadInt(body, "tx_enabled");
+        if (tx < 0) tx = JSON_ReadInt(body, "enabled");
+        if (tx < 0) tx = JSON_ReadInt(body, "state");
+        if (tx >= 0) s_http_cfg_temp.mqtt_tx_enabled = (uint8_t)tx;
+
+        int so = JSON_ReadInt(body, "skip_offline");
+        if (so < 0) so = JSON_ReadInt(body, "skip");
+        if (so >= 0) s_http_cfg_temp.mqtt_skip_offline = (uint8_t)so;
 
         if (s_http_cfg_temp.mqtt_broker[0] != '\0') {
             strncpy(s_http_cfg_temp.provision_status, "Active", sizeof(s_http_cfg_temp.provision_status) - 1);
@@ -2250,6 +2645,34 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
     }
+
+    /* -----------------------------------------------------------------
+     * POST /api/config/test_mode  → Enable/Disable Test Mode
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/config/test_mode", 26) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
+        body += 4;
+        Get_Shared_Config(&s_http_cfg_temp);
+
+        const char *pv = JSON_FindValue(body, "test_mode");
+        if (pv) {
+            s_http_cfg_temp.test_mode = (*pv == '1' || *pv == 't') ? 1 : 0;
+            s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+            Update_Shared_Config(&s_http_cfg_temp);
+            Safe_Write_Config_To_Flash(&s_http_cfg_temp, "test_mode update");
+            char msg[48];
+            snprintf(msg, sizeof(msg), "HTTP API: Test mode set to %u.", s_http_cfg_temp.test_mode);
+            Log_Event("SYS", msg);
+        }
+
+        char resp[48];
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"test_mode\":%u}", s_http_cfg_temp.test_mode);
+        Send_Response(sn, HTTP_200_JSON, resp);
+        return;
+    }
+
+
 
     /* -----------------------------------------------------------------
      * POST /api/provision/delete  → Clear provisioning data
@@ -2316,6 +2739,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         Get_Shared_Config(&s_http_cfg_temp);
 
         JSON_ReadStr(body, "deviceId",       s_http_cfg_temp.device_id,         sizeof(s_http_cfg_temp.device_id));
+        if (s_http_cfg_temp.device_id[0] == '\0') {
+            JSON_ReadStr(body, "device_id",  s_http_cfg_temp.device_id,         sizeof(s_http_cfg_temp.device_id));
+        }
         JSON_ReadStr(body, "status",         s_http_cfg_temp.provision_status,  sizeof(s_http_cfg_temp.provision_status));
         JSON_ReadStr(body, "message",        s_http_cfg_temp.provision_message, sizeof(s_http_cfg_temp.provision_message));
 
@@ -2340,7 +2766,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             s_http_cfg_temp.mqtt_port = 1883; /* default MQTT port */
         }
 
-        /* Parse MQTT topic from provisioning — saves to pending_sparkplug_topic for user confirmation */
+        /* Parse MQTT topic from provisioning — saves to pending_sparkplug_topic for user confirmation card in UI */
         {
             char prov_topic[128] = {0};
             JSON_ReadStr(body, "topic", prov_topic, sizeof(prov_topic));
@@ -2354,11 +2780,37 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
         }
 
+        /* Parse optional MQTT credentials if provided by mobile app */
+        {
+            char m_user[32] = {0};
+            JSON_ReadStr(body, "username", m_user, sizeof(m_user));
+            if (m_user[0] == '\0') JSON_ReadStr(body, "mqttUser", m_user, sizeof(m_user));
+            if (m_user[0] != '\0') {
+                strncpy(s_http_cfg_temp.mqtt_username, m_user, sizeof(s_http_cfg_temp.mqtt_username) - 1);
+                s_http_cfg_temp.mqtt_username[sizeof(s_http_cfg_temp.mqtt_username) - 1] = '\0';
+            }
+            char m_pass[32] = {0};
+            JSON_ReadStr(body, "password", m_pass, sizeof(m_pass));
+            if (m_pass[0] == '\0') JSON_ReadStr(body, "mqttPass", m_pass, sizeof(m_pass));
+            if (m_pass[0] != '\0') {
+                strncpy(s_http_cfg_temp.mqtt_password, m_pass, sizeof(s_http_cfg_temp.mqtt_password) - 1);
+                s_http_cfg_temp.mqtt_password[sizeof(s_http_cfg_temp.mqtt_password) - 1] = '\0';
+            }
+            char m_client[32] = {0};
+            JSON_ReadStr(body, "clientId", m_client, sizeof(m_client));
+            if (m_client[0] == '\0') JSON_ReadStr(body, "mqttClientId", m_client, sizeof(m_client));
+            if (m_client[0] != '\0') {
+                strncpy(s_http_cfg_temp.mqtt_client_id, m_client, sizeof(s_http_cfg_temp.mqtt_client_id) - 1);
+                s_http_cfg_temp.mqtt_client_id[sizeof(s_http_cfg_temp.mqtt_client_id) - 1] = '\0';
+            }
+        }
+
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&s_http_cfg_temp);
 
         /* Persist to Flash */
         Safe_Write_Config_To_Flash(&s_http_cfg_temp, "mobile provisioning");
+        Log_Event("SYS", "Device provisioned via mobile app");
 
         Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
         return;
@@ -2519,7 +2971,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
         
         send(sn, (uint8_t *)HTTP_200_JSON, strlen(HTTP_200_JSON));
-        send(sn, (uint8_t *)tx_buf, (uint16_t)pos);
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
         return;
     }
 
@@ -2550,6 +3002,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/ota/prepare  → Erase staging sectors for OTA
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/ota/prepare", 21) == 0) {
+        if (!ota_otp_validated) {
+            /* Even for authenticated session (Is_Session_Valid), OTP validation is required */
+            Send_Response(sn, HTTP_401, "{\"error\":\"Unauthorized: OTA OTP not verified\"}");
+            return;
+        }
         printf("[OTA] Sending prepare response...\r\n");
         const char *resp = "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nConnection:close\r\n\r\n{\"status\":\"preparing\"}";
         send(sn, (uint8_t *)resp, strlen(resp));
@@ -2563,15 +3020,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         printf("[OTA] Preparing flash: Erasing sectors 6 and 7...\r\n");
         
-        /* Suspend Modbus and MQTT tasks during blocking Flash erase to prevent CPU
-         * starvation, watchdog resets, or W5500 SPI contention while CPU is stalled. */
-        extern osThreadId_t g_tid_modbus;
-        extern osThreadId_t g_tid_mqtt;
-        if (g_tid_modbus) vTaskSuspend((TaskHandle_t)g_tid_modbus);
-        if (g_tid_mqtt)   vTaskSuspend((TaskHandle_t)g_tid_mqtt);
+        /* Pause background tasks cleanly without mutex deadlocks */
+        g_ota_in_progress = 1;
+        osDelay(100);
 
-        /* Backup configuration from Sector 7 tail before it is erased */
+        /* Backup configuration to W25Q16 external flash before destructive erase */
         Get_Shared_Config(&s_http_cfg_temp);
+        Partition_SaveConfig(&s_http_cfg_temp);
 
         FLASH_EraseSector(6);
         FLASH_EraseSector(7);
@@ -2582,9 +3037,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         Log_Event("OTA", "Flash sectors 6 & 7 prepared for update.");
 
-        /* Resume suspended tasks after flash operation finishes */
-        if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
-        if (g_tid_mqtt)   vTaskResume((TaskHandle_t)g_tid_mqtt);
+        /* Resume background tasks */
+        g_ota_in_progress = 0;
 
         printf("[OTA] Flash erase complete.\r\n");
         return;
@@ -2592,18 +3046,20 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
     /* -----------------------------------------------------------------
      * POST /update  → OTA binary upload
-     * Check OTP header, then stream body to staging flash area.
+     * Check OTP header or valid session, then stream body to staging flash area.
      * Staging sectors are already erased via prepare endpoint.
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /update", 12) == 0) {
-        /* Suspend Modbus and MQTT tasks during firmware streaming to prevent CPU starvation and SPI contention */
-        extern osThreadId_t g_tid_modbus;
-        extern osThreadId_t g_tid_mqtt;
-        if (g_tid_modbus) vTaskSuspend((TaskHandle_t)g_tid_modbus);
-        if (g_tid_mqtt)   vTaskSuspend((TaskHandle_t)g_tid_mqtt);
+        /* Pause background tasks cleanly without mutex deadlocks */
+        g_ota_in_progress = 1;
+        osDelay(100);
 
-        /* OTP validation disabled by user request. Force ota_otp_validated to 1. */
-        ota_otp_validated = 1;
+        if (!ota_otp_validated) {
+            /* Even for authenticated session (Is_Session_Valid), OTP validation is required */
+            Send_Response(sn, HTTP_401, "{\"error\":\"OTA OTP not validated\"}");
+            g_ota_in_progress = 0;
+            return;
+        }
 
         /* Parse Content-Length */
         uint32_t content_length = 0;
@@ -2617,8 +3073,25 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         /* Find body start */
         char *body = strstr(line, "\r\n\r\n");
-        if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
+        if (!body) {
+            Send_Response(sn, HTTP_400, NULL);
+            g_ota_in_progress = 0;
+            return;
+        }
         body += 4;
+
+        if (content_length == 0 || content_length > 262144) {
+            Send_Response(sn, HTTP_400, "{\"error\":\"Invalid image size\"}");
+            g_ota_in_progress = 0;
+            return;
+        }
+
+        /* Unlock Flash and enable programming */
+        while (FLASH_CTRL->SR & FLASH_SR_BSY);
+        FLASH_Unlock();
+        FLASH_CTRL->SR = 0xF3U;
+        FLASH_CTRL->CR &= ~(3U << 8);
+        FLASH_CTRL->CR |= FLASH_CR_PSIZE32 | FLASH_CR_PG;
 
         Flash_Aligned_Writer_t writer;
         Flash_Writer_Init(&writer, STAGING_ADDR);
@@ -2646,17 +3119,41 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 if (recvd > 0) {
                     Flash_Writer_Write(&writer, rx_buf, (uint32_t)recvd);
                     total_written += (uint32_t)recvd;
+                } else if (recvd < 0) {
+                    break;
                 }
             } else {
-                if (getSn_SR(sn) != SOCK_ESTABLISHED) break;
+                uint8_t sr = getSn_SR(sn);
+                if (sr != SOCK_ESTABLISHED && sr != SOCK_CLOSE_WAIT) {
+                    break;
+                }
+                if (sr == SOCK_CLOSE_WAIT && getSn_RX_RSR(sn) == 0) {
+                    break;
+                }
                 osDelay(1);  /* 1ms wait for more OTA bytes — W5500 RX empty. */
                 timeout_cnt++;
-                if (timeout_cnt > 10000) break;
+                if (timeout_cnt > 15000) break;
             }
         }
 
         /* Flush remaining bytes in writer cache */
         Flash_Writer_Flush(&writer);
+
+        /* Disable programming and lock Flash */
+        while (FLASH_CTRL->SR & FLASH_SR_BSY);
+        FLASH_CTRL->CR &= ~FLASH_CR_PG;
+        FLASH_Lock();
+
+        if (total_written < content_length) {
+            printf("[OTA] Incomplete upload: %lu / %lu bytes\r\n", (unsigned long)total_written, (unsigned long)content_length);
+            Log_Event("OTA", "Firmware upload incomplete or aborted.");
+            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection:close\r\n\r\nOTA INCOMPLETE";
+            send(sn, (uint8_t *)resp, strlen(resp));
+            g_ota_in_progress = 0;
+            disconnect(sn);
+            ota_otp_validated = 0;
+            return;
+        }
 
         /* Signal OTA task to verify + write metadata */
         ota_content_length   = total_written;
@@ -2669,13 +3166,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             const char *resp = "HTTP/1.1 200 OK\r\nContent-Type:text/plain\r\nConnection:close\r\n\r\n"
                                "OTA OK. Rebooting...";
             send(sn, (uint8_t *)resp, strlen(resp));
+            osDelay(100);
         } else {
             Log_Event("OTA", "Firmware upload failed (CRC check failed).");
             const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection:close\r\n\r\nOTA CRC FAIL";
             send(sn, (uint8_t *)resp, strlen(resp));
-            /* Resume suspended tasks since update failed */
-            if (g_tid_modbus) vTaskResume((TaskHandle_t)g_tid_modbus);
-            if (g_tid_mqtt)   vTaskResume((TaskHandle_t)g_tid_mqtt);
+            /* Resume background tasks since update failed */
+            g_ota_in_progress = 0;
         }
 
         disconnect(sn);
@@ -2698,139 +3195,197 @@ void Task_HTTPServer(void *arg) {
     if (!sem_ota_start) sem_ota_start = osSemaphoreNew(1, 0, NULL);
     if (!sem_ota_done)  sem_ota_done  = osSemaphoreNew(1, 0, NULL);
 
-    printf("[HTTP] Task started; opening TCP port %u\r\n", HTTP_PORT);
+    printf("[HTTP] Task started; opening TCP port %u on %u sockets\r\n",
+           HTTP_PORT, (unsigned int)HTTP_NUM_SOCKS);
+
+    static uint32_t s_sock_teardown_tick[8] = {0};
+    static uint32_t s_sock_est_tick[8] = {0};
 
     for (;;) {
-        uint8_t state = getSn_SR(HTTP_SOCK);
-        static uint32_t last_heartbeat = 0;
         uint32_t now = osKernelGetTickCount();
-        if (now - last_heartbeat >= 2000) {
-            /* printf("[HTTP] Heartbeat: socket state = 0x%02X\r\n", state); */
-            last_heartbeat = now;
-        }
 
-        switch (state) {
+        for (uint8_t i = 0; i < HTTP_NUM_SOCKS; i++) {
+            uint8_t sn = s_http_socks[i];
+            uint8_t state = getSn_SR(sn);
 
-        /* ---------------------------------------------------------------
-         * CLOSED → create TCP socket and prepare to listen.
-         * -------------------------------------------------------------- */
-        case SOCK_CLOSED:
-            if (socket(HTTP_SOCK, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
-                printf("[HTTP] Socket open failed! Checking network...\r\n");
-                Ensure_W5500_Network_Alive();
-                osDelay(200); /* backoff on W5500 socket allocation failure */
-            }
-            break;
+            switch (state) {
 
-        /* ---------------------------------------------------------------
-         * INIT → start listening for incoming connections immediately.
-         * --------------------------------------------------------------- */
-        case SOCK_INIT:
-            if (listen(HTTP_SOCK) != SOCK_OK) {
-                osDelay(50);
-            }
-            break;
+            /* ---------------------------------------------------------------
+             * CLOSED → clear library state and reopen TCP socket to listen.
+             * -------------------------------------------------------------- */
+            case SOCK_CLOSED:
+                s_sock_teardown_tick[sn] = 0;
+                s_sock_est_tick[sn] = 0;
+                close(sn); /* Reset socket.c internal variables */
+                if (socket(sn, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
+                    Ensure_W5500_Network_Alive();
+                }
+                break;
 
-        /* ---------------------------------------------------------------
-         * LISTEN → idle, waiting for browser SYN. 1ms yield.
-         * -------------------------------------------------------------- */
-        case SOCK_LISTEN:
-            osDelay(1);
-            break;
+            /* ---------------------------------------------------------------
+             * INIT → start listening for incoming connections immediately.
+             * --------------------------------------------------------------- */
+            case SOCK_INIT:
+                listen(sn);
+                break;
 
-        /* ---------------------------------------------------------------
-         * ESTABLISHED → receive and dispatch an HTTP request
-         *
-         * Wait up to 50ms in 5ms steps for the full request to arrive.
-         * This avoids the "partial-request" race where strncmp on an
-         * incomplete URL falls through to the 404 handler.
-         * -------------------------------------------------------------- */
-        case SOCK_ESTABLISHED:
-            /* Clear connection interrupt flag */
-            if (getSn_IR(HTTP_SOCK) & Sn_IR_CON) {
-                setSn_IR(HTTP_SOCK, Sn_IR_CON);
-            }
-            {
-                uint16_t size = 0;
-                /* Retry loop: wait for at least 8 bytes (shortest valid
-                 * request line: "GET / H") before processing */
-                for (int retry = 0; retry < 10; retry++) {
-                    size = getSn_RX_RSR(HTTP_SOCK);
-                    if (size >= 8) break;
-                    osDelay(5); /* 5ms poll step while waiting for the browser's
-                                 * request bytes to arrive from the network. */
+            /* ---------------------------------------------------------------
+             * LISTEN → idle, waiting for browser SYN.
+             * -------------------------------------------------------------- */
+            case SOCK_LISTEN:
+                s_sock_teardown_tick[sn] = 0;
+                s_sock_est_tick[sn] = 0;
+                break;
+
+            /* ---------------------------------------------------------------
+             * ESTABLISHED → receive and dispatch an HTTP request
+             * -------------------------------------------------------------- */
+            case SOCK_ESTABLISHED:
+                /* If this socket was already commanded to disconnect, don't re-dispatch */
+                if (s_sock_teardown_tick[sn] != 0) {
+                    if (now - s_sock_teardown_tick[sn] > 50) {
+                        close(sn);
+                        s_sock_teardown_tick[sn] = 0;
+                    }
+                    break;
                 }
 
-                if (size > 0) {
-                    if (size > (uint16_t)(sizeof(rx_buf) - 1))
-                        size = (uint16_t)(sizeof(rx_buf) - 1);
-                    recv(HTTP_SOCK, rx_buf, size);
-                    Dispatch_Request(HTTP_SOCK, rx_buf, size);
-                    
-                    /* Flush any leftover/overflow bytes in the socket RX buffer
-                     * before closing. If we close a socket with unread data in the
-                     * RX buffer, the W5500 will send a TCP RST packet to the browser,
-                     * causing ERR_CONNECTION_RESET or ERR_CONNECTION_REFUSED. */
-                    uint16_t rem_size;
-                    while ((rem_size = getSn_RX_RSR(HTTP_SOCK)) > 0) {
-                        uint16_t discard_len = (rem_size > sizeof(rx_buf)) ? sizeof(rx_buf) : rem_size;
-                        recv(HTTP_SOCK, rx_buf, discard_len);
-                        osDelay(1);
-                    }
-                    
-                    /* Wait for W5500 hardware TX buffer to be fully sent and ACKed by the client.
-                     * For a 2KB socket buffer, getSn_TX_FSR returning 2048 means the buffer is empty.
-                     * Use longer timeout (2s) for large web asset streaming (~112KB). */
-                    for (int wait_ack = 0; wait_ack < 2000; wait_ack++) {
-                        if (getSn_TX_FSR(HTTP_SOCK) >= 2048) {
-                            break;
+                if (getSn_IR(sn) & Sn_IR_CON) {
+                    setSn_IR(sn, Sn_IR_CON);
+                    s_sock_est_tick[sn] = now;
+                }
+                if (s_sock_est_tick[sn] == 0) {
+                    s_sock_est_tick[sn] = now;
+                }
+
+                {
+                    uint16_t size = getSn_RX_RSR(sn);
+                    if (size >= 8) {
+                        if (size > (uint16_t)(sizeof(rx_buf) - 1))
+                            size = (uint16_t)(sizeof(rx_buf) - 1);
+                        int32_t recvd = recv(sn, rx_buf, size);
+                        if (recvd <= 0) break;
+                        uint16_t total = (uint16_t)recvd;
+
+                        /* For POST requests, accumulate until full Content-Length body arrives.
+                         * Without this, TCP fragmentation causes partial JSON → save failures. */
+                        if (rx_buf[0] == 'P') {
+                            rx_buf[total] = '\0';
+                            char *cl = strstr((char *)rx_buf, "Content-Length: ");
+                            char *body = strstr((char *)rx_buf, "\r\n\r\n");
+
+                            /* If headers arrived fragmented (no Content-Length or
+                             * no end-of-headers yet), wait for more data. */
+                            if (!cl || !body) {
+                                uint32_t t0 = osKernelGetTickCount();
+                                while ((!cl || !body) && (osKernelGetTickCount() - t0) < 300) {
+                                    uint16_t more = getSn_RX_RSR(sn);
+                                    if (more > 0) {
+                                        if (more > (uint16_t)(sizeof(rx_buf) - 1 - total))
+                                            more = (uint16_t)(sizeof(rx_buf) - 1 - total);
+                                        int32_t r = recv(sn, rx_buf + total, more);
+                                        if (r > 0) total += (uint16_t)r;
+                                        rx_buf[total] = '\0';
+                                        cl = strstr((char *)rx_buf, "Content-Length: ");
+                                        body = strstr((char *)rx_buf, "\r\n\r\n");
+                                    } else {
+                                        osDelay(2);
+                                    }
+                                }
+                            }
+
+                            if (cl && body) {
+                                int content_len = atoi(cl + 16);
+                                int header_len = (int)(body + 4 - (char *)rx_buf);
+                                int need = header_len + content_len;
+                                if (need > (int)(sizeof(rx_buf) - 1)) need = (int)(sizeof(rx_buf) - 1);
+                                uint32_t t0 = osKernelGetTickCount();
+                                while ((int)total < need && (osKernelGetTickCount() - t0) < 500) {
+                                    uint16_t more = getSn_RX_RSR(sn);
+                                    if (more > 0) {
+                                        if (more > (uint16_t)(sizeof(rx_buf) - 1 - total))
+                                            more = (uint16_t)(sizeof(rx_buf) - 1 - total);
+                                        int32_t r = recv(sn, rx_buf + total, more);
+                                        if (r > 0) total += (uint16_t)r;
+                                    } else {
+                                        osDelay(2);
+                                    }
+                                }
+                            }
                         }
-                        osDelay(1);
+
+                        Dispatch_Request(sn, rx_buf, total);
+                        
+                        /* Flush any leftover/overflow bytes in the socket RX buffer */
+                        uint16_t rem_size;
+                        while ((rem_size = getSn_RX_RSR(sn)) > 0) {
+                            uint16_t discard_len = (rem_size > sizeof(rx_buf)) ? sizeof(rx_buf) : rem_size;
+                            recv(sn, rx_buf, discard_len);
+                        }
+
+                        /* Wait for W5500 hardware TX buffer to be fully transmitted and ACKed by peer */
+                        uint32_t wait_ack_t0 = osKernelGetTickCount();
+                        while (getSn_TX_FSR(sn) < 2048 && (osKernelGetTickCount() - wait_ack_t0) < 50) {
+                            osDelay(1);
+                        }
+
+                        /* Graceful TCP disconnect: W5500 hardware transmits any pending
+                         * TX buffer bytes and then automatically sends FIN to the client.
+                         * This avoids TCP RST, letting browser receive 100% of HTML/data. */
+                        setSn_CR(sn, Sn_CR_DISCON);
+                        while (getSn_CR(sn));
+                        s_sock_teardown_tick[sn] = osKernelGetTickCount();
+                        s_sock_est_tick[sn] = 0;
+                    } else if (now - s_sock_est_tick[sn] > 2000) {
+                        /* Inactivity timeout: close if connected > 2000ms with no HTTP request */
+                        close(sn);
+                        s_sock_est_tick[sn] = 0;
                     }
-                    osDelay(30); /* 30ms graceful delay for PC browser TCP stack to receive & process final TCP segments before disconnect FIN */
-                    disconnect(HTTP_SOCK);
-                } else {
-                    /* Socket leak fix: disconnect if no request bytes received */
-                    disconnect(HTTP_SOCK);
                 }
+                break;
+
+            /* ---------------------------------------------------------------
+             * CLOSE_WAIT → peer sent FIN, close our side to recycle socket
+             * -------------------------------------------------------------- */
+            case SOCK_CLOSE_WAIT:
+                disconnect(sn);
+                close(sn);
+                s_sock_teardown_tick[sn] = 0;
+                s_sock_est_tick[sn] = 0;
+                break;
+
+            /* ---------------------------------------------------------------
+             * Teardown states → allow TCP FIN/ACK handshake to finish gracefully.
+             * Force-close immediately or after 30ms to prevent stuck sockets.
+             * -------------------------------------------------------------- */
+            case SOCK_FIN_WAIT:
+            case SOCK_CLOSING:
+            case SOCK_TIME_WAIT:
+            case SOCK_LAST_ACK:
+                if (s_sock_teardown_tick[sn] == 0) {
+                    s_sock_teardown_tick[sn] = now;
+                }
+                if ((now - s_sock_teardown_tick[sn]) > 30) {
+                    close(sn);
+                    s_sock_teardown_tick[sn] = 0;
+                }
+                break;
+
+            /* Transient states (handshake): do nothing */
+            case SOCK_SYNSENT:
+            case SOCK_SYNRECV:
+                break;
+
+            default:
+                /* Any unexpected state: force-close immediately to recover */
+                close(sn);
+                s_sock_teardown_tick[sn] = 0;
+                s_sock_est_tick[sn] = 0;
+                break;
             }
-            break;
-
-        /* ---------------------------------------------------------------
-         * CLOSE_WAIT → remote sent FIN; we ack and finish our side
-         * -------------------------------------------------------------- */
-        case SOCK_CLOSE_WAIT:
-            disconnect(HTTP_SOCK);
-            break;
-
-        /* ---------------------------------------------------------------
-         * FIN_WAIT / CLOSING / TIME_WAIT
-         * Force-close the socket so W5500 recycles it to SOCK_CLOSED
-         * immediately — without this, the socket stays stuck and the
-         * server cannot accept any new connections (page refuses to load).
-         * The browser handles the RST cleanly on reconnect.
-         * -------------------------------------------------------------- */
-        case SOCK_FIN_WAIT:
-        case SOCK_CLOSING:
-        case SOCK_TIME_WAIT:
-            close(HTTP_SOCK);
-            break;
-
-        /* Transient states (handshake & teardown): do nothing and yield */
-        case SOCK_SYNSENT:
-        case SOCK_SYNRECV:
-        case SOCK_LAST_ACK:
-            break;
-
-        default:
-            printf("[HTTP] Unknown socket state: 0x%02X\r\n", state);
-            osDelay(1000);
-            break;
         }
 
-        osDelay(1); /* 1ms yield per loop — keeps the W5500 state machine
-                     * responsive (~1KB API responses) without starving the
-                     * 1ms Control Engine. Exact 1ms, does not exceed budget. */
+        osDelay(1); /* 1ms yield per loop keeps the W5500 state machine responsive */
     }
 }
 

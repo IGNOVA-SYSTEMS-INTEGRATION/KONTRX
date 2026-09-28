@@ -79,6 +79,7 @@ uint8_t Partition_BackupCurrentRules(void);
 void Partition_Queue_Push(const OfflineRecord_t *rec);
 uint8_t Partition_Queue_Pop(OfflineRecord_t *rec);
 uint32_t Partition_Queue_Count(void);
+void Partition_Queue_Reset(void);
 
 // Persistent System Audit Logs (Wrap-around Logger)
 void Partition_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg);
@@ -87,5 +88,13 @@ uint32_t Partition_Log_Count(uint32_t *out_bytes);
 int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items);
 int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit);
 void Partition_Log_Clear(void);
+
+// Streaming functions for full file export over socket
+uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total));
+uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total));
+
+// Pre-calculate formatted stream size (for Content-Length headers)
+uint32_t Partition_Log_StreamSize(void);
+uint32_t Partition_Queue_StreamSize(void);
 
 #endif // FLASH_PARTITION_H

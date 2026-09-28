@@ -145,6 +145,8 @@ static void Load_Config_From_Flash(void) {
         sharedConfig.mqtt_port = 1883;
         sharedConfig.mqtt_interval = 2;
         sharedConfig.mqtt_send_mode = 0; // Periodic
+        sharedConfig.mqtt_tx_enabled = 1; // Publishing Active
+        sharedConfig.test_mode = 0;      // Normal/Automated Rules Mode
         
         sharedConfig.mqtt_broker[0] = '\0';
         strcpy(sharedConfig.sparkplug_topic, "test/topic/12345");
@@ -193,6 +195,7 @@ static void Load_Config_From_Flash(void) {
  *  main()
  * ====================================================================== */
 int main(void) {
+    memset((void *)&g_mqtt_status, 0, sizeof(g_mqtt_status));
 
     /* ---- 0. High-Performance Clock: 168 MHz via PLL (HSE / HSI auto-fallback) ---- */
     RCC_SystemClock_168MHz_Init();

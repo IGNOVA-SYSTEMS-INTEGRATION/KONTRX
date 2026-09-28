@@ -10,6 +10,7 @@
 #include "pto_motion.h"
 #include "dac_420ma.h"
 #include "analog_010v.h"
+#include "modbus_dma.h"
 #include "freertos_tasks.h"
 #include <string.h>
 
@@ -74,6 +75,10 @@ static uint16_t ReadHoldingRegister(uint16_t addr) {
 }
 
 static void WriteHoldingRegister(uint16_t addr, uint16_t val) {
+    Gateway_Config_t cfg;
+    Get_Shared_Config(&cfg);
+    if (cfg.test_mode != 1) return; // Manual actuator write blocked when test mode is OFF
+
     if (addr < 16) {
         Relay_SetState(addr, val ? 1 : 0);
     } else if (addr >= 16 && addr <= 22) {
@@ -166,7 +171,9 @@ void Modbus_TCP_Server_Poll(void) {
         } else if (fc == 0x05) { // Write Single Coil
             uint16_t coil_addr = (s_rx_buf[8] << 8) | s_rx_buf[9];
             uint16_t coil_val  = (s_rx_buf[10] << 8) | s_rx_buf[11];
-            if (coil_addr < 16) {
+            Gateway_Config_t cfg;
+            Get_Shared_Config(&cfg);
+            if (cfg.test_mode == 1 && coil_addr < 16) {
                 Relay_SetState(coil_addr, (coil_val == 0xFF00) ? 1 : 0);
             }
             send(SN, s_rx_buf, 12);

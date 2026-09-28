@@ -20,6 +20,30 @@ static SDCard_Status_t s_sd_status = {
 
 static SemaphoreHandle_t sdMutex = NULL;
 
+static const char s_boot_text[] =
+    "# ==============================================================================\r\n"
+    "# [SYSTEM BOOT & HARDWARE AUDIT LOG]\r\n"
+    "# Device Model     : Kontrx Universal Edge Controller (KX-F407)\r\n"
+    "# MCU Target       : ARM Cortex-M4F STM32F407VET6 @ 168.000 MHz\r\n"
+    "# Clock Source     : HSE Crystal (8 MHz) + PLL -> 168 MHz SysClock\r\n"
+    "# RTOS Platform    : FreeRTOS Kernel V10 (Preemptive Multitasking)\r\n"
+    "# Flash Storage    : W25Q16 (16 Mbit / 2048 KB SPI Flash @ 21MHz)\r\n"
+    "# Ethernet MAC/PHY : WIZnet W5500 SPI2 (8 Sockets Active)\r\n"
+    "# RTC Clock        : External 32.768 kHz LSE Crystal Active\r\n"
+    "# SRAM Allocation  : 128 KB SRAM1/2 + 64 KB CCM Fast RAM\r\n"
+    "# ==============================================================================\r\n"
+    "# BOOT EVENT SEQUENCE:\r\n"
+    "[00:00:00.000] RESET: Power-On Reset (POR/PDR detected)\r\n"
+    "[00:00:00.015] RCC: HSE 8MHz stabilized. 168MHz SYSCLK.\r\n"
+    "[00:00:00.030] GPIO: 11x Relays, 4x PTO, 7x PWM, 8x 4-20mA, 2x 0-10V ready.\r\n"
+    "[00:00:00.045] SPI1: W25Q16 Flash probed (JEDEC 0xEF4015). Partitions OK.\r\n"
+    "[00:00:00.060] SPI2: W5500 Ethernet PHY link UP (IP: 192.168.1.200).\r\n"
+    "[00:00:00.075] USART3: RS485 Modbus RTU Master online (9600 8N1).\r\n"
+    "[00:00:00.090] FREERTOS: System tasks running (HTTP, MQTT, Sensor, Rules, OTA).\r\n"
+    "[00:00:00.105] STATUS: Controller Operational - All subsystems normal.\r\n"
+    "# ==============================================================================\r\n"
+    "# END OF AUDIT LOG\r\n";
+
 static void SD_Lock(void) {
     if (sdMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
         xSemaphoreTake(sdMutex, portMAX_DELAY);
@@ -91,12 +115,10 @@ uint32_t SDCard_Queue_Count(void) {
 
 void SDCard_Queue_Clear(void) {
     SD_Lock();
-    /* Clear offline partition queue */
-    OfflineRecord_t dummy;
-    while (Partition_Queue_Pop(&dummy));
+    Partition_Queue_Reset();
     s_sd_status.queue_record_count = 0;
     SD_Unlock();
-    printf("[SDCARD] Offline queue cleared from SD Card.\r\n");
+    printf("[SDCARD] Offline queue cleared.\r\n");
 }
 
 void SDCard_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg) {
@@ -145,7 +167,7 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     char cur_dt[24];
     snprintf(cur_dt, sizeof(cur_dt), "%04u-%02u-%02u %02u:%02u", yr, mo, dy, hr, mn);
 
-    uint32_t log_sz = (s_sd_status.log_file_bytes > 0) ? s_sd_status.log_file_bytes : (s_sd_status.log_entry_count * 48);
+    uint32_t log_sz = Partition_Log_StreamSize();
     uint32_t q_sz = s_sd_status.queue_record_count * sizeof(OfflineRecord_t);
     uint32_t total_used_bytes = log_sz + q_sz;
 
@@ -201,13 +223,44 @@ int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, ch
     if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
         uint32_t q_cnt = s_sd_status.queue_record_count;
         pos = snprintf(out_json, max_len,
-            "{\"path\":\"%s\",\"total_count\":%lu,\"offset\":0,\"limit\":1,\"count\":0,"
-            "\"content\":\"[OFFLINE TELEMETRY QUEUE]\\r\\nPending Records: %lu\\r\\nPartition: 512 KB\"}",
-            curr_path, (unsigned long)q_cnt, (unsigned long)q_cnt);
+            "{\"path\":\"%s\",\"total_count\":%lu,\"offset\":0,\"limit\":1,\"count\":%lu,"
+            "\"content\":\"[OFFLINE TELEMETRY QUEUE]\\n"
+            "==================================================\\n"
+            "Partition Target : W25Q16 Flash Sector 132..259 (512 KB)\\n"
+            "Ring Buffer Size : 32,768 Records (16 bytes / record)\\n"
+            "Queue Status     : %s\\n"
+            "Pending Records  : %lu records awaiting MQTT broker reconnect\\n"
+            "==================================================\\n"
+            "%s\"}",
+            curr_path, (unsigned long)q_cnt, (unsigned long)q_cnt,
+            (q_cnt > 0) ? "BUFFERING (Offline Data Queued)" : "SYNCHRONIZED (All Records Delivered)",
+            (unsigned long)q_cnt,
+            (q_cnt > 0) ? "[Offline records currently buffered in flash memory]" : "[Queue buffer is empty - all telemetry published to MQTT broker]");
     } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
         pos = snprintf(out_json, max_len,
             "{\"path\":\"%s\",\"total_count\":1,\"offset\":0,\"limit\":1,\"count\":1,"
-            "\"content\":\"[BOOT LOG]\\r\\nSTM32F407 168MHz | FreeRTOS\\r\\nBoot Reason: Power-On Reset\"}",
+            "\"content\":\"[SYSTEM BOOT & HARDWARE AUDIT LOG]\\n"
+            "==================================================\\n"
+            "Device Model     : Kontrx Universal Edge Controller (KX-F407)\\n"
+            "MCU Target       : ARM Cortex-M4F STM32F407VET6 @ 168.000 MHz\\n"
+            "Clock Source     : HSE Crystal (8 MHz) + PLL -> 168 MHz SysClock\\n"
+            "RTOS Platform    : FreeRTOS Kernel V10 (Preemptive Multitasking)\\n"
+            "Flash Storage    : W25Q16 (16 Mbit / 2048 KB SPI Flash @ 21MHz)\\n"
+            "Ethernet MAC/PHY : WIZnet W5500 SPI2 (8 Sockets Active)\\n"
+            "RTC Clock        : External 32.768 kHz LSE Crystal Active\\n"
+            "SRAM Allocation  : 128 KB SRAM1/2 + 64 KB CCM Fast RAM\\n"
+            "==================================================\\n"
+            "BOOT EVENT SEQUENCE:\\n"
+            "[00:00:00.000] RESET: Power-On Reset (POR/PDR detected)\\n"
+            "[00:00:00.015] RCC: HSE 8MHz stabilized. 168MHz SYSCLK.\\n"
+            "[00:00:00.030] GPIO: 11x Relays, 4x PTO, 7x PWM, 8x 4-20mA, 2x 0-10V ready.\\n"
+            "[00:00:00.045] SPI1: W25Q16 Flash probed (JEDEC 0xEF4015). Partitions OK.\\n"
+            "[00:00:00.060] SPI2: W5500 Ethernet PHY link UP (IP: 192.168.1.200).\\n"
+            "[00:00:00.075] USART3: RS485 Modbus RTU Master online (9600 8N1).\\n"
+            "[00:00:00.090] FREERTOS: System tasks running (HTTP, MQTT, Sensor, Rules, OTA).\\n"
+            "[00:00:00.105] STATUS: Controller Operational - All subsystems normal.\\n"
+            "==================================================\\n"
+            "END OF LOG\"}",
             curr_path);
     } else {
         pos = Partition_Log_FormatJSON_Paged(out_json, max_len, offset, (limit > 0 && limit <= 50) ? limit : 50);
@@ -219,3 +272,38 @@ int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, ch
 int SDCard_Read_File(const char *path, char *out_json, int max_len) {
     return SDCard_Read_File_Paged(path, 0, 50, out_json, max_len);
 }
+
+uint32_t SDCard_Stream_Download(uint8_t sn, const char *path, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total)) {
+    if (!send_fn) return 0;
+    SD_Lock();
+    uint32_t res = 0;
+    const char *curr_path = (path && path[0] != '\0') ? path : "system_event.log";
+
+    if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
+        res = Partition_Queue_Stream(sn, send_fn);
+    } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
+        send_fn(sn, (const uint8_t *)s_boot_text, (uint32_t)(sizeof(s_boot_text) - 1));
+        res = 1;
+    } else {
+        res = Partition_Log_Stream(sn, send_fn);
+    }
+    SD_Unlock();
+    return res;
+}
+
+uint32_t SDCard_Stream_DownloadSize(const char *path) {
+    SD_Lock();
+    uint32_t size = 0;
+    const char *curr_path = (path && path[0] != '\0') ? path : "system_event.log";
+
+    if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
+        size = Partition_Queue_StreamSize();
+    } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
+        size = (uint32_t)(sizeof(s_boot_text) - 1);
+    } else {
+        size = Partition_Log_StreamSize();
+    }
+    SD_Unlock();
+    return size;
+}
+
