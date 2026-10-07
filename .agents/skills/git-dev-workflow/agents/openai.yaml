@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Dev Workflow"
+  short_description: "Standard branching, PR merge to dev, and release workflow"
+  default_prompt: "Use $git-dev-workflow to branch off dev, commit, PR-merge to dev, and stay on dev."
