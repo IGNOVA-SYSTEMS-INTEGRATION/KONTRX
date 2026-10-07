@@ -2,11 +2,12 @@
 
 ## Development Workflow
 - Follow `.agents/rules/git-workflow.md` strictly:
-  1. Always branch off `main` for any task: `git checkout -b <type>/<name>`.
-  2. Implement, test, and commit atomically with conventional commit messages.
-  3. Push the feature branch to `origin`.
-  4. Merge into `main` with `--no-ff` (PR simulation) and push `main` to `origin`.
-  5. Start the next task only after `main` is merged and pushed.
+  1. Default base branch is `dev`.
+  2. Always branch off `dev` for any task: `git checkout dev && git pull origin dev && git checkout -b <type>/<name>`.
+  3. Implement, test (`cmake --build build`), and commit atomically with Conventional Commits.
+  4. Push the branch to `origin`: `git push -u origin <branch>`.
+  5. Checkout `dev`, merge with `--no-ff`, and push `dev` to `origin`.
+  6. ALWAYS leave the repository on `dev` (`git checkout dev`).
 
 ## Build & Test Instructions
 - ARM Toolchain: GCC ARM Embedded
