@@ -45,9 +45,22 @@ static uint8_t W25Q_ReadSR1(void) {
 }
 
 static void W25Q_WaitBusy(void) {
-    volatile uint32_t timeout = 2000000; // ~2-3 seconds safety timeout
-    while ((W25Q_ReadSR1() & 0x01) && timeout--) {
-        __asm__("nop");
+    volatile uint32_t timeout = 500; // ~500ms max with 1ms yields
+    while (timeout--) {
+        uint8_t sr = W25Q_ReadSR1();
+        if (sr == 0xFF) {
+            /* Flash unreadable / bus floating / CS contention — abort wait */
+            break;
+        }
+        if (!(sr & 0x01)) {
+            /* BUSY bit cleared — write/erase complete */
+            break;
+        }
+        if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } else {
+            for (volatile int _d = 0; _d < 5000; _d++) __asm__("nop");
+        }
     }
 }
 

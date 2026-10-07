@@ -152,6 +152,21 @@ void Timer_PTO_Init(TIM_TypeDef *tim, uint8_t channel) {
     // Enable Update Interrupt to count steps
     tim->DIER |= (1U << 0); // UIE: Update interrupt enable
     tim->EGR = (1U << 0);
+
+    // Enable corresponding NVIC interrupt
+    if (tim == TIM1) {
+        NVIC_IPR[25] = (5U << 4);
+        NVIC_ISER[0] |= (1U << 25); // TIM1_UP_TIM10_IRQn (25)
+    } else if (tim == TIM9) {
+        NVIC_IPR[24] = (5U << 4);
+        NVIC_ISER[0] |= (1U << 24); // TIM1_BRK_TIM9_IRQn (24)
+    } else if (tim == TIM3) {
+        NVIC_IPR[29] = (5U << 4);
+        NVIC_ISER[0] |= (1U << 29); // TIM3_IRQn (29)
+    } else if (tim == TIM2) {
+        NVIC_IPR[28] = (5U << 4);
+        NVIC_ISER[0] |= (1U << 28); // TIM2_IRQn (28)
+    }
 }
 
 void Timer_PTO_SetFrequency(TIM_TypeDef *tim, uint32_t pps) {
