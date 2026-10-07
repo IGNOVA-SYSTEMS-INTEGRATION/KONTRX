@@ -224,39 +224,56 @@ size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_m
     if (!write_metric_string(&p, end, "System/Status", timestamp_ms, "ONLINE")) return 0;
     if (!write_metric_string(&p, end, "System/Firmware", timestamp_ms, FW_VERSION)) return 0;
 
-    /* Sensors — emit all configured, with online/offline quality flag */
-    if (batch->count > 0) {
-        for (int i = 0; i < batch->count; i++) {
-            /* When skip_offline is enabled, completely omit offline sensors */
-            if (cfg && cfg->mqtt_skip_offline && !batch->records[i].valid) continue;
-            if (cfg && cfg->mqtt_skip_offline && batch->records[i].avg_value == 0.0f
-                && batch->records[i].avg_temp == 0.0f) continue;
+    /* Sensors — emit all configured sensors (or batch records if no config), with online/offline quality flag */
+    uint8_t total_cfg_sensors = (cfg && cfg->sensors.count > 0 && cfg->sensors.count <= MAX_SENSORS) ? cfg->sensors.count : 0;
+    if (total_cfg_sensors > 0) {
+        for (uint8_t i = 0; i < total_cfg_sensors; i++) {
+            uint8_t stype = cfg->sensors.entries[i].type;
+            uint8_t sid   = cfg->sensors.entries[i].id;
+            const char *tname = get_sensor_type_name(stype);
+
+            int b_idx = -1;
+            if (batch) {
+                for (int b = 0; b < batch->count; b++) {
+                    if (batch->records[b].type == stype && batch->records[b].id == sid) {
+                        b_idx = b;
+                        break;
+                    }
+                }
+            }
+
+            uint8_t is_online = (b_idx >= 0 && batch->records[b_idx].valid);
+            if (cfg->mqtt_skip_offline && !is_online) continue;
+
+            float val  = is_online ? batch->records[b_idx].avg_value : 0.0f;
+            float temp = is_online ? batch->records[b_idx].avg_temp : 0.0f;
 
             char name_buf[64];
+            snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Value", tname, sid);
+            if (!write_metric_float(&p, end, name_buf, timestamp_ms, val)) return 0;
+
+            snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Temperature", tname, sid);
+            if (!write_metric_float(&p, end, name_buf, timestamp_ms, temp)) return 0;
+
+            snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Online", tname, sid);
+            if (!write_metric_bool(&p, end, name_buf, timestamp_ms, is_online)) return 0;
+        }
+    } else if (batch && batch->count > 0) {
+        for (int i = 0; i < batch->count; i++) {
+            if (cfg && cfg->mqtt_skip_offline && !batch->records[i].valid) continue;
+            char name_buf[64];
             const char *tname = get_sensor_type_name(batch->records[i].type);
-            
+
             snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Value", tname, batch->records[i].id);
             if (!write_metric_float(&p, end, name_buf, timestamp_ms,
                 batch->records[i].valid ? batch->records[i].avg_value : 0.0f)) return 0;
-            
+
             snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Temperature", tname, batch->records[i].id);
             if (!write_metric_float(&p, end, name_buf, timestamp_ms,
                 batch->records[i].valid ? batch->records[i].avg_temp : 0.0f)) return 0;
-            
-            /* Quality flag: 1 = online/valid, 0 = offline/stale */
+
             snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Online", tname, batch->records[i].id);
             if (!write_metric_bool(&p, end, name_buf, timestamp_ms, batch->records[i].valid)) return 0;
-        }
-    } else if (cfg && cfg->sensors.count > 0 && !cfg->mqtt_skip_offline) {
-        for (int i = 0; i < cfg->sensors.count && i < MAX_SENSORS; i++) {
-            char name_buf[64];
-            const char *tname = get_sensor_type_name(cfg->sensors.entries[i].type);
-            snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Value", tname, cfg->sensors.entries[i].id);
-            if (!write_metric_float(&p, end, name_buf, timestamp_ms, 0.0f)) return 0;
-            snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Temperature", tname, cfg->sensors.entries[i].id);
-            if (!write_metric_float(&p, end, name_buf, timestamp_ms, 0.0f)) return 0;
-            snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Online", tname, cfg->sensors.entries[i].id);
-            if (!write_metric_bool(&p, end, name_buf, timestamp_ms, 0)) return 0;
         }
     }
 

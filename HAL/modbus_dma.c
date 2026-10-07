@@ -82,6 +82,15 @@ void Modbus_DMA_Init(void) {
         strncpy(cfg.admin_username, "admin", sizeof(cfg.admin_username));
         strncpy(cfg.admin_password, "adminkontrx", sizeof(cfg.admin_password));
         cfg.actuator_mask = 0x0F;
+        snprintf(cfg.sparkplug_edge_node_id, sizeof(cfg.sparkplug_edge_node_id), "KX-%07lu", (unsigned long)cfg.serial);
+        snprintf(cfg.sparkplug_device_id, sizeof(cfg.sparkplug_device_id), "KX-%07lu-dev", (unsigned long)cfg.serial);
+        Update_Shared_Config(&cfg);
+    }
+
+    /* Auto-generate Sparkplug IDs if empty (existing device upgraded to new firmware) */
+    if (cfg.sparkplug_edge_node_id[0] == '\0') {
+        snprintf(cfg.sparkplug_edge_node_id, sizeof(cfg.sparkplug_edge_node_id), "KX-%07lu", (unsigned long)cfg.serial);
+        snprintf(cfg.sparkplug_device_id, sizeof(cfg.sparkplug_device_id), "KX-%07lu-dev", (unsigned long)cfg.serial);
         Update_Shared_Config(&cfg);
     }
 }
