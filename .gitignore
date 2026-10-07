@@ -29,3 +29,15 @@ __pycache__/
 *.pyc
 scratch/
 ultrasonic_build/
+
+# Archives & Temporary files
+*.zip
+*.tar.gz
+node_modules/
+assemble_switches.py
+
+# Tooling and Index caches
+.codegraph/
+.gemini/
+memory_system/chroma_db/
+
