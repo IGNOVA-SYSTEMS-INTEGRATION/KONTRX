@@ -136,6 +136,8 @@ typedef struct {
     char provision_message[128];
     char sparkplug_topic[128];
     char pending_sparkplug_topic[128];
+    char sparkplug_edge_node_id[48];
+    char sparkplug_device_id[48];
     uint32_t mqtt_interval;       /* MQTT publish interval in seconds */
     uint8_t mqtt_send_mode;       /* 0 = On Interval (Periodic), 1 = On Change (CoV) */
     uint8_t mqtt_payload_shape;   /* 0 = Standard Nested JSON, 1 = Flat Key-Value JSON, 2 = Sparkplug B */
