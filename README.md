@@ -12,9 +12,50 @@
 
 **An industrial-grade, multi-tasking edge gateway and universal automation controller engineered for real-time motion control (PTO/PWM), analog I/O (0-10V / 4-20mA), water quality monitoring (Modbus RTU), SD card event logging, and SCADA / Cloud IoT integration (Modbus TCP, Sparkplug B, MQTT).**
 
-[System Architecture](#system-architecture) · [Hardware](#hardware-specifications--pinout) · [RTOS Tasks](#freertos-multi-tasking-architecture) · [Memory & Storage](#flash-memory--sd-card-architecture) · [Modbus & DSP](#modbus-rtu-sensor-subsystem--dsp-filtering) · [Motion & Analog](#industrial-interfaces-motion--analog-subsystems) · [Telemetry](#cloud-telemetry--sparkplug-b-engine) · [Rule Engine](#edge-rule-engine--fail-safe-watchdog) · [Web Dashboard](#web-dashboard--rest-api) · [OTA Updates](#ota-firmware-updates) · [Build & Flash](#build--flashing-guide)
+[System Architecture](#system-architecture) · [Documentation Index](#-system-documentation-index) · [Hardware](#hardware-specifications--pinout) · [RTOS Tasks](#freertos-multi-tasking-architecture) · [Memory & Storage](#flash-memory--sd-card-architecture) · [Modbus & DSP](#modbus-rtu-sensor-subsystem--dsp-filtering) · [Motion & Analog](#industrial-interfaces-motion--analog-subsystems) · [Telemetry](#cloud-telemetry--sparkplug-b-engine) · [Rule Engine](#edge-rule-engine--fail-safe-watchdog) · [Web Dashboard](#web-dashboard--rest-api) · [OTA Updates](#ota-firmware-updates) · [Build & Flash](#build--flashing-guide)
 
 </div>
+
+---
+
+## 📚 System Documentation Index
+
+The KONTRX documentation suite is organized into five structured categories in the [`docs/`](docs/) directory:
+
+### 🏛️ 1. Architecture (`docs/architecture/`)
+* [**01_SYSTEM_OVERVIEW.md**](docs/architecture/01_SYSTEM_OVERVIEW.md): Comprehensive system architecture, dual-domain separation, and hardware boundaries.
+* [**02_FREERTOS_TASK_MATRIX.md**](docs/architecture/02_FREERTOS_TASK_MATRIX.md): 6-task deterministic FreeRTOS matrix, execution periods, priorities, and mutexes.
+* [**03_MEMORY_ARCHITECTURE.md**](docs/architecture/03_MEMORY_ARCHITECTURE.md): SRAM1, CCMRAM 64 KB, internal flash, and W25Q16 external flash layout.
+* [**04_COMMUNICATION_STACK.md**](docs/architecture/04_COMMUNICATION_STACK.md): Layered industrial communication stack (Modbus, W5500, Sparkplug B, HTTP).
+* [**05_HARDWARE_PERIPHERALS.md**](docs/architecture/05_HARDWARE_PERIPHERALS.md): Pin mappings, timers, DMA controllers, and SPI/UART interfaces.
+
+### ⚙️ 2. Core Features (`docs/features/`)
+* [**01_MODBUS_DSP_SENSORS.md**](docs/features/01_MODBUS_DSP_SENSORS.md): RS485 acquisition, DMA USART3, and moving average/median DSP filtering.
+* [**02_MULTI_ACTUATOR_ENGINE.md**](docs/features/02_MULTI_ACTUATOR_ENGINE.md): 8 actuator domains (Relays, PWM, PTO 4-axis stepper, 4–20mA, 0–10V).
+* [**03_HIERARCHICAL_RULE_ENGINE.md**](docs/features/03_HIERARCHICAL_RULE_ENGINE.md): Condition trees, logic gates, timers, and autonomous closed-loop execution.
+* [**04_CANVAS_LAYOUT_AND_ROLLBACK.md**](docs/features/04_CANVAS_LAYOUT_AND_ROLLBACK.md): Visual canvas JSON layout persistence on SPI Flash and dual-sector rollback.
+* [**05_SPARKPLUG_B_TELEMETRY.md**](docs/features/05_SPARKPLUG_B_TELEMETRY.md): Zero-allocation micro-protobuf encoder, NBIRTH/DDATA/NDEATH lifecycle.
+* [**06_OFFLINE_STORAGE_QUEUE.md**](docs/features/06_OFFLINE_STORAGE_QUEUE.md): Dual-tier store-and-forward queue (MicroSD FatFS + W25Q16 NOR Flash).
+* [**07_EMBEDDED_HTTP_SPA.md**](docs/features/07_EMBEDDED_HTTP_SPA.md): Embedded gzipped SPA web dashboard (< 64 KB) and REST API in CCMRAM.
+* [**08_DUAL_BANK_OTA_BOOTLOADER.md**](docs/features/08_DUAL_BANK_OTA_BOOTLOADER.md): Staging area OTA firmware update, CRC32 checks, and safe bootloader jump.
+* [**09_PERIPHERAL_DISCOVERY.md**](docs/features/09_PERIPHERAL_DISCOVERY.md): Runtime interrogation of 12 industrial hardware interfaces and ASIC daughterboards.
+
+### 🧪 3. Verification & Tests (`docs/tests/`)
+* [**01_TESTING_STRATEGY.md**](docs/tests/01_TESTING_STRATEGY.md): Multi-tier quality assurance framework and pre-commit verification gates.
+* [**02_UNIT_TESTS_GUIDE.md**](docs/tests/02_UNIT_TESTS_GUIDE.md): Host C logic unit tests, Modbus protocol tests, and web asset tests.
+* [**03_INTEGRATION_TESTS.md**](docs/tests/03_INTEGRATION_TESTS.md): Device integration test suite across HTTP REST APIs and Sparkplug B.
+* [**04_HARDWARE_IN_THE_LOOP.md**](docs/tests/04_HARDWARE_IN_THE_LOOP.md): HIL test bench, RS485 noise tests, and brownout power-cut stress tests.
+
+### 📊 4. System Diagrams (`docs/diagrams/`)
+* [**01_SYSTEM_TOPOLOGY.md**](docs/diagrams/01_SYSTEM_TOPOLOGY.md): High-level edge topology and physical device interconnection.
+* [**02_STATE_MACHINES.md**](docs/diagrams/02_STATE_MACHINES.md): Modbus DMA, Rule Engine, OTA bootloader, and Offline Queue state machines.
+* [**03_MEMORY_MAP_DIAGRAM.md**](docs/diagrams/03_MEMORY_MAP_DIAGRAM.md): STM32F407 Flash, RAM/CCMRAM, and W25Q16 NOR flash memory layouts.
+* [**04_COMMUNICATION_FLOWS.md**](docs/diagrams/04_COMMUNICATION_FLOWS.md): Sequence diagrams for telemetry acquisition, closed-loop control, and HTTP requests.
+
+### 🗺️ 5. Roadmaps & ADR Specs (`docs/plans/`)
+* [**01_ROADMAP_AND_MILESTONES.md**](docs/plans/01_ROADMAP_AND_MILESTONES.md): Engineering release milestones (v1.0 through v3.0).
+* [**02_HISTORICAL_SPECS_ARCHIVE.md**](docs/plans/02_HISTORICAL_SPECS_ARCHIVE.md): Architecture Decision Records (ADR-01 through ADR-05).
+* [**03_FUTURE_ENHANCEMENTS.md**](docs/plans/03_FUTURE_ENHANCEMENTS.md): Future expansion (EtherCAT, PROFINET, hardware TLS crypto coprocessor).
 
 ---
 
