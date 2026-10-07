@@ -67,7 +67,7 @@ osSemaphoreId_t   sem_ota_done  = NULL;
 #define HTTP_PORT        80U
 #define HTTP_NUM_SOCKS   3U
 static const uint8_t s_http_socks[HTTP_NUM_SOCKS] = {0, 3, 6};
-#define RX_BUF_SIZE      4096U   /* Sized to fit large HTTP POST payloads (e.g. 16 actuators config JSON ~3.3KB) */
+#define RX_BUF_SIZE      12288U  /* Sized to fit full rulesets with canvas layout JSON */
 
 #define OTA_OTP_SECRET   "KontrxOTA2026"
 #define STAGING_ADDR     0x08040000U
@@ -85,12 +85,13 @@ extern uint8_t relayStates[MAX_RELAYS];
 void Relay_SetState(uint8_t idx, uint8_t state);
 
 /* ======================================================================
- *  Buffer — kept static to avoid stack pressure
+ *  Buffer — kept in fast CCMRAM to avoid stack and main SRAM pressure
  * ====================================================================== */
-static uint8_t rx_buf[RX_BUF_SIZE];
-static char    tx_buf[32768] __attribute__((section(".ccmram")));  /* Sized for complete /api/status JSON in CCMRAM (64KB total) */
+static uint8_t rx_buf[RX_BUF_SIZE] __attribute__((section(".ccmram")));
+static char    tx_buf[12288] __attribute__((section(".ccmram")));  /* Sized for complete /api/status JSON in CCMRAM */
 
-
+/* Static temporary storage for rules in CCMRAM to avoid ~4KB on HTTP task stack */
+static RuleConfig_t s_tempRules __attribute__((section(".ccmram")));
 
 /* ======================================================================
  *  Static working buffers for JSON_StatusResponse
@@ -230,6 +231,432 @@ const char *SensorTypeName(uint8_t type) {
         case 7: return "multi_us";
         default: return "unknown";
     }
+}
+
+static void JSON_FormatId(char *out, size_t maxlen, const char *id_str) {
+    if (!id_str || id_str[0] == '\0') {
+        snprintf(out, maxlen, "\"\"");
+        return;
+    }
+    const char *p = id_str;
+    while (*p >= '0' && *p <= '9') p++;
+    if (*p == '\0') {
+        /* Entirely digits: output as JSON number */
+        snprintf(out, maxlen, "%s", id_str);
+    } else {
+        /* Contains non-digit chars: output as JSON string */
+        snprintf(out, maxlen, "\"%s\"", id_str);
+    }
+}
+
+static uint8_t Parse_Op_String(const char *op_str) {
+    if (!op_str) return 0;
+    if (strcmp(op_str, ">") == 0) return 1;
+    if (strcmp(op_str, "<") == 0) return 2;
+    if (strcmp(op_str, "==") == 0) return 3;
+    if (strcmp(op_str, "!=") == 0) return 4;
+    if (strcmp(op_str, ">=") == 0) return 5;
+    if (strcmp(op_str, "<=") == 0) return 6;
+    return 0;
+}
+
+static int8_t Parse_Condition_Tree(const cJSON *cond, RuleConfig_t *cfg) {
+    if (!cond || !cJSON_IsObject(cond) || !cfg) return -1;
+    if (cfg->cond_node_count >= MAX_COND_NODES) return -1;
+
+    int8_t node_idx = (int8_t)cfg->cond_node_count;
+    CondNode_t *n = &cfg->cond_nodes[node_idx];
+    memset(n, 0, sizeof(CondNode_t));
+    for (int k = 0; k < 4; k++) n->children[k] = -1;
+    cfg->cond_node_count++;
+
+    cJSON *t_item = cJSON_GetObjectItemCaseSensitive(cond, "type");
+    const char *type_str = (t_item && cJSON_IsString(t_item)) ? t_item->valuestring : "compare";
+
+    if (strcmp(type_str, "range") == 0) {
+        n->type = COND_NODE_RANGE;
+        cJSON *min_i = cJSON_GetObjectItemCaseSensitive(cond, "min");
+        cJSON *max_i = cJSON_GetObjectItemCaseSensitive(cond, "max");
+        cJSON *mode_i = cJSON_GetObjectItemCaseSensitive(cond, "mode");
+        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
+        if (in_i) {
+            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
+            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
+        }
+        if (min_i && cJSON_IsNumber(min_i)) n->threshold = (float)min_i->valuedouble;
+        if (max_i && cJSON_IsNumber(max_i)) n->threshold_b = (float)max_i->valuedouble;
+        n->range_mode = (mode_i && cJSON_IsString(mode_i) && strcmp(mode_i->valuestring, "outside") == 0) ? 1 : 0;
+        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
+        if (ch && cJSON_IsObject(ch)) {
+            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
+            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
+        }
+    } else if (strcmp(type_str, "hysteresis") == 0) {
+        n->type = COND_NODE_HYSTERESIS;
+        cJSON *hth = cJSON_GetObjectItemCaseSensitive(cond, "high_threshold");
+        cJSON *lth = cJSON_GetObjectItemCaseSensitive(cond, "low_threshold");
+        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
+        if (in_i) {
+            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
+            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
+        }
+        if (hth && cJSON_IsNumber(hth)) n->threshold = (float)hth->valuedouble;
+        if (lth && cJSON_IsNumber(lth)) n->threshold_b = (float)lth->valuedouble;
+    } else if (strcmp(type_str, "timer_on") == 0) {
+        n->type = COND_NODE_TIMER_ON;
+        cJSON *dms = cJSON_GetObjectItemCaseSensitive(cond, "delay_ms");
+        cJSON *dsec = cJSON_GetObjectItemCaseSensitive(cond, "delay_sec");
+        if (dms && cJSON_IsNumber(dms)) n->delay_ms = (uint32_t)dms->valueint;
+        else if (dsec && cJSON_IsNumber(dsec)) n->delay_ms = (uint32_t)(dsec->valuedouble * 1000.0);
+        else n->delay_ms = 1000;
+        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
+        if (ch && cJSON_IsObject(ch)) {
+            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
+            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
+        }
+    } else if (strcmp(type_str, "pulse_timer") == 0) {
+        n->type = COND_NODE_PULSE_TIMER;
+        cJSON *pms = cJSON_GetObjectItemCaseSensitive(cond, "pulse_ms");
+        cJSON *psec = cJSON_GetObjectItemCaseSensitive(cond, "pulse_sec");
+        if (pms && cJSON_IsNumber(pms)) n->delay_ms = (uint32_t)pms->valueint;
+        else if (psec && cJSON_IsNumber(psec)) n->delay_ms = (uint32_t)(psec->valuedouble * 1000.0);
+        else n->delay_ms = 3000;
+        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
+        if (ch && cJSON_IsObject(ch)) {
+            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
+            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
+        }
+    } else if (strcmp(type_str, "sr_latch") == 0) {
+        n->type = COND_NODE_SR_LATCH;
+        cJSON *prio = cJSON_GetObjectItemCaseSensitive(cond, "priority");
+        n->sr_priority = (prio && cJSON_IsString(prio) && strcmp(prio->valuestring, "set") == 0) ? 1 : 0;
+        cJSON *sc = cJSON_GetObjectItemCaseSensitive(cond, "set_condition");
+        if (sc && cJSON_IsObject(sc)) {
+            int8_t s_idx = Parse_Condition_Tree(sc, cfg);
+            if (s_idx >= 0) { n->children[0] = s_idx; n->child_count = 1; }
+        }
+        cJSON *rc = cJSON_GetObjectItemCaseSensitive(cond, "reset_condition");
+        if (rc && cJSON_IsObject(rc)) {
+            int8_t r_idx = Parse_Condition_Tree(rc, cfg);
+            if (r_idx >= 0) { n->children[1] = r_idx; n->child_count = 2; }
+        }
+    } else if (strcmp(type_str, "and") == 0 || strcmp(type_str, "or") == 0) {
+        n->type = (strcmp(type_str, "and") == 0) ? COND_NODE_AND : COND_NODE_OR;
+        cJSON *children = cJSON_GetObjectItemCaseSensitive(cond, "children");
+        if (children && cJSON_IsArray(children)) {
+            int sz = cJSON_GetArraySize(children);
+            for (int c = 0; c < sz && c < 4; c++) {
+                cJSON *ch_item = cJSON_GetArrayItem(children, c);
+                int8_t ch_idx = Parse_Condition_Tree(ch_item, cfg);
+                if (ch_idx >= 0) {
+                    n->children[n->child_count++] = ch_idx;
+                }
+            }
+        }
+    } else if (strcmp(type_str, "not") == 0) {
+        n->type = COND_NODE_NOT;
+        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
+        if (ch && cJSON_IsObject(ch)) {
+            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
+            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
+        }
+    } else if (strcmp(type_str, "sensor_state") == 0) {
+        n->type = COND_NODE_SENSOR_STATE;
+        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
+        if (in_i) {
+            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
+            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
+        }
+        n->op = 4; // != -999.0
+        n->threshold = -999.0f;
+    } else {
+        // Default: compare
+        n->type = COND_NODE_COMPARE;
+        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
+        cJSON *op_i = cJSON_GetObjectItemCaseSensitive(cond, "operator");
+        cJSON *th_i = cJSON_GetObjectItemCaseSensitive(cond, "threshold");
+        cJSON *cm_i = cJSON_GetObjectItemCaseSensitive(cond, "compare_mode");
+        cJSON *in_b_i = cJSON_GetObjectItemCaseSensitive(cond, "input_b_id");
+
+        if (in_i) {
+            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
+            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
+        }
+        n->op = (op_i && cJSON_IsString(op_i)) ? Parse_Op_String(op_i->valuestring) : 1; // Default '>'
+        n->threshold = (th_i && cJSON_IsNumber(th_i)) ? (float)th_i->valuedouble : 0.0f;
+
+        if (cm_i && cJSON_IsString(cm_i) && strcmp(cm_i->valuestring, "input") == 0) {
+            n->compare_mode = 1;
+            if (in_b_i) {
+                if (cJSON_IsString(in_b_i)) strncpy(n->input_b_id, in_b_i->valuestring, sizeof(n->input_b_id) - 1);
+                else if (cJSON_IsNumber(in_b_i)) snprintf(n->input_b_id, sizeof(n->input_b_id), "%d", in_b_i->valueint);
+            }
+        }
+    }
+
+    return node_idx;
+}
+
+static int8_t Parse_Action_Sequence(const cJSON *seq_obj, RuleConfig_t *cfg) {
+    if (!seq_obj || !cJSON_IsObject(seq_obj) || !cfg) return -1;
+    if (cfg->seq_count >= MAX_SEQUENCES) return -1;
+
+    int8_t s_idx = (int8_t)cfg->seq_count;
+    ActionSequence_t *seq = &cfg->sequences[s_idx];
+    memset(seq, 0, sizeof(ActionSequence_t));
+    seq->enabled = 1;
+
+    cJSON *m_item = cJSON_GetObjectItemCaseSensitive(seq_obj, "mode");
+    if (m_item && cJSON_IsString(m_item)) {
+        if (strcmp(m_item->valuestring, "loop") == 0) seq->mode = SEQ_MODE_LOOP;
+        else if (strcmp(m_item->valuestring, "count") == 0) seq->mode = SEQ_MODE_COUNT;
+        else seq->mode = SEQ_MODE_ONCE;
+    }
+    cJSON *of_item = cJSON_GetObjectItemCaseSensitive(seq_obj, "on_false");
+    if (of_item && cJSON_IsString(of_item)) {
+        if (strcmp(of_item->valuestring, "finish_cycle") == 0) seq->on_false = SEQ_ON_FALSE_FINISH_CYCLE;
+        else if (strcmp(of_item->valuestring, "hold") == 0) seq->on_false = SEQ_ON_FALSE_HOLD;
+        else seq->on_false = SEQ_ON_FALSE_ABORT_SAFE;
+    }
+    cJSON *rc_item = cJSON_GetObjectItemCaseSensitive(seq_obj, "repeat_count");
+    if (rc_item && cJSON_IsNumber(rc_item)) seq->repeat_count = (uint8_t)rc_item->valueint;
+
+    cJSON *steps_arr = cJSON_GetObjectItemCaseSensitive(seq_obj, "steps");
+    if (steps_arr && cJSON_IsArray(steps_arr)) {
+        int sz = cJSON_GetArraySize(steps_arr);
+        for (int s = 0; s < sz && s < MAX_SEQ_STEPS; s++) {
+            cJSON *st_item = cJSON_GetArrayItem(steps_arr, s);
+            if (st_item && cJSON_IsObject(st_item)) {
+                cJSON *act_i = cJSON_GetObjectItemCaseSensitive(st_item, "action");
+                cJSON *val_i = cJSON_GetObjectItemCaseSensitive(st_item, "value");
+                cJSON *hold_i = cJSON_GetObjectItemCaseSensitive(st_item, "hold_ms");
+                cJSON *hold_sec = cJSON_GetObjectItemCaseSensitive(st_item, "hold_sec");
+
+                SeqStep_t *st = &seq->steps[seq->step_count++];
+                if (act_i && cJSON_IsString(act_i)) strncpy(st->action, act_i->valuestring, sizeof(st->action) - 1);
+                if (val_i && cJSON_IsNumber(val_i)) st->value = (float)val_i->valuedouble;
+                if (hold_i && cJSON_IsNumber(hold_i)) st->hold_ms = (uint32_t)hold_i->valueint;
+                else if (hold_sec && cJSON_IsNumber(hold_sec)) st->hold_ms = (uint32_t)(hold_sec->valuedouble * 1000.0);
+                else st->hold_ms = 1000;
+            }
+        }
+    }
+
+    if (seq->step_count > 0) {
+        cfg->seq_count++;
+        return s_idx;
+    }
+    return -1;
+}
+
+static int JSON_SerializeCondNode(char *buf, size_t buflen, const RuleConfig_t *cfg, int8_t node_idx) {
+    if (!cfg || node_idx < 0 || node_idx >= cfg->cond_node_count) {
+        return snprintf(buf, buflen, "null");
+    }
+    const CondNode_t *n = &cfg->cond_nodes[node_idx];
+    char in_id_buf[32];
+    char in_b_id_buf[32];
+    JSON_FormatId(in_id_buf, sizeof(in_id_buf), n->input_id);
+    JSON_FormatId(in_b_id_buf, sizeof(in_b_id_buf), n->input_b_id);
+
+    int pos = 0;
+    if (n->type == COND_NODE_RANGE) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"range\",\"input_id\":%s,\"min\":%.2f,\"max\":%.2f,\"mode\":\"%s\"",
+            in_id_buf, n->threshold, n->threshold_b, n->range_mode ? "outside" : "inside");
+        if (n->child_count > 0 && n->children[0] >= 0) {
+            pos += snprintf(buf + pos, buflen - pos, ",\"child\":");
+            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+        }
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    } else if (n->type == COND_NODE_TIMER_ON) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"timer_on\",\"delay_ms\":%lu,\"delay_sec\":%.2f",
+            (unsigned long)n->delay_ms, (float)n->delay_ms / 1000.0f);
+        if (n->child_count > 0 && n->children[0] >= 0) {
+            pos += snprintf(buf + pos, buflen - pos, ",\"child\":");
+            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+        }
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    } else if (n->type == COND_NODE_PULSE_TIMER) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"pulse_timer\",\"pulse_ms\":%lu,\"pulse_sec\":%.2f",
+            (unsigned long)n->delay_ms, (float)n->delay_ms / 1000.0f);
+        if (n->child_count > 0 && n->children[0] >= 0) {
+            pos += snprintf(buf + pos, buflen - pos, ",\"child\":");
+            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+        }
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    } else if (n->type == COND_NODE_HYSTERESIS) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"hysteresis\",\"input_id\":%s,\"high_threshold\":%.2f,\"low_threshold\":%.2f}",
+            in_id_buf, n->threshold, n->threshold_b);
+    } else if (n->type == COND_NODE_SR_LATCH) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"sr_latch\",\"priority\":\"%s\"", n->sr_priority ? "set" : "reset");
+        if (n->children[0] >= 0) {
+            pos += snprintf(buf + pos, buflen - pos, ",\"set_condition\":");
+            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+        }
+        if (n->children[1] >= 0) {
+            pos += snprintf(buf + pos, buflen - pos, ",\"reset_condition\":");
+            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[1]);
+        }
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    } else if (n->type == COND_NODE_AND || n->type == COND_NODE_OR) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"%s\",\"children\":[", (n->type == COND_NODE_AND) ? "and" : "or");
+        for (uint8_t c = 0; c < n->child_count; c++) {
+            if (c > 0) pos += snprintf(buf + pos, buflen - pos, ",");
+            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[c]);
+        }
+        pos += snprintf(buf + pos, buflen - pos, "]}");
+    } else if (n->type == COND_NODE_NOT) {
+        pos += snprintf(buf + pos, buflen - pos, "{\"type\":\"not\",\"child\":");
+        pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    } else if (n->type == COND_NODE_SENSOR_STATE) {
+        pos += snprintf(buf + pos, buflen - pos, "{\"type\":\"sensor_state\",\"input_id\":%s}", in_id_buf);
+    } else {
+        const char *op_str = ">";
+        if (n->op == 2) op_str = "<";
+        else if (n->op == 3) op_str = "==";
+        else if (n->op == 4) op_str = "!=";
+        else if (n->op == 5) op_str = ">=";
+        else if (n->op == 6) op_str = "<=";
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f",
+            n->compare_mode ? "input" : "constant", in_id_buf, op_str, n->threshold);
+        if (n->compare_mode == 1 && n->input_b_id[0] != '\0')
+            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    }
+    return pos;
+}
+
+static int JSON_SerializeSequence(char *buf, size_t buflen, const ActionSequence_t *seq) {
+    if (!seq || !seq->enabled) return 0;
+    const char *mode_str = "once";
+    if (seq->mode == SEQ_MODE_LOOP) mode_str = "loop";
+    else if (seq->mode == SEQ_MODE_COUNT) mode_str = "count";
+
+    const char *of_str = "abort_safe";
+    if (seq->on_false == SEQ_ON_FALSE_FINISH_CYCLE) of_str = "finish_cycle";
+    else if (seq->on_false == SEQ_ON_FALSE_HOLD) of_str = "hold";
+
+    int pos = 0;
+    pos += snprintf(buf + pos, buflen - pos,
+        "\"sequence\":{\"mode\":\"%s\",\"on_false\":\"%s\",\"repeat_count\":%u,\"steps\":[",
+        mode_str, of_str, (unsigned)seq->repeat_count);
+
+    for (uint8_t s = 0; s < seq->step_count; s++) {
+        const SeqStep_t *st = &seq->steps[s];
+        pos += snprintf(buf + pos, buflen - pos,
+            "%s{\"action\":\"%s\",\"value\":%.2f,\"hold_ms\":%lu}",
+            (s == 0) ? "" : ",", st->action, st->value, (unsigned long)st->hold_ms);
+    }
+    pos += snprintf(buf + pos, buflen - pos, "]},");
+    return pos;
+}
+
+static int JSON_SerializeRule(char *buf, size_t buflen, const Rule_t *r, const RuleConfig_t *cfg, uint8_t is_first) {
+    char out_id_buf[32];
+    char in_id_buf[32];
+    char in_b_id_buf[32];
+    JSON_FormatId(out_id_buf, sizeof(out_id_buf), r->output_id);
+    JSON_FormatId(in_id_buf, sizeof(in_id_buf), r->input_id);
+    JSON_FormatId(in_b_id_buf, sizeof(in_b_id_buf), r->input_b_id);
+
+    int pos = 0;
+    /* Common fields */
+    pos += snprintf(buf + pos, buflen - pos,
+        "%s{\"rule_id\":\"%s\",\"output_id\":%s,\"action\":\"%s\",\"active\":%u,"
+        "\"actuator_type\":%u,\"auto_reverse\":%s,\"priority\":%u,",
+        is_first ? "" : ",",
+        r->rule_id, out_id_buf, r->action, r->active,
+        r->actuator_type, r->auto_reverse ? "true" : "false", (unsigned)r->priority);
+
+    /* Serialize sequence if present */
+    if (cfg && r->sequence_idx >= 0 && r->sequence_idx < cfg->seq_count) {
+        pos += JSON_SerializeSequence(buf + pos, buflen - pos, &cfg->sequences[r->sequence_idx]);
+    }
+
+    /* Actuator params */
+    if (r->actuator_type == ACTUATOR_TYPE_PWM) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"value\":%.2f,\"params\":{\"duty\":%.2f,\"frequency\":%lu},",
+            r->action_value, r->action_value, (unsigned long)r->action_frequency);
+    } else if (r->actuator_type == ACTUATOR_TYPE_PTO) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"params\":{\"steps\":%ld,\"frequency\":%lu,\"direction\":\"%s\"},",
+            (long)r->action_steps, (unsigned long)r->action_frequency,
+            r->action_direction ? "CCW" : "CW");
+    } else if (r->actuator_type == ACTUATOR_TYPE_ANALOG_MA) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"value\":%.2f,\"params\":{\"current_ma\":%.2f},", r->action_value, r->action_value);
+    } else if (r->actuator_type == ACTUATOR_TYPE_ANALOG_V) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"value\":%.2f,\"params\":{\"voltage_v\":%.2f},", r->action_value, r->action_value);
+    } else {
+        pos += snprintf(buf + pos, buflen - pos, "\"params\":{},");
+    }
+
+    /* Serialize condition: use tree node if configured, else fallback to flat condition */
+    if (cfg && r->root_node >= 0 && r->root_node < cfg->cond_node_count) {
+        pos += snprintf(buf + pos, buflen - pos, "\"condition\":");
+        pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, r->root_node);
+    } else if (r->condition_type == COND_TYPE_HYSTERESIS) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"condition\":{\"type\":\"hysteresis\",\"input_id\":%s,"
+            "\"high_threshold\":%.2f,\"low_threshold\":%.2f}",
+            in_id_buf, r->high_threshold, r->low_threshold);
+    } else if (r->condition_type == COND_TYPE_RANGE) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"condition\":{\"type\":\"range\",\"input_id\":%s,"
+            "\"min\":%.2f,\"max\":%.2f,\"mode\":\"%s\"}",
+            in_id_buf, r->min_threshold, r->max_threshold,
+            r->range_mode ? "outside" : "inside");
+    } else if (r->condition_type == COND_TYPE_TIMER_ON) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"condition\":{\"type\":\"timer_on\",\"delay_ms\":%lu,\"delay_sec\":%.2f,"
+            "\"child\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
+            "\"operator\":\"%s\",\"threshold\":%.2f",
+            (unsigned long)r->delay_ms, (float)r->delay_ms / 1000.0f,
+            r->compare_mode ? "input" : "constant", in_id_buf, r->operator, r->threshold);
+        if (r->compare_mode == 1 && r->input_b_id[0] != '\0')
+            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos += snprintf(buf + pos, buflen - pos, "}}");
+    } else if (r->condition_type == COND_TYPE_PULSE_TIMER) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"condition\":{\"type\":\"pulse_timer\",\"pulse_ms\":%lu,\"pulse_sec\":%.2f,"
+            "\"child\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
+            "\"operator\":\"%s\",\"threshold\":%.2f",
+            (unsigned long)r->delay_ms, (float)r->delay_ms / 1000.0f,
+            r->compare_mode ? "input" : "constant", in_id_buf, r->operator, r->threshold);
+        if (r->compare_mode == 1 && r->input_b_id[0] != '\0')
+            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos += snprintf(buf + pos, buflen - pos, "}}");
+    } else if (r->condition_type == COND_TYPE_SR_LATCH) {
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"condition\":{\"type\":\"sr_latch\",\"priority\":\"%s\","
+            "\"set_condition\":{\"type\":\"compare\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f},"
+            "\"reset_condition\":{\"type\":\"compare\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f}}",
+            r->sr_priority ? "set" : "reset",
+            in_id_buf, r->operator, r->threshold,
+            in_b_id_buf, "!=", -999.0f);
+    } else {
+        /* Standard compare or sensor-to-sensor */
+        pos += snprintf(buf + pos, buflen - pos,
+            "\"condition\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
+            "\"operator\":\"%s\",\"threshold\":%.2f",
+            r->compare_mode ? "input" : "constant", in_id_buf, r->operator, r->threshold);
+        if (r->compare_mode == 1 && r->input_b_id[0] != '\0')
+            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos += snprintf(buf + pos, buflen - pos, "}");
+    }
+
+    pos += snprintf(buf + pos, buflen - pos, "}");
+    return pos;
 }
 
 #include "sdcard.h"
@@ -447,17 +874,6 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
 
-    /* --- pto live status --- */
-    pos += snprintf(buf + pos, buflen - pos, "\"pto\":[");
-    for (uint8_t p = 0; p < PTO_GetChannelCount() && p < MAX_PTO_CHANNELS; p++) {
-        const PTO_Channel_Status_t *st = PTO_GetStatus(p);
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"position\":%ld,\"moving\":%u}%s",
-            (long)(st ? st->position : 0), (st ? st->moving : 0),
-            (p < PTO_GetChannelCount() - 1) ? "," : "");
-    }
-    pos += snprintf(buf + pos, buflen - pos, "],");
-
     /* --- actuators (dynamic) --- */
     pos += snprintf(buf + pos, buflen - pos, "\"relays\":[");
     for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
@@ -525,7 +941,7 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     uint8_t has_pending = 0;
     char pending_ver[36] = {0};
     char active_ver[36] = {0};
-    if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
+    if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
         has_pending = hasPendingRules;
         strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
         strncpy(active_ver, activeRules.version_id, sizeof(active_ver) - 1);
@@ -541,17 +957,21 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"model\":\"KX-F407\","
         "\"test_mode\":%u,"
         "\"rules_version_id\":\"%s\","
+        "\"activeVersionId\":\"%s\","
         ,
         (unsigned long)g_uptime_seconds,
         s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
         (unsigned long)s_cfg.serial,
         s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
         s_cfg.test_mode,
+        active_ver[0] ? active_ver : "default",
         active_ver[0] ? active_ver : "default");
 
     pos += snprintf(buf + pos, buflen - pos,
         "\"sparkplug_topic\":\"%s\","
         "\"pending_sparkplug_topic\":\"%s\","
+        "\"sparkplug_edge_node_id\":\"%s\","
+        "\"sparkplug_device_id\":\"%s\","
         "\"provision_status\":\"%s\","
         "\"provision_message\":\"%s\","
         "\"mqtt\":{"
@@ -570,6 +990,8 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         "\"log\":[",
         s_cfg.sparkplug_topic,
         s_cfg.pending_sparkplug_topic,
+        s_cfg.sparkplug_edge_node_id,
+        s_cfg.sparkplug_device_id,
         s_cfg.provision_status[0] ? s_cfg.provision_status : "Active",
         s_cfg.provision_message,
         g_mqtt_status.connected,
@@ -593,16 +1015,22 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         }
     }
     uint8_t emitted_log = 0;
-    for (uint8_t i = 0; i < g_mqtt_status.log_count && i < MQTT_LOG_MAX; i++) {
-        if (buflen - pos < 4096) break;
+    uint8_t max_logs_to_send = (g_mqtt_status.log_count > MQTT_LOG_MAX) ? MQTT_LOG_MAX : g_mqtt_status.log_count;
+    for (uint8_t i = 0; i < max_logs_to_send && i < MQTT_LOG_MAX; i++) {
+        if (buflen - pos < 600) break;
         if (g_mqtt_status.log[i].topic[0] == '\0') continue;
-        static char clean_payload[2560] __attribute__((section(".ccmram")));
+        static char clean_payload[384] __attribute__((section(".ccmram")));
         uint32_t cpos = 0;
         const char *raw = (const char *)g_mqtt_status.log[i].payload;
-        while (*raw && cpos < sizeof(clean_payload) - 4) {
+        while (*raw && cpos < sizeof(clean_payload) - 8) {
             char ch = *raw++;
             if (ch == '"' || ch == '\\') clean_payload[cpos++] = '\\';
             clean_payload[cpos++] = ((unsigned char)ch < 32 || (unsigned char)ch > 126) ? ' ' : ch;
+        }
+        if (*raw != '\0' && cpos < sizeof(clean_payload) - 4) {
+            clean_payload[cpos++] = '.';
+            clean_payload[cpos++] = '.';
+            clean_payload[cpos++] = '.';
         }
         clean_payload[cpos] = '\0';
 
@@ -648,8 +1076,9 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     pos += JSON_Analog_Object(buf + pos, buflen - pos);
     pos += snprintf(buf + pos, buflen - pos, "}");
 
-    if (pos >= buflen) {
-        pos = buflen - 1;
+    if (pos >= buflen - 2) {
+        pos = buflen - 2;
+        buf[pos++] = '}';
         buf[pos] = '\0';
     }
 
@@ -751,9 +1180,9 @@ static int Is_Pin_Reserved(uint8_t port, uint8_t pin) {
     if (port == 0) {
         if (pin == 6 || pin == 9 || pin == 10) return 1;
     }
-    /* PB10, PB11: USART3 Modbus, PB12..PB15: SPI2 Ethernet */
+    /* PB0: W25Q16 CS, PB3..PB5: SPI1 Flash, PB10, PB11: USART3 Modbus, PB12..PB15: SPI2 Ethernet */
     if (port == 1) {
-        if (pin == 10 || pin == 11 || pin == 12 || pin == 13 || pin == 14 || pin == 15) return 1;
+        if (pin == 0 || pin == 3 || pin == 4 || pin == 5 || pin == 10 || pin == 11 || pin >= 12) return 1;
     }
     /* PC6/PC7: USART6 debug console */
     if (port == 2) {
@@ -823,7 +1252,7 @@ static uint8_t Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
             busy_retries = 0;
             osDelay(1);   /* 1ms yield between successful chunk writes to prevent SPI lock starvation */
         } else if (result == SOCK_BUSY) {
-            if (++busy_retries > 500) {
+            if (++busy_retries > 2000) {
                 printf("[HTTP] Send_Chunked: socket busy timeout at %lu/%lu bytes\r\n", (unsigned long)sent, (unsigned long)total);
                 return 0;
             }
@@ -1132,12 +1561,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         if (new_u[0] != '\0') {
             strncpy(s_http_cfg_temp.admin_username, new_u, sizeof(s_http_cfg_temp.admin_username) - 1);
+            s_http_cfg_temp.admin_username[sizeof(s_http_cfg_temp.admin_username) - 1] = '\0';
         }
         if (new_p[0] != '\0') {
             strncpy(s_http_cfg_temp.admin_password, new_p, sizeof(s_http_cfg_temp.admin_password) - 1);
+            s_http_cfg_temp.admin_password[sizeof(s_http_cfg_temp.admin_password) - 1] = '\0';
         }
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
+        Update_Shared_Config(&s_http_cfg_temp);
         Safe_Write_Config_To_Flash(&s_http_cfg_temp, "admin_auth");
+        Generate_Session_Token(s_session_token, sizeof(s_session_token));
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         Log_Event("AUTH", "Admin credentials updated");
         return;
@@ -1161,19 +1594,20 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * Protected API Gatekeeper:
      * Restrict sensitive configuration writes & firmware updates to authenticated sessions.
      * Note: POST /api/provision is exempt so mobile onboarding/provisioning can configure MQTT.
+     * Note: POST /api/rules is TEMPORARILY exempt for desktop configurator uploads.
+     *       TODO: Re-enable auth for /api/rules once configurator sends session tokens.
      * ----------------------------------------------------------------- */
     if ((strncmp(line, "POST /api/config/", 17) == 0 && strncmp(line, "POST /api/config/provision", 26) != 0) ||
         strncmp(line, "POST /api/auth/change_password", 30) == 0 ||
         strncmp(line, "POST /api/relay", 15) == 0 ||
-        strncmp(line, "POST /api/rules", 15) == 0 ||
+        /* strncmp(line, "POST /api/rules", 15) == 0 || */  /* TEMPORARILY DISABLED — configurator auth bypass */
         strncmp(line, "POST /api/pto", 13) == 0 ||
         strncmp(line, "POST /api/pwm", 13) == 0 ||
         strncmp(line, "POST /api/analog", 16) == 0 ||
         strncmp(line, "POST /api/modbus", 16) == 0 ||
         strncmp(line, "POST /api/provision/delete", 26) == 0 ||
         strncmp(line, "POST /api/provision/manual", 26) == 0 ||
-        strncmp(line, "POST /api/queue/clear", 21) == 0 ||
-        strncmp(line, "POST /update", 12) == 0) {
+        strncmp(line, "POST /api/queue/clear", 21) == 0) {
         if (!Is_Session_Valid(line)) {
             Send_Response(sn, HTTP_401, NULL);
             return;
@@ -1444,36 +1878,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * GET /api/rules/history  → List historical rule versions (CORS)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/rules/history", 22) == 0) {
-        RuleConfig_t temp_rules;
-        
-        int pos = 0;
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "[");
-        uint8_t added = 0;
-        char prim_version[36] = {0};
-
-        // Read Primary
-        W25Q_Read(RULES_PRIMARY_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
-        uint32_t prim_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
-        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == prim_crc) {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
-                temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
-            strncpy(prim_version, temp_rules.version_id, sizeof(prim_version) - 1);
-            added = 1;
+        char cur_ver[36] = {0};
+        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            strncpy(cur_ver, activeRules.version_id, sizeof(cur_ver) - 1);
+            osMutexRelease(rulesMutex);
         }
-
-        // Read Backup
-        W25Q_Read(RULES_BACKUP_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
-        uint32_t back_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
-        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == back_crc) {
-            if (!added || strcmp(prim_version, temp_rules.version_id) != 0) {
-                pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                    "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
-                    added ? "," : "",
-                    temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
-            }
-        }
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]");
+        int pos = Partition_FormatRulesHistoryJSON(tx_buf, sizeof(tx_buf), cur_ver);
 
         char hist_hdr[320];
         snprintf(hist_hdr, sizeof(hist_hdr),
@@ -1496,19 +1906,32 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * GET /api/rules  → Get currently active rules from RAM (CORS)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/rules ", 14) == 0 || strncmp(line, "GET /api/rules?", 15) == 0) {
+        char req_ver[36] = {0};
+        ParseQueryStringParam(line, "version", req_ver, sizeof(req_ver));
+
         RuleConfig_t current_rules;
         memset(&current_rules, 0, sizeof(RuleConfig_t));
-        if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
-            current_rules = activeRules;
-            osMutexRelease(rulesMutex);
-        }
-
         uint8_t has_pending = 0;
         char pending_ver[36] = {0};
-        if (rulesMutex && osMutexAcquire(rulesMutex, 0) == osOK) {
-            has_pending = hasPendingRules;
-            strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
-            osMutexRelease(rulesMutex);
+
+        if (req_ver[0] != '\0') {
+            static char s_req_layout[3000] __attribute__((section(".ccmram")));
+            memset(s_req_layout, 0, sizeof(s_req_layout));
+            if (!Partition_LoadArchivedRules(req_ver, &current_rules, s_req_layout, sizeof(s_req_layout))) {
+                if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                    current_rules = activeRules;
+                    has_pending = hasPendingRules;
+                    strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+                    osMutexRelease(rulesMutex);
+                }
+            }
+        } else {
+            if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                current_rules = activeRules;
+                has_pending = hasPendingRules;
+                strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+                osMutexRelease(rulesMutex);
+            }
         }
 
         int pos = 0;
@@ -1518,44 +1941,27 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             has_pending, pending_ver);
         
         for (uint32_t i = 0; i < current_rules.rule_count; i++) {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "%s{\"rule_id\":\"%s\",\"input_id\":\"%s\",\"operator\":\"%s\",\"threshold\":%.2f,\"output_id\":\"%s\",\"action\":\"%s\",\"active\":%u}",
-                (i > 0) ? "," : "",
-                current_rules.rules[i].rule_id,
-                current_rules.rules[i].input_id,
-                current_rules.rules[i].operator,
-                current_rules.rules[i].threshold,
-                current_rules.rules[i].output_id,
-                current_rules.rules[i].action,
-                current_rules.rules[i].active);
+            const Rule_t *r = &current_rules.rules[i];
+            pos += JSON_SerializeRule(tx_buf + pos, sizeof(tx_buf) - pos, r, &current_rules, (i == 0));
         }
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "],\"history\":[");
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "],\"history\":");
 
-        RuleConfig_t temp_rules;
-        uint8_t hist_added = 0;
-        char prim_version[36] = {0};
+        pos += Partition_FormatRulesHistoryJSON(tx_buf + pos, sizeof(tx_buf) - pos, current_rules.version_id);
 
-        W25Q_Read(RULES_PRIMARY_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
-        uint32_t prim_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
-        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == prim_crc) {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
-                temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
-            strncpy(prim_version, temp_rules.version_id, sizeof(prim_version) - 1);
-            hist_added = 1;
-        }
-
-        W25Q_Read(RULES_BACKUP_ADDR, (uint8_t *)&temp_rules, sizeof(RuleConfig_t));
-        uint32_t back_crc = Compute_CRC32((const uint8_t *)&temp_rules, offsetof(RuleConfig_t, checksum));
-        if (temp_rules.magic == RULES_MAGIC_CURRENT && temp_rules.checksum == back_crc) {
-            if (!hist_added || strcmp(prim_version, temp_rules.version_id) != 0) {
-                pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                    "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%u}",
-                    hist_added ? "," : "",
-                    temp_rules.version_id, temp_rules.timestamp, (unsigned)temp_rules.rule_count);
+        /* Append canvas layout blob if one was saved by the desktop configurator.
+           The layout is stored as raw JSON so we splice it directly into the response. */
+        {
+            static const char layout_key[] = ",\"layout\":";
+            uint32_t key_len = sizeof(layout_key) - 1; /* 10 */
+            uint32_t remaining = (uint32_t)(sizeof(tx_buf) - pos - key_len - 2);
+            uint32_t layout_len = Partition_LoadLayout(tx_buf + pos + key_len, remaining);
+            if (layout_len > 0) {
+                memcpy(tx_buf + pos, layout_key, key_len);
+                pos += key_len + layout_len;
             }
         }
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+
+        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "}");
 
         char rules_hdr[320];
         snprintf(rules_hdr, sizeof(rules_hdr),
@@ -1571,6 +1977,54 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             pos);
         send(sn, (uint8_t *)rules_hdr, (uint16_t)strlen(rules_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/layout  → Get canvas layout blob from flash (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/layout", 15) == 0) {
+        uint32_t layout_len = Partition_LoadLayout(tx_buf, sizeof(tx_buf) - 1);
+        if (layout_len == 0) {
+            static const char empty_layout[] = "{\"nodes\":[],\"connections\":[]}";
+            memcpy(tx_buf, empty_layout, sizeof(empty_layout));
+            layout_len = sizeof(empty_layout) - 1;
+        }
+
+        char hdr[320];
+        snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %lu\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            (unsigned long)layout_len);
+        send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, layout_len);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/layout  → Save canvas layout blob directly to flash (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/layout", 16) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) {
+            Send_Response(sn, HTTP_400, "{\"status\":\"error\",\"error\":\"No body\"}");
+            return;
+        }
+        body += 4;
+        uint32_t body_len = (uint32_t)strlen(body);
+        if (body_len > 0) {
+            Partition_SaveLayout(body, body_len);
+            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"ok\"}");
+        } else {
+            Send_Response(sn, HTTP_400, "{\"status\":\"error\",\"error\":\"Empty layout\"}");
+        }
         return;
     }
 
@@ -1680,16 +2134,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 pending_snap.version_id, pending_snap.timestamp, pending_snap.bypass_validation);
             
             for (uint32_t i = 0; i < pending_snap.rule_count; i++) {
-                pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                    "%s{\"rule_id\":\"%s\",\"input_id\":\"%s\",\"operator\":\"%s\",\"threshold\":%.2f,\"output_id\":\"%s\",\"action\":\"%s\",\"active\":%u}",
-                    (i > 0) ? "," : "",
-                    pending_snap.rules[i].rule_id,
-                    pending_snap.rules[i].input_id,
-                    pending_snap.rules[i].operator,
-                    pending_snap.rules[i].threshold,
-                    pending_snap.rules[i].output_id,
-                    pending_snap.rules[i].action,
-                    pending_snap.rules[i].active);
+                const Rule_t *r = &pending_snap.rules[i];
+                pos += JSON_SerializeRule(tx_buf + pos, sizeof(tx_buf) - pos, r, &pending_snap, (i == 0));
             }
             pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
         } else {
@@ -1750,9 +2196,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 osMutexRelease(rulesMutex);
             }
 
+            // Archive to persistent history (SD Card / Flash) along with current layout
+            {
+                static char s_arch_layout[3000] __attribute__((section(".ccmram")));
+                uint32_t ll = Partition_LoadLayout(s_arch_layout, sizeof(s_arch_layout));
+                Partition_ArchiveRules(&newRules, ll > 0 ? s_arch_layout : NULL, ll);
+            }
+
             char accept_log[128];
             snprintf(accept_log, sizeof(accept_log), "Pending rules version %s ACCEPTED and applied.", newRules.version_id);
             Log_Event("SYS", accept_log);
+            ControlEngine_ResetStates();
 
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         } else {
@@ -1807,8 +2261,68 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             
             osMutexRelease(rulesMutex);
         }
+        ControlEngine_ResetStates();
         Log_Event("SYS", "All active and pending controller rules cleared.");
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/rules/rollback  → Rollback to an archived version (CORS)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/rules/rollback", 24) == 0) {
+        char target_ver[36] = {0};
+        ParseQueryStringParam(line, "version", target_ver, sizeof(target_ver));
+
+        char *body = strstr(line, "\r\n\r\n");
+        if (body && target_ver[0] == '\0') {
+            body += 4;
+            char *v_key = strstr(body, "\"version_id\"");
+            if (!v_key) v_key = strstr(body, "\"version\"");
+            if (v_key) {
+                char *colon = strchr(v_key, ':');
+                if (colon) {
+                    char *q1 = strchr(colon, '"');
+                    if (q1) {
+                        char *q2 = strchr(q1 + 1, '"');
+                        if (q2 && (q2 - q1 - 1) < (int)sizeof(target_ver)) {
+                            strncpy(target_ver, q1 + 1, q2 - q1 - 1);
+                            target_ver[q2 - q1 - 1] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+
+        if (target_ver[0] == '\0') {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Missing version parameter\"}");
+            return;
+        }
+
+        RuleConfig_t rolledRules;
+        memset(&rolledRules, 0, sizeof(rolledRules));
+        if (Partition_RollbackRules(target_ver, &rolledRules)) {
+            if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                activeRules = rolledRules;
+                hasPendingRules = 0;
+                memset(&pendingRules, 0, sizeof(RuleConfig_t));
+                osMutexRelease(rulesMutex);
+            }
+            ControlEngine_ResetStates();
+            char r_log[128];
+            snprintf(r_log, sizeof(r_log), "Rules rolled back to version %s successfully.", target_ver);
+            Log_Event("SYS", r_log);
+
+            char ok_body[160];
+            snprintf(ok_body, sizeof(ok_body),
+                     "{\"ok\":true,\"status\":\"rolled_back\",\"version_id\":\"%s\"}", target_ver);
+            Send_Response(sn, HTTP_200_JSON, ok_body);
+        } else {
+            char err_body[160];
+            snprintf(err_body, sizeof(err_body),
+                     "{\"ok\":false,\"error\":\"Version '%s' not found in archives\"}", target_ver);
+            Send_Response(sn, HTTP_200_JSON, err_body);
+        }
         return;
     }
 
@@ -1823,21 +2337,69 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         body += 4;
 
+        /* If payload contains "layout":{...}, extract and save it directly to flash
+           WITHOUT parsing it in cJSON to avoid exhausting the tiny FreeRTOS heap.
+           Then replace the layout object with null in-place so cJSON_Parse sees a tiny object. */
+        char *lkey = strstr(body, "\"layout\"");
+        if (lkey) {
+            char *colon = strchr(lkey, ':');
+            if (colon) {
+                char *brace = strchr(colon, '{');
+                if (brace) {
+                    int depth = 1;
+                    char *p = brace + 1;
+                    while (*p && depth > 0) {
+                        if (*p == '{') depth++;
+                        else if (*p == '}') depth--;
+                        else if (*p == '"') {
+                            p++;
+                            while (*p && *p != '"') {
+                                if (*p == '\\' && *(p + 1)) p += 2;
+                                else p++;
+                            }
+                            if (!*p) break;
+                        }
+                        if (depth == 0) break;
+                        p++;
+                    }
+                    if (depth == 0) {
+                        uint32_t layout_bytes = (uint32_t)(p - brace + 1);
+                        Partition_SaveLayout(brace, layout_bytes);
+                        /* Replace '{...}' with 'null       ' in place */
+                        brace[0] = 'n';
+                        brace[1] = 'u';
+                        brace[2] = 'l';
+                        brace[3] = 'l';
+                        for (char *pad = brace + 4; pad <= p; pad++) {
+                            *pad = ' ';
+                        }
+                    }
+                }
+            }
+        }
+
         cJSON *root = cJSON_Parse(body);
         if (!root) {
             Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Invalid JSON syntax\"}");
             return;
         }
 
-        cJSON *version_item = cJSON_GetObjectItemCaseSensitive(root, "version_id");
-        cJSON *timestamp_item = cJSON_GetObjectItemCaseSensitive(root, "timestamp");
-        cJSON *rules_arr = cJSON_GetObjectItemCaseSensitive(root, "rules");
+        /* Accept both wrapped {"version_id","timestamp","rules":[...]} and bare array [...] */
+        cJSON *version_item = NULL;
+        cJSON *timestamp_item = NULL;
+        cJSON *rules_arr = NULL;
 
-        if (!version_item || !cJSON_IsString(version_item) ||
-            !timestamp_item || !cJSON_IsString(timestamp_item) ||
-            !rules_arr || !cJSON_IsArray(rules_arr)) {
+        if (cJSON_IsArray(root)) {
+            rules_arr = root;
+        } else {
+            version_item = cJSON_GetObjectItemCaseSensitive(root, "version_id");
+            timestamp_item = cJSON_GetObjectItemCaseSensitive(root, "timestamp");
+            rules_arr = cJSON_GetObjectItemCaseSensitive(root, "rules");
+        }
+
+        if (!rules_arr || !cJSON_IsArray(rules_arr)) {
             cJSON_Delete(root);
-            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Missing version_id, timestamp, or rules array\"}");
+            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Missing rules array\"}");
             return;
         }
 
@@ -1849,12 +2411,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             return;
         }
 
-        // Allocate temporary structure on the stack
-        RuleConfig_t tempRules;
+        // Use s_tempRules located in CCMRAM to avoid stack or BSS overflow
+        #define tempRules s_tempRules
         memset(&tempRules, 0, sizeof(tempRules));
         tempRules.magic = RULES_MAGIC_CURRENT;
-        strncpy(tempRules.version_id, version_item->valuestring, sizeof(tempRules.version_id) - 1);
-        strncpy(tempRules.timestamp, timestamp_item->valuestring, sizeof(tempRules.timestamp) - 1);
+        if (version_item && cJSON_IsString(version_item))
+            strncpy(tempRules.version_id, version_item->valuestring, sizeof(tempRules.version_id) - 1);
+        else
+            snprintf(tempRules.version_id, sizeof(tempRules.version_id), "auto_%lu", (unsigned long)osKernelGetTickCount());
+        if (timestamp_item && cJSON_IsString(timestamp_item))
+            strncpy(tempRules.timestamp, timestamp_item->valuestring, sizeof(tempRules.timestamp) - 1);
+        else
+            strncpy(tempRules.timestamp, "auto-generated", sizeof(tempRules.timestamp) - 1);
         tempRules.rule_count = 0;
         tempRules.rules_valid = 0; // Starts unvalidated
 
@@ -1873,16 +2441,48 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cJSON *out_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "output_id");
             cJSON *act = cJSON_GetObjectItemCaseSensitive(rule_obj, "action");
 
+            /* If rule uses nested "condition" object, walk the tree to extract flat fields.
+               Searches condition → child → set_condition → children[0] recursively for input_id/operator/threshold. */
+            cJSON *cond = cJSON_GetObjectItemCaseSensitive(rule_obj, "condition");
+            if (cond && cJSON_IsObject(cond)) {
+                cJSON *walk = cond;
+                for (int depth = 0; depth < 5 && walk; depth++) {
+                    if (!in_id)  in_id  = cJSON_GetObjectItemCaseSensitive(walk, "input_id");
+                    if (!op)     op     = cJSON_GetObjectItemCaseSensitive(walk, "operator");
+                    if (!thresh) thresh = cJSON_GetObjectItemCaseSensitive(walk, "threshold");
+                    if (in_id && op && thresh) break;
+                    /* Descend into "set_condition", "child", or first element of "children" */
+                    cJSON *set_c = cJSON_GetObjectItemCaseSensitive(walk, "set_condition");
+                    if (set_c && cJSON_IsObject(set_c)) { walk = set_c; continue; }
+                    cJSON *child = cJSON_GetObjectItemCaseSensitive(walk, "child");
+                    if (child && cJSON_IsObject(child)) { walk = child; continue; }
+                    cJSON *children = cJSON_GetObjectItemCaseSensitive(walk, "children");
+                    if (children && cJSON_IsArray(children) && cJSON_GetArraySize(children) > 0) {
+                        walk = cJSON_GetArrayItem(children, 0);
+                        continue;
+                    }
+                    break;
+                }
+                /* For sensor_state / AND / OR without operator, default to != -999 (always true when sensor online) */
+                if (in_id && !op) {
+                    static cJSON default_op;
+                    default_op.type = cJSON_String;
+                    default_op.valuestring = "!=";
+                    op = &default_op;
+                }
+            }
+
             if (!r_id || !cJSON_IsString(r_id) ||
                 !in_id || (!cJSON_IsString(in_id) && !cJSON_IsNumber(in_id)) ||
                 !op || !cJSON_IsString(op) ||
-                !thresh || !cJSON_IsNumber(thresh) ||
                 !out_id || (!cJSON_IsString(out_id) && !cJSON_IsNumber(out_id)) ||
                 !act || !cJSON_IsString(act)) {
                 cJSON_Delete(root);
                 Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule field missing or invalid type\"}");
                 return;
             }
+
+            /* threshold is optional for condition-based rules (default 0) */
 
             strncpy(tempRules.rules[i].rule_id, r_id->valuestring, sizeof(tempRules.rules[i].rule_id) - 1);
             if (cJSON_IsString(in_id)) {
@@ -1891,7 +2491,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 snprintf(tempRules.rules[i].input_id, sizeof(tempRules.rules[i].input_id), "%d", in_id->valueint);
             }
             strncpy(tempRules.rules[i].operator, op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
-            tempRules.rules[i].threshold = (float)thresh->valuedouble;
+            tempRules.rules[i].threshold = (thresh && cJSON_IsNumber(thresh)) ? (float)thresh->valuedouble : -999.0f;
             if (cJSON_IsString(out_id)) {
                 strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
             } else {
@@ -1899,10 +2499,194 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
             strncpy(tempRules.rules[i].action, act->valuestring, sizeof(tempRules.rules[i].action) - 1);
             tempRules.rules[i].active = 1;
+
+            /* Sensor-to-sensor comparison: compare_mode "input" with input_b_id */
+            tempRules.rules[i].compare_mode = 0;
+            memset(tempRules.rules[i].input_b_id, 0, sizeof(tempRules.rules[i].input_b_id));
+            if (cond && cJSON_IsObject(cond)) {
+                cJSON *cm_walk = cond;
+                for (int d = 0; d < 5 && cm_walk; d++) {
+                    cJSON *cm = cJSON_GetObjectItemCaseSensitive(cm_walk, "compare_mode");
+                    if (cm && cJSON_IsString(cm) && strcmp(cm->valuestring, "input") == 0) {
+                        tempRules.rules[i].compare_mode = 1;
+                        cJSON *ib = cJSON_GetObjectItemCaseSensitive(cm_walk, "input_b_id");
+                        if (ib) {
+                            if (cJSON_IsString(ib))
+                                strncpy(tempRules.rules[i].input_b_id, ib->valuestring, sizeof(tempRules.rules[i].input_b_id) - 1);
+                            else if (cJSON_IsNumber(ib))
+                                snprintf(tempRules.rules[i].input_b_id, sizeof(tempRules.rules[i].input_b_id), "%d", ib->valueint);
+                        }
+                        break;
+                    }
+                    cJSON *ch = cJSON_GetObjectItemCaseSensitive(cm_walk, "child");
+                    if (ch && cJSON_IsObject(ch)) { cm_walk = ch; continue; }
+                    cJSON *chs = cJSON_GetObjectItemCaseSensitive(cm_walk, "children");
+                    if (chs && cJSON_IsArray(chs) && cJSON_GetArraySize(chs) > 0) {
+                        cm_walk = cJSON_GetArrayItem(chs, 0); continue;
+                    }
+                    break;
+                }
+            }
+
+            /* --- Parse condition_type and advanced parameters --- */
+            tempRules.rules[i].condition_type = COND_TYPE_COMPARE;
+            if (cond && cJSON_IsObject(cond)) {
+                cJSON *ctype = cJSON_GetObjectItemCaseSensitive(cond, "type");
+                if (ctype && cJSON_IsString(ctype)) {
+                    if (strcmp(ctype->valuestring, "hysteresis") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_HYSTERESIS;
+                        cJSON *hth = cJSON_GetObjectItemCaseSensitive(cond, "high_threshold");
+                        cJSON *lth = cJSON_GetObjectItemCaseSensitive(cond, "low_threshold");
+                        if (hth && cJSON_IsNumber(hth)) tempRules.rules[i].high_threshold = (float)hth->valuedouble;
+                        if (lth && cJSON_IsNumber(lth)) tempRules.rules[i].low_threshold = (float)lth->valuedouble;
+                    } else if (strcmp(ctype->valuestring, "range") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_RANGE;
+                        cJSON *rmin = cJSON_GetObjectItemCaseSensitive(cond, "min");
+                        cJSON *rmax = cJSON_GetObjectItemCaseSensitive(cond, "max");
+                        cJSON *rmode = cJSON_GetObjectItemCaseSensitive(cond, "mode");
+                        if (rmin && cJSON_IsNumber(rmin)) tempRules.rules[i].min_threshold = (float)rmin->valuedouble;
+                        if (rmax && cJSON_IsNumber(rmax)) tempRules.rules[i].max_threshold = (float)rmax->valuedouble;
+                        tempRules.rules[i].range_mode = (rmode && cJSON_IsString(rmode) && strcmp(rmode->valuestring, "outside") == 0) ? 1 : 0;
+                    } else if (strcmp(ctype->valuestring, "timer_on") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_TIMER_ON;
+                        cJSON *dms = cJSON_GetObjectItemCaseSensitive(cond, "delay_ms");
+                        cJSON *dsec = cJSON_GetObjectItemCaseSensitive(cond, "delay_sec");
+                        if (dms && cJSON_IsNumber(dms)) tempRules.rules[i].delay_ms = (uint32_t)dms->valueint;
+                        else if (dsec && cJSON_IsNumber(dsec)) tempRules.rules[i].delay_ms = (uint32_t)(dsec->valuedouble * 1000.0);
+                    } else if (strcmp(ctype->valuestring, "pulse_timer") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_PULSE_TIMER;
+                        cJSON *pms = cJSON_GetObjectItemCaseSensitive(cond, "pulse_ms");
+                        cJSON *psec = cJSON_GetObjectItemCaseSensitive(cond, "pulse_sec");
+                        if (pms && cJSON_IsNumber(pms)) tempRules.rules[i].delay_ms = (uint32_t)pms->valueint;
+                        else if (psec && cJSON_IsNumber(psec)) tempRules.rules[i].delay_ms = (uint32_t)(psec->valuedouble * 1000.0);
+                    } else if (strcmp(ctype->valuestring, "sr_latch") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_SR_LATCH;
+                        cJSON *prio = cJSON_GetObjectItemCaseSensitive(cond, "priority");
+                        tempRules.rules[i].sr_priority = (prio && cJSON_IsString(prio) && strcmp(prio->valuestring, "set") == 0) ? 1 : 0;
+                        /* Check nested set_condition & reset_condition objects if present */
+                        cJSON *set_c = cJSON_GetObjectItemCaseSensitive(cond, "set_condition");
+                        if (set_c && cJSON_IsObject(set_c)) {
+                            cJSON *s_in = cJSON_GetObjectItemCaseSensitive(set_c, "input_id");
+                            cJSON *s_op = cJSON_GetObjectItemCaseSensitive(set_c, "operator");
+                            cJSON *s_th = cJSON_GetObjectItemCaseSensitive(set_c, "threshold");
+                            if (s_in) {
+                                if (cJSON_IsString(s_in))
+                                    strncpy(tempRules.rules[i].input_id, s_in->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
+                                else if (cJSON_IsNumber(s_in))
+                                    snprintf(tempRules.rules[i].input_id, sizeof(tempRules.rules[i].input_id), "%d", s_in->valueint);
+                            }
+                            if (s_op && cJSON_IsString(s_op))
+                                strncpy(tempRules.rules[i].operator, s_op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
+                            if (s_th && cJSON_IsNumber(s_th))
+                                tempRules.rules[i].threshold = (float)s_th->valuedouble;
+                        }
+                        cJSON *rst_c = cJSON_GetObjectItemCaseSensitive(cond, "reset_condition");
+                        if (rst_c && cJSON_IsObject(rst_c)) {
+                            cJSON *r_in = cJSON_GetObjectItemCaseSensitive(rst_c, "input_id");
+                            if (r_in) {
+                                if (cJSON_IsString(r_in))
+                                    strncpy(tempRules.rules[i].input_b_id, r_in->valuestring, sizeof(tempRules.rules[i].input_b_id) - 1);
+                                else if (cJSON_IsNumber(r_in))
+                                    snprintf(tempRules.rules[i].input_b_id, sizeof(tempRules.rules[i].input_b_id), "%d", r_in->valueint);
+                            }
+                        }
+                    } else if (strcmp(ctype->valuestring, "and") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_AND;
+                    } else if (strcmp(ctype->valuestring, "or") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_OR;
+                    } else if (strcmp(ctype->valuestring, "not") == 0) {
+                        tempRules.rules[i].condition_type = COND_TYPE_NOT;
+                    }
+                }
+            }
+
+            /* --- Parse actuator type and specialized action values --- */
+            cJSON *atype = cJSON_GetObjectItemCaseSensitive(rule_obj, "actuator_type");
+            cJSON *aval  = cJSON_GetObjectItemCaseSensitive(rule_obj, "value");
+            cJSON *aparams = cJSON_GetObjectItemCaseSensitive(rule_obj, "params");
+            cJSON *asteps = cJSON_GetObjectItemCaseSensitive(rule_obj, "steps");
+            cJSON *afreq  = cJSON_GetObjectItemCaseSensitive(rule_obj, "frequency");
+            cJSON *adir   = cJSON_GetObjectItemCaseSensitive(rule_obj, "direction");
+
+            tempRules.rules[i].actuator_type = (atype && cJSON_IsNumber(atype)) ? (uint8_t)atype->valueint : 0;
+            tempRules.rules[i].action_value = (aval && cJSON_IsNumber(aval)) ? (float)aval->valuedouble : 0.0f;
+
+            if (asteps && cJSON_IsNumber(asteps)) tempRules.rules[i].action_steps = (int32_t)asteps->valueint;
+            if (afreq && cJSON_IsNumber(afreq)) tempRules.rules[i].action_frequency = (uint32_t)afreq->valueint;
+            if (adir && cJSON_IsString(adir)) {
+                tempRules.rules[i].action_direction = (strcmp(adir->valuestring, "CCW") == 0) ? 1 : 0;
+            }
+
+            /* params.* fields override top-level value/frequency when present */
+            if (aparams && cJSON_IsObject(aparams)) {
+                cJSON *pduty = cJSON_GetObjectItemCaseSensitive(aparams, "duty");
+                cJSON *pfreq = cJSON_GetObjectItemCaseSensitive(aparams, "frequency");
+                cJSON *pma   = cJSON_GetObjectItemCaseSensitive(aparams, "current_ma");
+                cJSON *pv    = cJSON_GetObjectItemCaseSensitive(aparams, "voltage_v");
+                cJSON *pstep = cJSON_GetObjectItemCaseSensitive(aparams, "steps");
+
+                if (pduty && cJSON_IsNumber(pduty)) tempRules.rules[i].action_value = (float)pduty->valuedouble;
+                else if (pma && cJSON_IsNumber(pma)) tempRules.rules[i].action_value = (float)pma->valuedouble;
+                else if (pv && cJSON_IsNumber(pv))   tempRules.rules[i].action_value = (float)pv->valuedouble;
+                if (pfreq && cJSON_IsNumber(pfreq)) tempRules.rules[i].action_frequency = (uint32_t)pfreq->valueint;
+                if (pstep && cJSON_IsNumber(pstep)) tempRules.rules[i].action_steps = (int32_t)pstep->valueint;
+            }
+
+            /* auto_reverse: automatically undo action when condition becomes false */
+            cJSON *auto_rev = cJSON_GetObjectItemCaseSensitive(rule_obj, "auto_reverse");
+            tempRules.rules[i].auto_reverse = (auto_rev && cJSON_IsTrue(auto_rev)) ? 1 : 0;
+
+            /* Parse rule priority (default 10, range 1..16) */
+            cJSON *prio_item = cJSON_GetObjectItemCaseSensitive(rule_obj, "priority");
+            tempRules.rules[i].priority = (prio_item && cJSON_IsNumber(prio_item)) ? (uint8_t)prio_item->valueint : 10;
+
+            /* Parse condition tree if present */
+            tempRules.rules[i].root_node = -1;
+            if (cond && cJSON_IsObject(cond)) {
+                int8_t rn = Parse_Condition_Tree(cond, &tempRules);
+                tempRules.rules[i].root_node = rn;
+            }
+
+            /* Parse action sequence if present */
+            tempRules.rules[i].sequence_idx = -1;
+            cJSON *seq_obj = cJSON_GetObjectItemCaseSensitive(rule_obj, "sequence");
+            if (seq_obj && cJSON_IsObject(seq_obj)) {
+                int8_t sq = Parse_Action_Sequence(seq_obj, &tempRules);
+                tempRules.rules[i].sequence_idx = sq;
+            }
+
             tempRules.rule_count++;
         }
 
         cJSON_Delete(root);
+
+        /* Validate output_id bounds against current actuator config */
+        {
+            Gateway_Config_t val_cfg;
+            Get_Shared_Config(&val_cfg);
+            for (uint32_t v = 0; v < tempRules.rule_count; v++) {
+                const char *oid = tempRules.rules[v].output_id;
+                const char *p = oid;
+                int out_num = -1;
+                while (*p) {
+                    if (*p >= '0' && *p <= '9') { out_num = (int)strtol(p, NULL, 10); break; }
+                    p++;
+                }
+                if (out_num >= 0 && out_num >= val_cfg.actuator_count) {
+                    printf("[Rules] WARNING: Rule '%s' output_id '%s' (index %d) exceeds actuator_count (%u)\r\n",
+                           tempRules.rules[v].rule_id, oid, out_num, (unsigned)val_cfg.actuator_count);
+                }
+                /* Warn on actuator_type mismatch */
+                if (out_num >= 0 && out_num < val_cfg.actuator_count) {
+                    uint8_t cfg_type = val_cfg.actuators[out_num].type;
+                    uint8_t rule_type = tempRules.rules[v].actuator_type;
+                    if (rule_type != 0 && cfg_type != rule_type) {
+                        printf("[Rules] WARNING: Rule '%s' actuator_type %u mismatches config type %u for output %d\r\n",
+                               tempRules.rules[v].rule_id, rule_type, cfg_type, out_num);
+                    }
+                }
+            }
+        }
 
         // Save rules into pending structure safely
         if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
@@ -1936,6 +2720,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             
         send(sn, (uint8_t *)resp_hdr, (uint16_t)strlen(resp_hdr));
         Send_Chunked(sn, (const uint8_t *)resp_body, (uint32_t)resp_len);
+        #undef tempRules
         return;
     }
 
@@ -2602,6 +3387,20 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             s_http_cfg_temp.sparkplug_topic[sizeof(s_http_cfg_temp.sparkplug_topic) - 1] = '\0';
         }
 
+        if (JSON_FindValue(body, "sparkplug_edge_node_id") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "sparkplug_edge_node_id", val_buf, sizeof(val_buf));
+            strncpy(s_http_cfg_temp.sparkplug_edge_node_id, val_buf, sizeof(s_http_cfg_temp.sparkplug_edge_node_id) - 1);
+            s_http_cfg_temp.sparkplug_edge_node_id[sizeof(s_http_cfg_temp.sparkplug_edge_node_id) - 1] = '\0';
+        }
+
+        if (JSON_FindValue(body, "sparkplug_device_id") != NULL) {
+            val_buf[0] = '\0';
+            JSON_ReadStr(body, "sparkplug_device_id", val_buf, sizeof(val_buf));
+            strncpy(s_http_cfg_temp.sparkplug_device_id, val_buf, sizeof(s_http_cfg_temp.sparkplug_device_id) - 1);
+            s_http_cfg_temp.sparkplug_device_id[sizeof(s_http_cfg_temp.sparkplug_device_id) - 1] = '\0';
+        }
+
         int p = JSON_ReadInt(body, "port");
         if (p > 0 && p <= 65535) s_http_cfg_temp.mqtt_port = (uint16_t)p;
 
@@ -2707,7 +3506,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         
         JSON_ReadStr(body, "device_id", s_http_cfg_temp.device_id, sizeof(s_http_cfg_temp.device_id));
         JSON_ReadStr(body, "sparkplug_topic", s_http_cfg_temp.sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic));
-        
+        JSON_ReadStr(body, "sparkplug_edge_node_id", s_http_cfg_temp.sparkplug_edge_node_id, sizeof(s_http_cfg_temp.sparkplug_edge_node_id));
+        JSON_ReadStr(body, "sparkplug_device_id", s_http_cfg_temp.sparkplug_device_id, sizeof(s_http_cfg_temp.sparkplug_device_id));
+
         /* If manual topic is empty, generate standard Sparkplug B topic path */
         if (s_http_cfg_temp.sparkplug_topic[0] == '\0') {
             snprintf(s_http_cfg_temp.sparkplug_topic, sizeof(s_http_cfg_temp.sparkplug_topic), "spBv1.0/KontrxGroup/DDATA/%s", s_http_cfg_temp.device_id);
@@ -2744,6 +3545,23 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         JSON_ReadStr(body, "status",         s_http_cfg_temp.provision_status,  sizeof(s_http_cfg_temp.provision_status));
         JSON_ReadStr(body, "message",        s_http_cfg_temp.provision_message, sizeof(s_http_cfg_temp.provision_message));
+
+        /* Parse Sparkplug IDs from provisioning */
+        {
+            char sp_edge[48] = {0}, sp_dev[48] = {0};
+            JSON_ReadStr(body, "sparkplugEdgeNodeId", sp_edge, sizeof(sp_edge));
+            if (sp_edge[0] == '\0') JSON_ReadStr(body, "edgeNodeId", sp_edge, sizeof(sp_edge));
+            if (sp_edge[0] != '\0') {
+                strncpy(s_http_cfg_temp.sparkplug_edge_node_id, sp_edge, sizeof(s_http_cfg_temp.sparkplug_edge_node_id) - 1);
+                s_http_cfg_temp.sparkplug_edge_node_id[sizeof(s_http_cfg_temp.sparkplug_edge_node_id) - 1] = '\0';
+            }
+            JSON_ReadStr(body, "sparkplugDeviceId", sp_dev, sizeof(sp_dev));
+            if (sp_dev[0] == '\0') JSON_ReadStr(body, "deviceGroupId", sp_dev, sizeof(sp_dev));
+            if (sp_dev[0] != '\0') {
+                strncpy(s_http_cfg_temp.sparkplug_device_id, sp_dev, sizeof(s_http_cfg_temp.sparkplug_device_id) - 1);
+                s_http_cfg_temp.sparkplug_device_id[sizeof(s_http_cfg_temp.sparkplug_device_id) - 1] = '\0';
+            }
+        }
 
         /* Parse MQTT Broker IP — try all field name variants from mobile app */
         char broker[64] = {0};
@@ -2841,6 +3659,19 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         Get_Shared_Config(&s_http_cfg_temp);
         s_http_cfg_temp.serial = s;
+
+        /* Re-generate default Sparkplug IDs when serial changes and IDs are still auto-generated */
+        {
+            if (s_http_cfg_temp.sparkplug_edge_node_id[0] == '\0' ||
+                strncmp(s_http_cfg_temp.sparkplug_edge_node_id, "KX-", 3) == 0) {
+                snprintf(s_http_cfg_temp.sparkplug_edge_node_id, sizeof(s_http_cfg_temp.sparkplug_edge_node_id), "KX-%07lu", (unsigned long)s);
+            }
+            if (s_http_cfg_temp.sparkplug_device_id[0] == '\0' ||
+                strncmp(s_http_cfg_temp.sparkplug_device_id, "KX-", 3) == 0) {
+                snprintf(s_http_cfg_temp.sparkplug_device_id, sizeof(s_http_cfg_temp.sparkplug_device_id), "KX-%07lu-dev", (unsigned long)s);
+            }
+        }
+
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&s_http_cfg_temp);
 
@@ -3007,8 +3838,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Send_Response(sn, HTTP_401, "{\"error\":\"Unauthorized: OTA OTP not verified\"}");
             return;
         }
-        printf("[OTA] Sending prepare response...\r\n");
-        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type:application/json\r\nConnection:close\r\n\r\n{\"status\":\"preparing\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"status\":\"preparing\"}";
         send(sn, (uint8_t *)resp, strlen(resp));
         
         /* Give W5500 and TCP stack 100ms to transmit the HTTP response
@@ -3147,7 +3977,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (total_written < content_length) {
             printf("[OTA] Incomplete upload: %lu / %lu bytes\r\n", (unsigned long)total_written, (unsigned long)content_length);
             Log_Event("OTA", "Firmware upload incomplete or aborted.");
-            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection:close\r\n\r\nOTA INCOMPLETE";
+            const char *resp = "HTTP/1.1 500 Internal Server Error\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Connection: close\r\n\r\n"
+                               "{\"ok\":false,\"error\":\"OTA INCOMPLETE\"}";
             send(sn, (uint8_t *)resp, strlen(resp));
             g_ota_in_progress = 0;
             disconnect(sn);
@@ -3163,13 +3997,20 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         /* Wait for OTA task to confirm */
         if (osSemaphoreAcquire(sem_ota_done, 5000) == osOK && ota_write_ok) {
             Log_Event("OTA", "Firmware upload successful. Device is rebooting...");
-            const char *resp = "HTTP/1.1 200 OK\r\nContent-Type:text/plain\r\nConnection:close\r\n\r\n"
-                               "OTA OK. Rebooting...";
+            const char *resp = "HTTP/1.1 200 OK\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Connection: close\r\n\r\n"
+                               "{\"ok\":true,\"status\":\"OTA OK. Rebooting...\"}";
             send(sn, (uint8_t *)resp, strlen(resp));
             osDelay(100);
         } else {
             Log_Event("OTA", "Firmware upload failed (CRC check failed).");
-            const char *resp = "HTTP/1.1 500 Internal Server Error\r\nConnection:close\r\n\r\nOTA CRC FAIL";
+            const char *resp = "HTTP/1.1 500 Internal Server Error\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Connection: close\r\n\r\n"
+                               "{\"ok\":false,\"error\":\"OTA CRC FAIL\"}";
             send(sn, (uint8_t *)resp, strlen(resp));
             /* Resume background tasks since update failed */
             g_ota_in_progress = 0;
@@ -3217,8 +4058,21 @@ void Task_HTTPServer(void *arg) {
                 s_sock_teardown_tick[sn] = 0;
                 s_sock_est_tick[sn] = 0;
                 close(sn); /* Reset socket.c internal variables */
-                if (socket(sn, Sn_MR_TCP, HTTP_PORT, 0x00) < 0) {
-                    Ensure_W5500_Network_Alive();
+                {
+                    int8_t sock_ret = socket(sn, Sn_MR_TCP, HTTP_PORT, 0x00);
+                    if (sock_ret < 0) {
+                        /* SPI bus may be contended by MQTT/Partition tasks — yield and retry */
+                        osDelay(50);
+                        sock_ret = socket(sn, Sn_MR_TCP, HTTP_PORT, 0x00);
+                    }
+                    if (sock_ret < 0) {
+                        osDelay(200);
+                        sock_ret = socket(sn, Sn_MR_TCP, HTTP_PORT, 0x00);
+                    }
+                    if (sock_ret < 0) {
+                        /* Only check W5500 health after 3 failed attempts with delays */
+                        Ensure_W5500_Network_Alive();
+                    }
                 }
                 break;
 
@@ -3300,7 +4154,7 @@ void Task_HTTPServer(void *arg) {
                                 int need = header_len + content_len;
                                 if (need > (int)(sizeof(rx_buf) - 1)) need = (int)(sizeof(rx_buf) - 1);
                                 uint32_t t0 = osKernelGetTickCount();
-                                while ((int)total < need && (osKernelGetTickCount() - t0) < 500) {
+                                while ((int)total < need && (osKernelGetTickCount() - t0) < 2500) {
                                     uint16_t more = getSn_RX_RSR(sn);
                                     if (more > 0) {
                                         if (more > (uint16_t)(sizeof(rx_buf) - 1 - total))
@@ -3325,7 +4179,7 @@ void Task_HTTPServer(void *arg) {
 
                         /* Wait for W5500 hardware TX buffer to be fully transmitted and ACKed by peer */
                         uint32_t wait_ack_t0 = osKernelGetTickCount();
-                        while (getSn_TX_FSR(sn) < 2048 && (osKernelGetTickCount() - wait_ack_t0) < 50) {
+                        while (getSn_TX_FSR(sn) < 2048 && (osKernelGetTickCount() - wait_ack_t0) < 150) {
                             osDelay(1);
                         }
 

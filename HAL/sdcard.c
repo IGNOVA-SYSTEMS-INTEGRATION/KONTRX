@@ -113,6 +113,21 @@ uint32_t SDCard_Queue_Count(void) {
     return count;
 }
 
+uint8_t SDCard_Queue_PeekAt(uint32_t index, OfflineRecord_t *rec) {
+    if (!rec) return 0;
+    SD_Lock();
+    uint8_t res = Partition_Queue_PeekAt(index, rec);
+    SD_Unlock();
+    return res;
+}
+
+void SDCard_Queue_Discard(uint32_t n) {
+    SD_Lock();
+    Partition_Queue_Discard(n);
+    s_sd_status.queue_record_count = Partition_Queue_Count();
+    SD_Unlock();
+}
+
 void SDCard_Queue_Clear(void) {
     SD_Lock();
     Partition_Queue_Reset();
@@ -176,11 +191,33 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
             "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"telemetry_queue.dat\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"LOGS\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
-            "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"}",
+            "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
+            "{\"name\":\"RULES\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"}",
             (unsigned long)log_sz, cur_dt,
             (unsigned long)q_sz, cur_dt,
-            cur_dt, cur_dt
+            cur_dt, cur_dt, cur_dt
         );
+    } else if (strstr(curr_path, "RULES") != NULL || strstr(curr_path, "rules") != NULL) {
+        uint8_t arch_emitted = 0;
+        for (uint32_t s = 0; s < MAX_HISTORY_ARCHIVES; s++) {
+            uint32_t slot_addr = PARTITION_RULES_HISTORY_ADDR + s * ARCHIVE_SLOT_SIZE;
+            uint32_t magic = 0;
+            W25Q_Read(slot_addr, (uint8_t *)&magic, 4);
+            if (magic == ARCHIVE_SLOT_MAGIC) {
+                char ver[36] = {0};
+                char ts[36] = {0};
+                W25Q_Read(slot_addr + 4,  (uint8_t *)ver, sizeof(ver));
+                W25Q_Read(slot_addr + 40, (uint8_t *)ts,  sizeof(ts));
+                pos += snprintf(out_json + pos, max_len - pos,
+                    "%s{\"name\":\"rules_%s.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}",
+                    arch_emitted ? "," : "", ver, ts[0] ? ts : cur_dt);
+                arch_emitted = 1;
+            }
+        }
+        if (!arch_emitted) {
+            pos += snprintf(out_json + pos, max_len - pos,
+                "{\"name\":\"rules_active.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}", cur_dt);
+        }
     } else if (strstr(curr_path, "LOGS") != NULL || strstr(curr_path, "logs") != NULL) {
         pos += snprintf(out_json + pos, max_len - pos,
             "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
