@@ -111,7 +111,8 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
 }
 
 void vApplicationMallocFailedHook(void) {
-    printf("\r\n!!! FreeRTOS MALLOC FAILED !!!\r\n");
+    printf("\r\n!!! FreeRTOS MALLOC FAILED -> Auto-resetting !!!\r\n");
+    SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;
     while (1);
 }
 
@@ -153,12 +154,12 @@ static void Load_Config_From_Flash(void) {
         strcpy(sharedConfig.provision_status, "Active");
         strcpy(sharedConfig.provision_message, "Provisioned manually via Cloud MQTT settings");
 
-        // Map default 10 local GPIO actuators
-        const char *names[10] = {"Relay1", "Relay2", "Relay3", "Relay4", "Relay5", "Relay6", "Relay7", "Relay8", "Relay9", "Relay10"};
-        const char *ports[10] = {"PE", "PE", "PE", "PC", "PC", "PA", "PA", "PA", "PA", "PC"};
-        const uint8_t pins[10]  = {2, 4, 6, 0, 2, 1, 0, 2, 4, 4};
+        // Map default 8 local GPIO relays
+        const char *names[8] = {"Relay1", "Relay2", "Relay3", "Relay4", "Relay5", "Relay6", "Relay7", "Relay8"};
+        const char *ports[8] = {"PE", "PE", "PE", "PC", "PC", "PA", "PA", "PA"};
+        const uint8_t pins[8]  = {2, 4, 6, 0, 2, 1, 0, 2};
         
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 8; i++) {
             sharedConfig.actuators[i].id = i;
             strcpy(sharedConfig.actuators[i].name, names[i]);
             sharedConfig.actuators[i].type = ACTUATOR_TYPE_LOCAL_GPIO;
@@ -170,7 +171,46 @@ static void Load_Config_From_Flash(void) {
             sharedConfig.actuators[i].port = 0;
             sharedConfig.actuators[i].reg_addr = 0;
         }
-        sharedConfig.actuator_count = 10;
+
+        // Slot 8: PWM1 (TIM4_CH1 on PD12, Channel 0)
+        sharedConfig.actuators[8].id = 8;
+        strcpy(sharedConfig.actuators[8].name, "PWM1_Fan");
+        sharedConfig.actuators[8].type = ACTUATOR_TYPE_PWM;
+        sharedConfig.actuators[8].pin_or_slave = 0; // Channel 0 (PD12)
+        sharedConfig.actuators[8].reg_addr = 1000;  // 1000 Hz default frequency
+        strcpy(sharedConfig.actuators[8].port_or_ip, "CH1");
+
+        // Slot 9: PWM2 (TIM4_CH2 on PD13, Channel 1)
+        sharedConfig.actuators[9].id = 9;
+        strcpy(sharedConfig.actuators[9].name, "PWM2_Pump");
+        sharedConfig.actuators[9].type = ACTUATOR_TYPE_PWM;
+        sharedConfig.actuators[9].pin_or_slave = 1; // Channel 1 (PD13)
+        sharedConfig.actuators[9].reg_addr = 1000;
+        strcpy(sharedConfig.actuators[9].port_or_ip, "CH2");
+
+        // Slot 10: PTO Axis 1 (TIM1 on PE9/PE8)
+        sharedConfig.actuators[10].id = 10;
+        strcpy(sharedConfig.actuators[10].name, "PTO_Axis1");
+        sharedConfig.actuators[10].type = ACTUATOR_TYPE_PTO;
+        sharedConfig.actuators[10].pin_or_slave = 0; // Axis 0
+        sharedConfig.actuators[10].reg_addr = 1000;  // Default speed
+        strcpy(sharedConfig.actuators[10].port_or_ip, "AXIS1");
+
+        // Slot 11: Analog 0-10V Channel 1 (PD14)
+        sharedConfig.actuators[11].id = 11;
+        strcpy(sharedConfig.actuators[11].name, "0-10V_VFD");
+        sharedConfig.actuators[11].type = ACTUATOR_TYPE_ANALOG_V;
+        sharedConfig.actuators[11].pin_or_slave = 0; // Channel 0
+        strcpy(sharedConfig.actuators[11].port_or_ip, "CH1");
+
+        // Slot 12: Analog 4-20mA Current Output 1 (PA4)
+        sharedConfig.actuators[12].id = 12;
+        strcpy(sharedConfig.actuators[12].name, "4-20mA_Dose");
+        sharedConfig.actuators[12].type = ACTUATOR_TYPE_ANALOG_MA;
+        sharedConfig.actuators[12].pin_or_slave = 0; // Channel 0
+        strcpy(sharedConfig.actuators[12].port_or_ip, "CH1");
+
+        sharedConfig.actuator_count = 13;
 
         // Default telemetry field mappings
         sharedConfig.mqtt_mappings[0] = (Mqtt_Field_Mapping_t){.source_type=MAP_SOURCE_SENSOR, .source_id=1, .json_key="ph", .enabled=1};
