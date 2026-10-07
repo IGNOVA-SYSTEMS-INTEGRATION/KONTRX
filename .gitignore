@@ -40,4 +40,7 @@ assemble_switches.py
 .codegraph/
 .gemini/
 memory_system/chroma_db/
+AGENT/
+skills-lock.json
+
 

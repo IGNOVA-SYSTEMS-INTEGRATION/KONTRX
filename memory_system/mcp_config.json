@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "antigravity-memory": {
+      "command": "python",
+      "args": [
+        "d:\\WORKSPACE\\IGNOVA\\DEVELOPMENT\\Kontrx\\memory_system\\mcp_server.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}
