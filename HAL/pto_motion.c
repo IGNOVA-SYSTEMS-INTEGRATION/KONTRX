@@ -103,6 +103,14 @@ void PTO_Motion_Init(void) {
     Timer_PTO_Init(TIM3, TIMER_CH3);
     Timer_PTO_Init(TIM2, TIMER_CH4);
 
+    for (uint8_t c = 0; c < MAX_PTO_CHANNELS; c++) {
+        PTO_Stop(c);
+        s_pto[c].moving = 0;
+        s_pto[c].steps_remaining = 0;
+        s_pto[c].position = 0;
+        s_pto[c].target = 0;
+    }
+
     // 5. Initialize EXTI Limit Switches & Register ISR callback
     EXTI_LimitSwitches_Init();
     EXTI_RegisterLimitSwitchCallback(LimitSwitch_Handler);

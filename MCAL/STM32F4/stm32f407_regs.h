@@ -250,4 +250,9 @@ typedef struct {
 #define AIRCR_VECTKEY    (0x05FA0000U)
 #define AIRCR_SYSRESET   (1U << 2)
 
+/* NVIC Registers */
+#define NVIC_ISER   ((volatile uint32_t *)0xE000E100U)
+#define NVIC_ICER   ((volatile uint32_t *)0xE000E180U)
+#define NVIC_IPR    ((volatile uint8_t *)0xE000E400U)
+
 #endif // STM32F407_REGS_H
