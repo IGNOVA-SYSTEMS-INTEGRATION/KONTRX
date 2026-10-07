@@ -108,4 +108,10 @@ extern volatile uint8_t rulesTesting;
  */
 void Ensure_W5500_Network_Alive(void);
 
+/**
+ * @brief Reset all active condition timers, pulse states, bistable latches, and sequence states.
+ */
+void ControlEngine_ResetStates(void);
+
+
 #endif /* FREERTOS_TASKS_H */

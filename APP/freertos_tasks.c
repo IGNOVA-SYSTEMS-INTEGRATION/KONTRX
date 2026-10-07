@@ -76,9 +76,13 @@ volatile uint8_t rulesTesting = 0;
  * - If base_topic is empty, fall back to standard Sparkplug B format.
  */
 static void get_sparkplug_topic(const char *base_topic, const char *msg_type, char *out_topic, size_t max_len) {
-    /* Empty topic → standard Sparkplug B fallback */
+    /* Empty topic → standard Sparkplug B fallback using configured edge/device IDs */
     if (base_topic[0] == '\0') {
-        snprintf(out_topic, max_len, "spBv1.0/KontrxGroup/%s/kontrx-%07lu", msg_type, (unsigned long)s_tasks_cfg.serial);
+        const char *edge = s_tasks_cfg.sparkplug_edge_node_id;
+        const char *dev  = s_tasks_cfg.sparkplug_device_id;
+        if (edge[0] == '\0') edge = "kontrx-node";
+        if (dev[0] == '\0')  dev  = "kontrx-dev";
+        snprintf(out_topic, max_len, "spBv1.0/KontrxGroup/%s/%s/%s", msg_type, edge, dev);
         return;
     }
 
@@ -248,7 +252,7 @@ static uint8_t Relay_Pin_Is_Reserved(uint8_t port, uint8_t pin) {
     if (port > 4 || pin > 15) return 1;
 
     if (port == 0 && (pin == 6 || pin == 9 || pin == 10)) return 1;  /* LED, USART1 */
-    if (port == 1 && pin >= 10 && pin <= 15) return 1;                /* Modbus, W5500 SPI */
+    if (port == 1 && (pin == 0 || pin == 3 || pin == 4 || pin == 5 || (pin >= 10 && pin <= 15))) return 1; /* W25Q16 Flash (PB0 CS, PB3-PB5 SPI1), Modbus, W5500 SPI2 */
     if (port == 2 && (pin == 6 || pin == 7)) return 1;                /* USART6 */
     if (port == 3 && (pin == 2 || pin == 3)) return 1;                /* MAX485 RE#/DE */
     return 0;
@@ -386,6 +390,176 @@ static int string_equals_ci(const char *s1, const char *s2) {
         s2++;
     }
     return *s1 == *s2;
+}
+
+static uint8_t Evaluate_Compare(float val, const char *op, float thr) {
+    if (strcmp(op, ">") == 0)       return (val > thr);
+    if (strcmp(op, "<") == 0)       return (val < thr);
+    if (strcmp(op, "==") == 0)      return (val == thr);
+    if (strcmp(op, "!=") == 0)      return (val != thr);
+    if (strcmp(op, ">=") == 0)      return (val >= thr);
+    if (strcmp(op, "<=") == 0)      return (val <= thr);
+    return 1;
+}
+
+static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found);
+
+/* Per-node timer/pulse state memory */
+typedef struct {
+    uint32_t timer_start;
+    uint8_t  timer_running;
+    uint32_t pulse_start;
+    uint8_t  pulse_active;
+    uint8_t  last_pulse_in;
+    uint8_t  hyst_state;
+    uint8_t  sr_state;
+} CondNodeState_t;
+
+/* State memory for sequences */
+typedef struct {
+    uint8_t  active;
+    uint8_t  current_step;
+    uint8_t  current_cycle;
+    uint32_t step_start_ticks;
+} RuleSeqState_t;
+
+static CondNodeState_t s_node_states[MAX_COND_NODES] = {0};
+static RuleSeqState_t  s_seq_states[MAX_RULES] = {0};
+
+void ControlEngine_ResetStates(void) {
+    memset(s_node_states, 0, sizeof(s_node_states));
+    memset(s_seq_states, 0, sizeof(s_seq_states));
+}
+
+static uint8_t Evaluate_Cond_Node(int8_t node_idx, const RuleConfig_t *cfg, const Gateway_Config_t *gw_cfg, const Modbus_SensorData_t *sd, uint32_t now_ticks) {
+    if (!cfg || node_idx < 0 || node_idx >= cfg->cond_node_count) return 0;
+    const CondNode_t *n = &cfg->cond_nodes[node_idx];
+    CondNodeState_t *st = &s_node_states[node_idx];
+
+    if (n->type == COND_NODE_AND) {
+        if (n->child_count == 0) return 1;
+        for (uint8_t c = 0; c < n->child_count; c++) {
+            if (!Evaluate_Cond_Node(n->children[c], cfg, gw_cfg, sd, now_ticks)) return 0;
+        }
+        return 1;
+    }
+
+    if (n->type == COND_NODE_OR) {
+        if (n->child_count == 0) return 0;
+        for (uint8_t c = 0; c < n->child_count; c++) {
+            if (Evaluate_Cond_Node(n->children[c], cfg, gw_cfg, sd, now_ticks)) return 1;
+        }
+        return 0;
+    }
+
+    if (n->type == COND_NODE_NOT) {
+        if (n->child_count == 0 || n->children[0] < 0) return 0;
+        return !Evaluate_Cond_Node(n->children[0], cfg, gw_cfg, sd, now_ticks);
+    }
+
+    if (n->type == COND_NODE_TIMER_ON) {
+        uint8_t raw_in = 0;
+        if (n->child_count > 0 && n->children[0] >= 0) {
+            raw_in = Evaluate_Cond_Node(n->children[0], cfg, gw_cfg, sd, now_ticks);
+        } else {
+            uint8_t found = 0;
+            float val = Resolve_Input_Value(n->input_id, gw_cfg, sd, &found);
+            raw_in = found && (val > n->threshold);
+        }
+
+        if (raw_in) {
+            if (!st->timer_running) {
+                st->timer_running = 1;
+                st->timer_start = now_ticks;
+            } else if ((now_ticks - st->timer_start) >= (n->delay_ms > 0 ? n->delay_ms : 1000)) {
+                return 1;
+            }
+        } else {
+            st->timer_running = 0;
+        }
+        return 0;
+    }
+
+    if (n->type == COND_NODE_PULSE_TIMER) {
+        uint8_t raw_in = 0;
+        if (n->child_count > 0 && n->children[0] >= 0) {
+            raw_in = Evaluate_Cond_Node(n->children[0], cfg, gw_cfg, sd, now_ticks);
+        } else {
+            uint8_t found = 0;
+            float val = Resolve_Input_Value(n->input_id, gw_cfg, sd, &found);
+            raw_in = found && (val > n->threshold);
+        }
+
+        if (raw_in && !st->last_pulse_in && !st->pulse_active) {
+            st->pulse_active = 1;
+            st->pulse_start = now_ticks;
+        }
+        st->last_pulse_in = raw_in;
+
+        if (st->pulse_active) {
+            if ((now_ticks - st->pulse_start) < (n->delay_ms > 0 ? n->delay_ms : 3000)) {
+                return 1;
+            } else {
+                st->pulse_active = 0;
+            }
+        }
+        return 0;
+    }
+
+    if (n->type == COND_NODE_SR_LATCH) {
+        uint8_t set_act = 0;
+        uint8_t rst_act = 0;
+        if (n->children[0] >= 0) set_act = Evaluate_Cond_Node(n->children[0], cfg, gw_cfg, sd, now_ticks);
+        if (n->children[1] >= 0) rst_act = Evaluate_Cond_Node(n->children[1], cfg, gw_cfg, sd, now_ticks);
+
+        if (n->sr_priority == 1) { // Set dominant
+            if (set_act) st->sr_state = 1;
+            else if (rst_act) st->sr_state = 0;
+        } else { // Reset dominant
+            if (rst_act) st->sr_state = 0;
+            else if (set_act) st->sr_state = 1;
+        }
+        return st->sr_state;
+    }
+
+    // Resolve primary sensor
+    uint8_t found = 0;
+    float val = Resolve_Input_Value(n->input_id, gw_cfg, sd, &found);
+    if (!found && !cfg->bypass_validation) return 0;
+    if (cfg->bypass_validation) val = 0.0f;
+
+    if (n->type == COND_NODE_HYSTERESIS) {
+        if (val >= n->threshold) st->hyst_state = 1;
+        else if (val <= n->threshold_b) st->hyst_state = 0;
+        return st->hyst_state;
+    }
+
+    if (n->type == COND_NODE_RANGE) {
+        uint8_t in_range = (val >= n->threshold && val <= n->threshold_b);
+        return n->range_mode ? (!in_range) : in_range;
+    }
+
+    if (n->type == COND_NODE_SENSOR_STATE) {
+        return (cfg->bypass_validation || (found && val > 0.0f)) ? 1 : 0;
+    }
+
+    // Default Compare
+    float thr = n->threshold;
+    if (n->compare_mode == 1 && n->input_b_id[0] != '\0') {
+        uint8_t found_b = 0;
+        thr = Resolve_Input_Value(n->input_b_id, gw_cfg, sd, &found_b);
+        if (!found_b && !cfg->bypass_validation) return 0;
+    }
+
+    switch (n->op) {
+        case 1: return (val > thr);
+        case 2: return (val < thr);
+        case 3: return (val == thr);
+        case 4: return (val != thr);
+        case 5: return (val >= thr);
+        case 6: return (val <= thr);
+        default: return (val > thr);
+    }
 }
 
 static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found) {
@@ -579,7 +753,7 @@ static void Task_ControlEngine(void *arg) {
         }
 
         /* 2. Execute active rules */
-        static RuleConfig_t localRules;
+        static RuleConfig_t localRules __attribute__((section(".ccmram")));
         uint8_t has_rules = 0;
         if (osMutexAcquire(rulesMutex, 0) == osOK) {
             localRules = activeRules;
@@ -603,37 +777,195 @@ static void Task_ControlEngine(void *arg) {
             if (cfg_snap.test_mode == 1) {
                 /* Test mode: rules paused */
             } else {
-                for (uint32_t i = 0; i < localRules.rule_count; i++) {
+                /* Output Arbitration Table across MAX_RELAYS (0..15) */
+                typedef struct {
+                    uint8_t  claimed;
+                    uint8_t  priority;
+                    uint8_t  atype;
+                    uint8_t  hw_ch;
+                    char     action[16];
+                    float    action_value;
+                    uint32_t action_frequency;
+                    int32_t  action_steps;
+                } OutputClaim_t;
+                OutputClaim_t claims[MAX_RELAYS];
+                memset(claims, 0, sizeof(claims));
+
+                uint32_t now_ticks = osKernelGetTickCount();
+
+                for (uint32_t i = 0; i < localRules.rule_count && i < MAX_RULES; i++) {
                     const Rule_t *rule = &localRules.rules[i];
                     if (!rule->active) continue;
 
-                    // Resolve input value from string input_id
-                    uint8_t found = 0;
-                    float val = Resolve_Input_Value(rule->input_id, &cfg_snap, &sd, &found);
+                    uint8_t cond_met = 0;
 
-                    if (found) {
-                        uint8_t cond_met = 0;
-                        float thr = rule->threshold;
+                    /* 1. Evaluate condition: use recursive tree if root_node is valid, else flat legacy */
+                    if (rule->root_node >= 0 && rule->root_node < localRules.cond_node_count) {
+                        cond_met = Evaluate_Cond_Node(rule->root_node, &localRules, &cfg_snap, &sd, now_ticks);
+                    } else {
+                        // Legacy flat condition resolution
+                        uint8_t found = 0;
+                        float val = Resolve_Input_Value(rule->input_id, &cfg_snap, &sd, &found);
                         if (localRules.bypass_validation) {
-                            /* When sensor validation bypass is active, rule fires to test actuators */
                             cond_met = 1;
-                        } else {
-                            if (strcmp(rule->operator, ">") == 0)       cond_met = (val > thr);
-                            else if (strcmp(rule->operator, "<") == 0)  cond_met = (val < thr);
-                            else if (strcmp(rule->operator, "==") == 0) cond_met = (val == thr);
-                            else if (strcmp(rule->operator, ">=") == 0) cond_met = (val >= thr);
-                            else if (strcmp(rule->operator, "<=") == 0) cond_met = (val <= thr);
+                        } else if (found) {
+                            float thr = rule->threshold;
+                            if (rule->compare_mode == 1 && rule->input_b_id[0] != '\0') {
+                                uint8_t found_b = 0;
+                                thr = Resolve_Input_Value(rule->input_b_id, &cfg_snap, &sd, &found_b);
+                                if (!found_b) goto skip_rule;
+                            }
+                            if (rule->condition_type == COND_TYPE_HYSTERESIS) {
+                                static uint8_t s_legacy_hyst[MAX_RULES] = {0};
+                                if (val >= rule->high_threshold) s_legacy_hyst[i] = 1;
+                                else if (val <= rule->low_threshold) s_legacy_hyst[i] = 0;
+                                cond_met = s_legacy_hyst[i];
+                            } else if (rule->condition_type == COND_TYPE_RANGE) {
+                                uint8_t in_range = (val >= rule->min_threshold && val <= rule->max_threshold);
+                                cond_met = rule->range_mode ? (!in_range) : in_range;
+                            } else {
+                                cond_met = Evaluate_Compare(val, rule->operator, thr);
+                            }
                         }
+                    }
+
+                    int8_t out_idx = Resolve_Output_Id(rule->output_id, &cfg_snap);
+                    if (out_idx < 0 || out_idx >= cfg_snap.actuator_count || out_idx >= MAX_RELAYS) {
+                        goto skip_rule;
+                    }
+
+                    uint8_t atype = (rule->actuator_type != 0) ? rule->actuator_type : cfg_snap.actuators[out_idx].type;
+                    uint8_t hw_ch = cfg_snap.actuators[out_idx].pin_or_slave;
+
+                    /* 2. Handle Action Sequence State Machine if sequence_idx >= 0 */
+                    char eff_action[16];
+                    float eff_value = rule->action_value;
+                    uint32_t eff_freq = rule->action_frequency;
+                    int32_t eff_steps = rule->action_steps;
+                    uint8_t eff_active = 0;
+
+                    if (rule->sequence_idx >= 0 && rule->sequence_idx < localRules.seq_count) {
+                        const ActionSequence_t *seq = &localRules.sequences[rule->sequence_idx];
+                        RuleSeqState_t *sq = &s_seq_states[i];
 
                         if (cond_met) {
-                            int8_t relay_idx = Resolve_Output_Id(rule->output_id, &cfg_snap);
-                            if (relay_idx >= 0 && relay_idx < MAX_RELAYS) {
-                                uint8_t action_val = 0;
-                                if (string_equals_ci(rule->action, "ON") || strcmp(rule->action, "1") == 0) {
-                                    action_val = 1;
-                                }
-                                Relay_SetState(relay_idx, action_val);
+                            if (!sq->active) {
+                                sq->active = 1;
+                                sq->current_step = 0;
+                                sq->current_cycle = 0;
+                                sq->step_start_ticks = now_ticks;
                             }
+                        } else {
+                            if (sq->active) {
+                                if (seq->on_false == SEQ_ON_FALSE_FINISH_CYCLE) {
+                                    // Let current cycle finish, then stop
+                                } else if (seq->on_false == SEQ_ON_FALSE_HOLD) {
+                                    // Hold current step
+                                } else {
+                                    // SEQ_ON_FALSE_ABORT_SAFE: immediate reset
+                                    sq->active = 0;
+                                    sq->current_step = 0;
+                                }
+                            }
+                        }
+
+                        if (sq->active && seq->step_count > 0) {
+                            eff_active = 1;
+                            const SeqStep_t *cur_step = &seq->steps[sq->current_step];
+                            strncpy(eff_action, cur_step->action, sizeof(eff_action) - 1);
+                            eff_action[sizeof(eff_action) - 1] = '\0';
+                            eff_value = cur_step->value;
+
+                            uint32_t step_hold = cur_step->hold_ms > 0 ? cur_step->hold_ms : 1000;
+                            if ((now_ticks - sq->step_start_ticks) >= pdMS_TO_TICKS(step_hold)) {
+                                sq->current_step++;
+                                sq->step_start_ticks = now_ticks;
+                                if (sq->current_step >= seq->step_count) {
+                                    sq->current_cycle++;
+                                    if (seq->mode == SEQ_MODE_LOOP) {
+                                        sq->current_step = 0;
+                                    } else if (seq->mode == SEQ_MODE_COUNT && sq->current_cycle < seq->repeat_count) {
+                                        sq->current_step = 0;
+                                    } else {
+                                        // Once or count completed
+                                        sq->active = 0;
+                                        sq->current_step = 0;
+                                        eff_active = 0;
+                                    }
+                                }
+                            }
+                        } else if (!cond_met && rule->auto_reverse) {
+                            eff_active = 2; // Auto-reverse active
+                            strncpy(eff_action, "OFF", sizeof(eff_action) - 1);
+                        }
+                    } else {
+                        // Standard single action
+                        if (cond_met) {
+                            eff_active = 1;
+                            strncpy(eff_action, rule->action, sizeof(eff_action) - 1);
+                            eff_action[sizeof(eff_action) - 1] = '\0';
+                        } else if (rule->auto_reverse) {
+                            eff_active = 2; // Auto-reverse
+                            if (atype == ACTUATOR_TYPE_PWM) {
+                                strncpy(eff_action, "SET_DUTY", sizeof(eff_action) - 1);
+                                eff_value = 0.0f;
+                            } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
+                                strncpy(eff_action, "SET_MA", sizeof(eff_action) - 1);
+                                eff_value = 4.0f;
+                            } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
+                                strncpy(eff_action, "SET_V", sizeof(eff_action) - 1);
+                                eff_value = 0.0f;
+                            } else {
+                                strncpy(eff_action, (string_equals_ci(rule->action, "ON") || strcmp(rule->action, "1") == 0) ? "OFF" : "ON", sizeof(eff_action) - 1);
+                            }
+                        }
+                    }
+
+                    /* 3. Output Arbitration by Rule Priority (1..16, higher wins) */
+                    if (eff_active) {
+                        uint8_t p = rule->priority > 0 ? rule->priority : 10;
+                        if (!claims[out_idx].claimed || p > claims[out_idx].priority) {
+                            claims[out_idx].claimed = 1;
+                            claims[out_idx].priority = p;
+                            claims[out_idx].atype = atype;
+                            claims[out_idx].hw_ch = hw_ch;
+                            strncpy(claims[out_idx].action, eff_action, sizeof(claims[out_idx].action) - 1);
+                            claims[out_idx].action_value = eff_value;
+                            claims[out_idx].action_frequency = eff_freq;
+                            claims[out_idx].action_steps = eff_steps;
+                        }
+                    }
+
+                skip_rule:
+                    (void)0;
+                }
+
+                /* 4. Apply Arbitrated Outputs to Hardware */
+                for (uint8_t out = 0; out < cfg_snap.actuator_count && out < MAX_RELAYS; out++) {
+                    if (claims[out].claimed) {
+                        uint8_t atype = claims[out].atype;
+                        uint8_t hw_ch = claims[out].hw_ch;
+                        const char *act = claims[out].action;
+
+                        if (atype == ACTUATOR_TYPE_PWM && string_equals_ci(act, "SET_DUTY")) {
+                            PWM_SetDuty(hw_ch, claims[out].action_value);
+                            if (claims[out].action_frequency > 0) {
+                                PWM_SetFrequency(hw_ch, claims[out].action_frequency);
+                            }
+                        } else if (atype == ACTUATOR_TYPE_PWM && (string_equals_ci(act, "OFF") || strcmp(act, "0") == 0)) {
+                            PWM_SetDuty(hw_ch, 0.0f);
+                        } else if (atype == ACTUATOR_TYPE_ANALOG_MA && string_equals_ci(act, "SET_MA")) {
+                            DAC_420MA_SetCurrent(hw_ch, claims[out].action_value);
+                        } else if (atype == ACTUATOR_TYPE_ANALOG_V && string_equals_ci(act, "SET_V")) {
+                            Analog_010V_SetVoltage(hw_ch, claims[out].action_value);
+                        } else if (atype == ACTUATOR_TYPE_PTO && string_equals_ci(act, "MOVE")) {
+                            PTO_MoveRelative(hw_ch, claims[out].action_steps, claims[out].action_frequency > 0 ? claims[out].action_frequency : 1000);
+                        } else {
+                            uint8_t action_val = 0;
+                            if (string_equals_ci(act, "ON") || strcmp(act, "1") == 0) {
+                                action_val = 1;
+                            }
+                            Relay_SetState(out, action_val);
                         }
                     }
                 }
@@ -768,9 +1100,10 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
                         break;
                     }
                 }
-                /* Only include key if sensor is online and valid */
                 if (sensor_valid) {
                     pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":%.2f", cfg->mqtt_mappings[m].json_key, val);
+                } else if (!cfg->mqtt_skip_offline) {
+                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":0.00", cfg->mqtt_mappings[m].json_key);
                 }
             } else if (cfg->mqtt_mappings[m].source_type == MAP_SOURCE_ACTUATOR) {
                 uint8_t r_id = cfg->mqtt_mappings[m].source_id;
@@ -779,13 +1112,43 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
             }
         }
     } else {
-        /* Dynamic key-value mapping: ONLY emit sensors that are currently online and valid */
-        for (int s = 0; s < batch->count; s++) {
-            if (!batch->records[s].valid) continue;
-            const char *tname = SensorTypeName(batch->records[s].type);
-            pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":%.2f", tname, batch->records[s].avg_value);
-            if (batch->records[s].avg_temp > -50.0f && batch->records[s].avg_temp < 150.0f) {
-                pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_temp\":%.2f", tname, batch->records[s].avg_temp);
+        /* Dynamic key-value mapping: emit all configured sensors (or batch records) */
+        uint8_t total_sensors = (cfg->sensors.count > 0 && cfg->sensors.count <= MAX_SENSORS) ? cfg->sensors.count : 0;
+        uint8_t sens_emitted = 0;
+        if (total_sensors > 0) {
+            for (uint8_t i = 0; i < total_sensors; i++) {
+                uint8_t stype = cfg->sensors.entries[i].type;
+                uint8_t sid   = cfg->sensors.entries[i].id;
+                const char *tname = SensorTypeName(stype);
+
+                int b_idx = -1;
+                for (int b = 0; b < batch->count; b++) {
+                    if (batch->records[b].type == stype && batch->records[b].id == sid) {
+                        b_idx = b;
+                        break;
+                    }
+                }
+
+                if (b_idx >= 0 && batch->records[b_idx].valid) {
+                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_%u\":%.2f", tname, sid, batch->records[b_idx].avg_value);
+                    if (batch->records[b_idx].avg_temp > -50.0f && batch->records[b_idx].avg_temp < 150.0f) {
+                        pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_%u_temp\":%.2f", tname, sid, batch->records[b_idx].avg_temp);
+                    }
+                    sens_emitted = 1;
+                } else if (!cfg->mqtt_skip_offline) {
+                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_%u\":0.00", tname, sid);
+                    sens_emitted = 1;
+                }
+            }
+        }
+        if (!sens_emitted && batch->count > 0) {
+            for (int s = 0; s < batch->count; s++) {
+                if (cfg->mqtt_skip_offline && !batch->records[s].valid) continue;
+                const char *tname = SensorTypeName(batch->records[s].type);
+                pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":%.2f", tname, batch->records[s].avg_value);
+                if (batch->records[s].avg_temp > -50.0f && batch->records[s].avg_temp < 150.0f) {
+                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_temp\":%.2f", tname, batch->records[s].avg_temp);
+                }
             }
         }
         
@@ -1162,6 +1525,7 @@ static void Task_MQTTClient(void *arg) {
     uint16_t connected_port   = 0;
     uint32_t last_publish     = 0;
     uint8_t broker_empty_notified = 0;
+    uint32_t mqtt_tcp_backoff_ms = 3000;  /* Exponential backoff for TCP failures: 3s → 5s → 10s → 20s → 30s cap */
     
     for (;;) {
         if (g_ota_in_progress) {
@@ -1303,6 +1667,7 @@ static void Task_MQTTClient(void *arg) {
         if (ConnectNetwork(&n, broker_ip, s_tasks_cfg.mqtt_port) == SOCK_OK) {
             printf("[MQTT] TCP Connected! Initializing MQTT client...\r\n");
             Log_Event("MQTT", "TCP connection established.");
+            mqtt_tcp_backoff_ms = 3000;  /* Reset backoff on successful TCP connect */
             
             MQTTClientInit(&client, &n, 5000, tx_buf, sizeof(tx_buf), rx_buf, sizeof(rx_buf));
             
@@ -1440,6 +1805,7 @@ static void Task_MQTTClient(void *arg) {
                         static uint32_t cov_last_heartbeat_s         = 0;
                         static uint32_t cov_last_pub_tick            = 0;
                         static uint32_t cov_seq                      = 0;
+                        static uint8_t  cov_actuators_init           = 0;
 
                         TelemetryBatch_t batch = {0};
                         Modbus_DMA_ConsumeBatch(&batch);
@@ -1447,39 +1813,62 @@ static void Task_MQTTClient(void *arg) {
                         /* Check for changes across all actuator types (Relay, PWM, PTO, 4-20mA, 0-10V, Test Mode) */
                         uint8_t actuator_changed = 0;
                         uint8_t act_cnt = (s_tasks_cfg.actuator_count > 0) ? s_tasks_cfg.actuator_count : MAX_RELAYS;
-                        for (int i = 0; i < act_cnt && i < MAX_RELAYS; i++) {
-                            if (relayStates[i] != cov_last_relay[i]) {
+
+                        if (!cov_actuators_init) {
+                            /* First iteration after connect: capture initial baseline without triggering actuator_changed */
+                            for (int i = 0; i < act_cnt && i < MAX_RELAYS; i++) cov_last_relay[i] = relayStates[i];
+                            for (uint8_t c = 0; c < PWM_GetChannelCount() && c < MAX_PWM_CHANNELS; c++) {
+                                const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(c);
+                                if (pw) cov_last_pwm[c] = (uint8_t)pw->duty_pct;
+                            }
+                            for (uint8_t c = 0; c < PTO_GetChannelCount() && c < MAX_PTO_CHANNELS; c++) {
+                                const PTO_Channel_Status_t *pt = PTO_GetStatus(c);
+                                if (pt) { cov_last_pto_pos[c] = pt->position; cov_last_pto_mov[c] = pt->moving; }
+                            }
+                            for (uint8_t c = 0; c < DAC_420MA_GetChannelCount() && c < MAX_420MA_CHANNELS; c++) {
+                                cov_last_ma[c] = DAC_420MA_GetCurrent(c);
+                            }
+                            for (uint8_t c = 0; c < Analog_010V_GetChannelCount() && c < MAX_010V_CHANNELS; c++) {
+                                cov_last_v[c] = Analog_010V_GetVoltage(c);
+                            }
+                            cov_last_test_mode = s_tasks_cfg.test_mode;
+                            cov_actuators_init = 1;
+                        } else {
+                            for (int i = 0; i < act_cnt && i < MAX_RELAYS; i++) {
+                                if (relayStates[i] != cov_last_relay[i]) {
+                                    actuator_changed = 1;
+                                    break;
+                                }
+                            }
+                            for (uint8_t c = 0; !actuator_changed && c < PWM_GetChannelCount() && c < MAX_PWM_CHANNELS; c++) {
+                                const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(c);
+                                if (pw && (uint8_t)pw->duty_pct != cov_last_pwm[c]) {
+                                    actuator_changed = 1; break;
+                                }
+                            }
+                            for (uint8_t c = 0; !actuator_changed && c < PTO_GetChannelCount() && c < MAX_PTO_CHANNELS; c++) {
+                                const PTO_Channel_Status_t *pt = PTO_GetStatus(c);
+                                if (pt && (pt->position != cov_last_pto_pos[c] || pt->moving != cov_last_pto_mov[c])) {
+                                    actuator_changed = 1; break;
+                                }
+                            }
+                            for (uint8_t c = 0; !actuator_changed && c < DAC_420MA_GetChannelCount() && c < MAX_420MA_CHANNELS; c++) {
+                                float ma = DAC_420MA_GetCurrent(c);
+                                float dma = ma - cov_last_ma[c];
+                                if (dma < 0) dma = -dma;
+                                if (dma >= 0.05f) { actuator_changed = 1; break; }
+                            }
+                            for (uint8_t c = 0; !actuator_changed && c < Analog_010V_GetChannelCount() && c < MAX_010V_CHANNELS; c++) {
+                                float v = Analog_010V_GetVoltage(c);
+                                float dv = v - cov_last_v[c];
+                                if (dv < 0) dv = -dv;
+                                if (dv >= 0.05f) { actuator_changed = 1; break; }
+                            }
+                            if (s_tasks_cfg.test_mode != cov_last_test_mode) {
                                 actuator_changed = 1;
-                                break;
                             }
                         }
-                        for (uint8_t c = 0; !actuator_changed && c < PWM_GetChannelCount() && c < MAX_PWM_CHANNELS; c++) {
-                            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(c);
-                            if (pw && (uint8_t)pw->duty_pct != cov_last_pwm[c]) {
-                                actuator_changed = 1; break;
-                            }
-                        }
-                        for (uint8_t c = 0; !actuator_changed && c < PTO_GetChannelCount() && c < MAX_PTO_CHANNELS; c++) {
-                            const PTO_Channel_Status_t *pt = PTO_GetStatus(c);
-                            if (pt && (pt->position != cov_last_pto_pos[c] || pt->moving != cov_last_pto_mov[c])) {
-                                actuator_changed = 1; break;
-                            }
-                        }
-                        for (uint8_t c = 0; !actuator_changed && c < DAC_420MA_GetChannelCount() && c < MAX_420MA_CHANNELS; c++) {
-                            float ma = DAC_420MA_GetCurrent(c);
-                            float dma = ma - cov_last_ma[c];
-                            if (dma < 0) dma = -dma;
-                            if (dma >= 0.05f) { actuator_changed = 1; break; }
-                        }
-                        for (uint8_t c = 0; !actuator_changed && c < Analog_010V_GetChannelCount() && c < MAX_010V_CHANNELS; c++) {
-                            float v = Analog_010V_GetVoltage(c);
-                            float dv = v - cov_last_v[c];
-                            if (dv < 0) dv = -dv;
-                            if (dv >= 0.05f) { actuator_changed = 1; break; }
-                        }
-                        if (s_tasks_cfg.test_mode != cov_last_test_mode) {
-                            actuator_changed = 1;
-                        }
+
 
                         if (s_tasks_cfg.mqtt_tx_enabled == 0) {
                             /* Publishing paused by Master Transmission Switch */
@@ -1551,8 +1940,9 @@ static void Task_MQTTClient(void *arg) {
                                         case 4: db_abs=COV_DB_DO;  pct=COV_PCT_DO;  range=COV_RNG_DO;  break;
                                         case 5: db_abs=COV_DB_AMM; pct=COV_PCT_AMM; range=COV_RNG_AMM; break;
                                         case 6:
-                                        case 7: db_abs=COV_DB_US;  pct=COV_PCT_US;  range=COV_RNG_US;  break;
-                                        default:db_abs=COV_DB_DEF; pct=1.0f;        range=100.0f;      break;
+                                        case 7:
+                                        case 10: db_abs=COV_DB_US;  pct=COV_PCT_US;  range=COV_RNG_US;  break;
+                                        default:db_abs=1.0f;       pct=2.0f;        range=100.0f;      break;
                                     }
 
                                     float db_pct = (pct / 100.0f) * range;
@@ -1571,91 +1961,117 @@ static void Task_MQTTClient(void *arg) {
                                         cov_above_db[idx] = 0;
                                     }
 
-                                    float dt = batch.records[i].avg_temp - cov_last_tmp[idx];
-                                    if (dt < 0.0f) dt = -dt;
-                                    if (dt >= 0.5f) { has_change = 1; trigger = "cov_temp"; break; }
+                                    /* Only trigger on significant temperature change (>= 1.5°C) if sensor has valid temp reading */
+                                    if (batch.records[i].avg_temp > -40.0f && cov_last_tmp[idx] > -40.0f) {
+                                        float dt = batch.records[i].avg_temp - cov_last_tmp[idx];
+                                        if (dt < 0.0f) dt = -dt;
+                                        if (dt >= 1.5f) { has_change = 1; trigger = "cov_temp"; break; }
+                                    }
                                 }
+                            }
+
+                            /* Rate limit: In CoV mode, throttle publications to at most once per 1000ms */
+                            if (has_change && (osKernelGetTickCount() - last_publish) < pdMS_TO_TICKS(1000)) {
+                                has_change = 0;
                             }
                         }
 
                         if (!has_change) {
-                            /* ── Only drain offline queue in Periodic mode ── */
-                            if (s_tasks_cfg.mqtt_send_mode == 0) {
+                            /* ── Drain offline queue in ANY send mode (Periodic / On Change) ── */
+                            {
                                 static uint32_t s_last_queue_drain_tick = 0;
                                 uint32_t now_drain_tick = osKernelGetTickCount();
                                 uint32_t drain_interval_ticks = pdMS_TO_TICKS(s_tasks_cfg.mqtt_interval > 0 ? (s_tasks_cfg.mqtt_interval * 1000) : 2000);
                                 if (drain_interval_ticks < pdMS_TO_TICKS(2000)) drain_interval_ticks = pdMS_TO_TICKS(2000);
 
-                                if (s_tasks_cfg.mqtt_tx_enabled && Partition_Queue_Count() > 0 &&
+                                if (s_tasks_cfg.mqtt_tx_enabled && SDCard_Queue_Count() > 0 &&
                                     (now_drain_tick - s_last_queue_drain_tick) >= drain_interval_ticks) {
                                     s_last_queue_drain_tick = now_drain_tick;
-                                    static char cache_json[512];
-                                    const char *d_id = s_tasks_cfg.device_id[0] ? s_tasks_cfg.device_id :
-                                                       (s_tasks_cfg.mqtt_client_id[0] ? s_tasks_cfg.mqtt_client_id : "kontrx-gateway-01");
-                                    int pos = snprintf(cache_json, sizeof(cache_json),
-                                                       "{\"deviceId\":\"%s\",\"status\":\"Queued\",\"sensors\":{", d_id);
-                                    uint8_t count = 0;
-                                    uint32_t last_ts = 0;
+
+                                    /* Rebuild ONE cached snapshot (records sharing the same timestamp)
+                                     * on top of the current batch layout, then publish it with the SAME
+                                     * encoder / topic / shape configured on the MQTT page. */
+                                    static TelemetryBatch_t q_batch;
+                                    static uint8_t q_relays[MAX_RELAYS];
+                                    q_batch = batch;
+                                    for (int i = 0; i < q_batch.count && i < MAX_SENSORS; i++) q_batch.records[i].valid = 0;
+                                    memcpy(q_relays, relayStates, sizeof(q_relays));
+
                                     OfflineRecord_t rec;
-                                    char emitted_keys[16][24];
-                                    uint8_t emitted_count = 0;
-
-                                    while (count < 8 && Partition_Queue_Count() > 0 && Partition_Queue_Pop(&rec)) {
-                                        if (!rec.valid && s_tasks_cfg.mqtt_skip_offline) continue;
-                                        char key_name[24] = {0};
-                                        for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
-                                            if (s_tasks_cfg.mqtt_mappings[m].source_type == rec.source_type &&
-                                                s_tasks_cfg.mqtt_mappings[m].source_id == rec.source_id &&
-                                                s_tasks_cfg.mqtt_mappings[m].enabled) {
-                                                strncpy(key_name, s_tasks_cfg.mqtt_mappings[m].json_key, sizeof(key_name) - 1);
-                                                break;
+                                    uint32_t consumed = 0;
+                                    uint32_t snap_ts = 0;
+                                    uint8_t applied = 0;
+                                    while (consumed < 64 && SDCard_Queue_PeekAt(consumed, &rec)) {
+                                        if (consumed == 0) snap_ts = rec.timestamp;
+                                        else if (rec.timestamp != snap_ts) break;
+                                        consumed++;
+                                        uint8_t was_valid = rec.padding ? 1 : 0;
+                                        if (rec.source_type == MAP_SOURCE_SENSOR) {
+                                            for (int i = 0; i < q_batch.count && i < MAX_SENSORS; i++) {
+                                                if (q_batch.records[i].id == rec.source_id) {
+                                                    q_batch.records[i].avg_value = rec.value;
+                                                    q_batch.records[i].avg_temp  = rec.temp;
+                                                    q_batch.records[i].valid     = was_valid;
+                                                    applied = 1;
+                                                    break;
+                                                }
                                             }
+                                        } else if (rec.source_type == MAP_SOURCE_ACTUATOR && rec.source_id < MAX_RELAYS) {
+                                            q_relays[rec.source_id] = (uint8_t)rec.value;
+                                            applied = 1;
                                         }
-                                        if (key_name[0] == '\0') {
-                                            if (rec.source_type == MAP_SOURCE_SENSOR)
-                                                snprintf(key_name, sizeof(key_name), "sensor_%u", rec.source_id);
-                                            else
-                                                snprintf(key_name, sizeof(key_name), "relay_%u", rec.source_id);
-                                        }
-
-                                        /* Ensure key is unique within this batch snapshot */
-                                        uint8_t duplicate = 0;
-                                        for (uint8_t k = 0; k < emitted_count; k++) {
-                                            if (strcmp(emitted_keys[k], key_name) == 0) {
-                                                duplicate = 1;
-                                                break;
-                                            }
-                                        }
-                                        if (duplicate) {
-                                            char suffixed_key[28];
-                                            snprintf(suffixed_key, sizeof(suffixed_key), "%s_%u", key_name, count + 1);
-                                            pos += snprintf(cache_json + pos, sizeof(cache_json) - pos,
-                                                            "%s\"%s\":%.2f", count ? "," : "", suffixed_key, rec.value);
-                                        } else {
-                                            strncpy(emitted_keys[emitted_count++], key_name, sizeof(emitted_keys[0]) - 1);
-                                            pos += snprintf(cache_json + pos, sizeof(cache_json) - pos,
-                                                            "%s\"%s\":%.2f", count ? "," : "", key_name, rec.value);
-                                        }
-
-                                        if (rec.timestamp > last_ts) last_ts = rec.timestamp;
-                                        count++;
                                     }
-                                    if (count > 0) {
-                                        pos += snprintf(cache_json + pos, sizeof(cache_json) - pos,
-                                                        "},\"timestamp\":%lu}", (unsigned long)last_ts);
+
+                                    if (applied) {
+                                        int q_rc = -1;
+                                        static char q_log[256];
+                                        int q_is_spb = (s_tasks_cfg.mqtt_payload_shape == 2 ||
+                                                        strncmp(active_topic, "spBv1.0/", 8) == 0 ||
+                                                        s_tasks_cfg.sparkplug_topic[0] != '\0');
                                         MQTTMessage msg;
                                         msg.qos = QOS1;
-                                        msg.retained = 0;
+                                        msg.retained = 0;   /* historical data must not replace the retained live value */
                                         msg.dup = 0;
-                                        msg.payload = (void*)cache_json;
-                                        msg.payloadlen = strlen(cache_json);
-                                        int cache_pub_rc = MQTTPublish(&client, active_topic, &msg);
-                                        Log_Mqtt_Topic(active_topic, cache_json, cache_pub_rc == SUCCESSS);
+                                        char q_topic[128];
+                                        if (q_is_spb) {
+                                            static uint8_t q_buf[2560];
+                                            cov_seq = (cov_seq + 1) & 0xFF;
+                                            if (cov_seq == 0) cov_seq = 1;
+                                            size_t q_len = sparkplug_encode_ddata(q_buf, sizeof(q_buf),
+                                                                                  (uint64_t)snap_ts * 1000, cov_seq,
+                                                                                  &q_batch, &s_tasks_cfg, q_relays);
+                                            get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "DDATA", q_topic, sizeof(q_topic));
+                                            msg.payload = (void*)q_buf;
+                                            msg.payloadlen = q_len;
+                                            snprintf(q_log, sizeof(q_log),
+                                                     "{\"protocol\":\"Sparkplug B\",\"msg\":\"DDATA\",\"replay\":true,\"seq\":%lu,\"bytes\":%d,\"ts\":%lu,\"records\":%lu}",
+                                                     (unsigned long)cov_seq, (int)q_len, (unsigned long)snap_ts, (unsigned long)consumed);
+                                            if (q_len > 0) q_rc = MQTTPublish(&client, q_topic, &msg);
+                                        } else {
+                                            static char q_json[1024];
+                                            if (s_tasks_cfg.mqtt_payload_shape == 1)
+                                                Build_Flat_Telemetry_JSON(q_json, sizeof(q_json), &q_batch, &s_tasks_cfg);
+                                            else
+                                                Build_Structured_Telemetry_JSON(q_json, sizeof(q_json), &q_batch, &s_tasks_cfg);
+                                            strncpy(q_topic, active_topic, sizeof(q_topic) - 1);
+                                            q_topic[sizeof(q_topic) - 1] = '\0';
+                                            msg.payload = (void*)q_json;
+                                            msg.payloadlen = strlen(q_json);
+                                            strncpy(q_log, q_json, sizeof(q_log) - 1);
+                                            q_log[sizeof(q_log) - 1] = '\0';
+                                            q_rc = MQTTPublish(&client, q_topic, &msg);
+                                        }
+                                        Log_Mqtt_Topic(q_topic, q_log, q_rc == SUCCESSS);
+                                        if (q_rc == SUCCESSS) SDCard_Queue_Discard(consumed);
+                                    } else if (consumed > 0) {
+                                        /* Records no longer map to any configured sensor/actuator */
+                                        SDCard_Queue_Discard(consumed);
+                                    }
+                                    if (consumed > 0 && SDCard_Queue_Count() == 0) {
+                                        Log_Event("MQTT", "Offline queue flushed to broker.");
                                     }
                                 }
                             }
-                            /* In On Change mode (mqtt_send_mode == 1): do NOT drain queue.
-                               Queue will drain when a real change or heartbeat triggers a publish. */
                             osDelay(50);
                             continue;
                         }
@@ -1730,22 +2146,54 @@ static void Task_MQTTClient(void *arg) {
                                                    (unsigned long)cov_seq, (int)ddata_len);
 
                             uint8_t sens_logged = 0;
-                            for (int si = 0; si < batch.count && log_pos < (int)sizeof(pub_payload_str) - 80; si++) {
-                                if (s_tasks_cfg.mqtt_skip_offline && !batch.records[si].valid) continue;
-                                const char *sname = SensorTypeName(batch.records[si].type);
-                                if (batch.records[si].valid) {
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
-                                                        sens_logged ? "," : "",
-                                                        sname, batch.records[si].id,
-                                                        batch.records[si].avg_value, batch.records[si].avg_temp);
-                                } else {
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
-                                                        sens_logged ? "," : "",
-                                                        sname, batch.records[si].id);
+                            uint8_t total_cfg_sensors = (s_tasks_cfg.sensors.count > 0 && s_tasks_cfg.sensors.count <= MAX_SENSORS) ? s_tasks_cfg.sensors.count : 0;
+                            if (total_cfg_sensors > 0) {
+                                for (uint8_t si = 0; si < total_cfg_sensors && log_pos < (int)sizeof(pub_payload_str) - 80; si++) {
+                                    uint8_t stype = s_tasks_cfg.sensors.entries[si].type;
+                                    uint8_t sid   = s_tasks_cfg.sensors.entries[si].id;
+                                    const char *sname = SensorTypeName(stype);
+
+                                    int b_idx = -1;
+                                    for (int b = 0; b < batch.count; b++) {
+                                        if (batch.records[b].type == stype && batch.records[b].id == sid) {
+                                            b_idx = b;
+                                            break;
+                                        }
+                                    }
+
+                                    if (b_idx >= 0 && batch.records[b_idx].valid) {
+                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
+                                                            "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+                                                            sens_logged ? "," : "",
+                                                            sname, sid,
+                                                            batch.records[b_idx].avg_value, batch.records[b_idx].avg_temp);
+                                        sens_logged = 1;
+                                    } else if (!s_tasks_cfg.mqtt_skip_offline) {
+                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
+                                                            "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
+                                                            sens_logged ? "," : "",
+                                                            sname, sid);
+                                        sens_logged = 1;
+                                    }
                                 }
-                                sens_logged = 1;
+                            } else {
+                                for (int si = 0; si < batch.count && log_pos < (int)sizeof(pub_payload_str) - 80; si++) {
+                                    if (s_tasks_cfg.mqtt_skip_offline && !batch.records[si].valid) continue;
+                                    const char *sname = SensorTypeName(batch.records[si].type);
+                                    if (batch.records[si].valid) {
+                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
+                                                            "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+                                                            sens_logged ? "," : "",
+                                                            sname, batch.records[si].id,
+                                                            batch.records[si].avg_value, batch.records[si].avg_temp);
+                                    } else {
+                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
+                                                            "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
+                                                            sens_logged ? "," : "",
+                                                            sname, batch.records[si].id);
+                                    }
+                                    sens_logged = 1;
+                                }
                             }
 
                             log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos, "},\"actuators\":{");
@@ -1850,9 +2298,19 @@ static void Task_MQTTClient(void *arg) {
                             live_event_published = 1;
                             cov_last_pub_tick = osKernelGetTickCount();
                             last_publish = cov_last_pub_tick;
-                            char pub_msg[128];
-                            snprintf(pub_msg, sizeof(pub_msg), "Pub %s", active_topic);
-                            Log_Event("MQTT", pub_msg);
+                            /* Summarise publishes in the flash log once per minute
+                             * (per-message detail stays in the RAM Transmission Log) */
+                            static uint32_t s_pub_count = 0;
+                            static uint32_t s_pub_log_s = 0;
+                            s_pub_count++;
+                            if ((g_uptime_seconds - s_pub_log_s) >= 60U) {
+                                char pub_msg[64];
+                                snprintf(pub_msg, sizeof(pub_msg), "Published %lu DDATA msgs (last 60s)",
+                                         (unsigned long)s_pub_count);
+                                Log_Event("MQTT", pub_msg);
+                                s_pub_count = 0;
+                                s_pub_log_s = g_uptime_seconds;
+                            }
                             Log_Mqtt_Topic(active_topic, pub_payload_str, 1);
                         } else {
                             Log_Mqtt_Topic(active_topic, pub_payload_str, 0);
@@ -1909,7 +2367,11 @@ static void Task_MQTTClient(void *arg) {
             g_mqtt_status.connected = 0;
             snprintf((char*)g_mqtt_status.last_error, sizeof(g_mqtt_status.last_error), "TCP fail: %s:%d", s_tasks_cfg.mqtt_broker, s_tasks_cfg.mqtt_port);
             close(n.my_socket);
-            osDelay(3000);
+            osDelay(mqtt_tcp_backoff_ms);
+            /* Exponential backoff: double the delay each failure, cap at 30 seconds */
+            if (mqtt_tcp_backoff_ms < 30000) {
+                mqtt_tcp_backoff_ms = (mqtt_tcp_backoff_ms * 2 > 30000) ? 30000 : mqtt_tcp_backoff_ms * 2;
+            }
         }
         
         // Cache telemetry data locally while disconnected (always active when MQTT is disconnected)
@@ -1966,7 +2428,7 @@ void RTOS_Tasks_Init(void) {
     /* Task 3 — HTTP Server */
     attr.name       = "HTTPServer";
     attr.stack_size = 12288;  /* Increased to 12KB to guarantee absolute stack overflow protection */
-    attr.priority   = osPriorityNormal;
+    attr.priority   = osPriorityAboveNormal;
     osThreadNew(Task_HTTPServer, NULL, &attr);
 
     /* Task 4 — OTA Background */

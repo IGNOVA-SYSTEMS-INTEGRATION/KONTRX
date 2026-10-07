@@ -28,6 +28,8 @@ void SDCard_GetStatus(SDCard_Status_t *status);
 void SDCard_Queue_Push(const OfflineRecord_t *rec);
 uint8_t SDCard_Queue_Pop(OfflineRecord_t *rec);
 uint32_t SDCard_Queue_Count(void);
+uint8_t SDCard_Queue_PeekAt(uint32_t index, OfflineRecord_t *rec);
+void SDCard_Queue_Discard(uint32_t n);
 void SDCard_Queue_Clear(void);
 
 /* System-Wide Event Logger on SD Card */

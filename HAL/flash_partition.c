@@ -38,9 +38,8 @@ void Partition_Init(void) {
     uint32_t first_empty = 0xFFFFFFFF;
     uint32_t first_active = 0xFFFFFFFF;
     
-    // We have 32768 slots of 16 bytes each in the 512KB queue partition
-    for (uint32_t i = 0; i < 32768; i++) {
-        uint32_t addr = PARTITION_QUEUE_ADDR + i * 16;
+    for (uint32_t i = 0; i < QUEUE_MAX_ENTRIES; i++) {
+        uint32_t addr = PARTITION_QUEUE_ADDR + i * QUEUE_RECORD_SIZE;
         uint8_t buf[8];
         W25Q_Read(addr, buf, 8);
         
@@ -179,6 +178,8 @@ static uint8_t Sanitize_Config(Gateway_Config_t *cfg) {
     SANITIZE_FIELD(cfg->device_id);
     SANITIZE_FIELD(cfg->sparkplug_topic);
     SANITIZE_FIELD(cfg->pending_sparkplug_topic);
+    SANITIZE_FIELD(cfg->sparkplug_edge_node_id);
+    SANITIZE_FIELD(cfg->sparkplug_device_id);
     SANITIZE_FIELD(cfg->provision_status);
     SANITIZE_FIELD(cfg->provision_message);
     SANITIZE_FIELD(cfg->admin_username);
@@ -228,6 +229,24 @@ static uint8_t Sanitize_Config(Gateway_Config_t *cfg) {
     if (cfg->provision_status[0] == '\0') {
         strncpy(cfg->provision_status, "Active", sizeof(cfg->provision_status) - 1);
         changed = 1;
+    }
+
+    /* Sanitize actuators: ensure no actuator has hijacked SPI Flash pins (PB0 CS, PB3..PB5) */
+    for (int i = 0; i < (int)cfg->actuator_count && i < MAX_RELAYS; i++) {
+        if (cfg->actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO ||
+            cfg->actuators[i].type == ACTUATOR_TYPE_DIGITAL_OUT) {
+            int port = (cfg->actuators[i].port_or_ip[0] == 'P' &&
+                        cfg->actuators[i].port_or_ip[1] >= 'A' &&
+                        cfg->actuators[i].port_or_ip[1] <= 'E') ?
+                        (cfg->actuators[i].port_or_ip[1] - 'A') : -1;
+            uint8_t pin = cfg->actuators[i].pin_or_slave;
+            if (port == 1 && (pin == 0 || pin == 3 || pin == 4 || pin == 5 || (pin >= 10 && pin <= 15))) {
+                printf("[Partition] Actuator %d: PB%u is reserved for SPI Flash! Remapping to PE0\r\n", i + 1, pin);
+                strncpy(cfg->actuators[i].port_or_ip, "PE", sizeof(cfg->actuators[i].port_or_ip) - 1);
+                cfg->actuators[i].pin_or_slave = 0;
+                changed = 1;
+            }
+        }
     }
 
     return changed;
@@ -393,26 +412,84 @@ uint8_t Partition_BackupCurrentRules(void) {
 }
 
 /* ======================================================================
+ *  Canvas Layout Blob (opaque JSON round-trip for desktop configurator)
+ *  Flash format: [magic:4] [data_len:4] [json_data:N] [crc32:4]
+ * ====================================================================== */
+uint8_t Partition_SaveLayout(const char *json, uint32_t len) {
+    if (!json || len == 0 || len > LAYOUT_MAX_DATA) {
+        printf("[Layout] Save rejected: len=%lu (max %lu)\r\n",
+               (unsigned long)len, (unsigned long)LAYOUT_MAX_DATA);
+        return 0;
+    }
+
+    uint32_t sectors = (len + 12U + 4095U) / 4096U;
+    if (sectors > (LAYOUT_PARTITION_SIZE / 4096U)) sectors = LAYOUT_PARTITION_SIZE / 4096U;
+    for (uint32_t s = 0; s < sectors; s++) {
+        W25Q_EraseSector(LAYOUT_PARTITION_ADDR + s * 4096U);
+    }
+
+    uint32_t magic = LAYOUT_MAGIC;
+    uint32_t crc   = Compute_CRC32((const uint8_t *)json, len);
+
+    W25Q_Write(LAYOUT_PARTITION_ADDR,      (const uint8_t *)&magic, 4);
+    W25Q_Write(LAYOUT_PARTITION_ADDR + 4,  (const uint8_t *)&len,   4);
+    W25Q_Write(LAYOUT_PARTITION_ADDR + 8,  (const uint8_t *)json,   len);
+    W25Q_Write(LAYOUT_PARTITION_ADDR + 8 + len, (const uint8_t *)&crc, 4);
+
+    printf("[Layout] Saved %lu bytes of canvas layout to flash.\r\n", (unsigned long)len);
+    return 1;
+}
+
+uint32_t Partition_LoadLayout(char *buf, uint32_t buf_size) {
+    uint32_t magic = 0, data_len = 0;
+    W25Q_Read(LAYOUT_PARTITION_ADDR,     (uint8_t *)&magic,    4);
+    W25Q_Read(LAYOUT_PARTITION_ADDR + 4, (uint8_t *)&data_len, 4);
+
+    if (magic != LAYOUT_MAGIC || data_len == 0 || data_len > LAYOUT_MAX_DATA) {
+        return 0;
+    }
+    if (data_len >= buf_size) {
+        printf("[Layout] Buffer too small: need %lu, have %lu\r\n",
+               (unsigned long)data_len, (unsigned long)buf_size);
+        return 0;
+    }
+
+    W25Q_Read(LAYOUT_PARTITION_ADDR + 8, (uint8_t *)buf, data_len);
+    buf[data_len] = '\0';
+
+    uint32_t stored_crc = 0;
+    W25Q_Read(LAYOUT_PARTITION_ADDR + 8 + data_len, (uint8_t *)&stored_crc, 4);
+    uint32_t cal_crc = Compute_CRC32((const uint8_t *)buf, data_len);
+
+    if (stored_crc != cal_crc) {
+        printf("[Layout] CRC mismatch — layout data corrupted.\r\n");
+        return 0;
+    }
+
+    return data_len;
+}
+
+/* ======================================================================
  *  Offline Telemetry Queue (FIFO Ring)
  * ====================================================================== */
 void Partition_Queue_Push(const OfflineRecord_t *rec) {
-    uint32_t addr = PARTITION_QUEUE_ADDR + q_write_ptr * 16;
-    
+    uint32_t addr = PARTITION_QUEUE_ADDR + q_write_ptr * QUEUE_RECORD_SIZE;
+
     // If we are at the beginning of a 4KB sector, we must erase it
     if ((addr % 4096) == 0) {
         W25Q_EraseSector(addr);
     }
     
     OfflineRecord_t copy = *rec;
+    copy.padding = rec->valid ? 1 : 0; // original data validity (valid byte is the flash state marker)
     copy.valid = 0xAA; // 0xAA = Active/Unprocessed
-    copy.padding = 0;
     
     W25Q_Write(addr, (const uint8_t *)&copy, sizeof(OfflineRecord_t));
-    q_write_ptr = (q_write_ptr + 1) % 32768;
+    q_write_ptr = (q_write_ptr + 1) % QUEUE_MAX_ENTRIES;
     
     // If queue write wraps and hits read pointer, advance read pointer (reclaim/overwrite)
     if (q_write_ptr == q_read_ptr) {
-        q_read_ptr = (q_read_ptr + 1) % 32768;
+        q_read_ptr = (q_read_ptr + 1) % QUEUE_MAX_ENTRIES;
     }
 }
 
@@ -421,14 +498,14 @@ uint8_t Partition_Queue_Pop(OfflineRecord_t *rec) {
         return 0; // Empty
     }
     
-    uint32_t addr = PARTITION_QUEUE_ADDR + q_read_ptr * 16;
+    uint32_t addr = PARTITION_QUEUE_ADDR + q_read_ptr * QUEUE_RECORD_SIZE;
     W25Q_Read(addr, (uint8_t *)rec, sizeof(OfflineRecord_t));
     
     // Mark record as processed (0x55) in flash (without erasing)
     uint8_t processed_val = 0x55;
     W25Q_Write(addr + 6, &processed_val, 1);
     
-    q_read_ptr = (q_read_ptr + 1) % 32768;
+    q_read_ptr = (q_read_ptr + 1) % QUEUE_MAX_ENTRIES;
     return 1;
 }
 
@@ -436,8 +513,20 @@ uint32_t Partition_Queue_Count(void) {
     if (q_write_ptr >= q_read_ptr) {
         return q_write_ptr - q_read_ptr;
     } else {
-        return (32768 - q_read_ptr) + q_write_ptr;
+        return (QUEUE_MAX_ENTRIES - q_read_ptr) + q_write_ptr;
     }
+}
+
+uint8_t Partition_Queue_PeekAt(uint32_t index, OfflineRecord_t *rec) {
+    if (!rec || index >= Partition_Queue_Count()) return 0;
+    uint32_t slot = (q_read_ptr + index) % QUEUE_MAX_ENTRIES;
+    W25Q_Read(PARTITION_QUEUE_ADDR + slot * QUEUE_RECORD_SIZE, (uint8_t *)rec, sizeof(OfflineRecord_t));
+    return 1;
+}
+
+void Partition_Queue_Discard(uint32_t n) {
+    OfflineRecord_t tmp;
+    while (n-- > 0 && Partition_Queue_Pop(&tmp)) { }
 }
 
 void Partition_Queue_Reset(void) {
@@ -468,6 +557,11 @@ void Partition_Log_Append(uint32_t timestamp, uint8_t cat_id, const char *msg) {
         }
         W25Q_EraseSector(next_sec);
         log_write_addr = next_sec;
+    } else if (sector_offset == 0) {
+        /* Entry starts exactly on a sector boundary: the sector still holds
+         * stale data from a previous wrap. NOR flash cannot overwrite (bits AND),
+         * so it must be erased first or the entry is corrupted. */
+        W25Q_EraseSector(log_write_addr);
     }
     
     PartitionLogHeader_t hdr = {
@@ -503,13 +597,17 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
     int pos = 0;
     pos += snprintf(buf + pos, max_len - pos, "{\"logs\":[");
 
-    /* Pass 1: Count total valid log entries across active sectors */
+    /* Pass 1: Count total valid log entries across active sectors.
+     * Sectors are visited oldest -> newest: start right after the sector
+     * currently being written, so wrapped (circular) logs stay in order. */
+    const uint32_t log_secs = 252;
+    uint32_t start_sec = ((log_write_addr - PARTITION_LOG_ADDR) / 4096U + 1U) % log_secs;
     uint32_t total_found = 0;
-    for (uint32_t sec = 0; sec < 252; sec++) {
-        uint32_t sec_addr = PARTITION_LOG_ADDR + sec * 4096;
+    for (uint32_t i = 0; i < log_secs; i++) {
+        uint32_t sec_addr = PARTITION_LOG_ADDR + ((start_sec + i) % log_secs) * 4096;
         uint32_t marker = 0xFFFFFFFF;
         W25Q_Read(sec_addr, (uint8_t *)&marker, 4);
-        if (marker == 0xFFFFFFFF) break;
+        if (marker == 0xFFFFFFFF) continue;
 
         uint32_t off = 0;
         while (off + sizeof(PartitionLogHeader_t) <= 4096) {
@@ -536,11 +634,11 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
 
         /* Pass 2: Collect entry addresses that fall into [win_start, win_end] */
         uint32_t curr_idx = 0;
-        for (uint32_t sec = 0; sec < 252; sec++) {
-            uint32_t sec_addr = PARTITION_LOG_ADDR + sec * 4096;
+        for (uint32_t i = 0; i < log_secs; i++) {
+            uint32_t sec_addr = PARTITION_LOG_ADDR + ((start_sec + i) % log_secs) * 4096;
             uint32_t marker = 0xFFFFFFFF;
             W25Q_Read(sec_addr, (uint8_t *)&marker, 4);
-            if (marker == 0xFFFFFFFF) break;
+            if (marker == 0xFFFFFFFF) continue;
 
             uint32_t off = 0;
             while (off + sizeof(PartitionLogHeader_t) <= 4096) {
@@ -808,7 +906,7 @@ uint32_t Partition_Queue_StreamSize(void) {
             rec.temp);
 
         idx++;
-        cur_ptr = (cur_ptr + 1) % 32768;
+        cur_ptr = (cur_ptr + 1) % QUEUE_MAX_ENTRIES;
     }
 
     return total;
@@ -868,12 +966,157 @@ uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const
             idx++;
         }
 
-        cur_ptr = (cur_ptr + 1) % 32768;
+        cur_ptr = (cur_ptr + 1) % QUEUE_MAX_ENTRIES;
     }
 
     if (pos > 0) {
         send_fn(sn, (const uint8_t *)buf, (uint32_t)pos);
     }
     return idx;
+}
+
+/* ======================================================================
+ *  Rules History & Rollback System on Persistent Flash / SD Card
+ * ====================================================================== */
+uint8_t Partition_ArchiveRules(const RuleConfig_t *cfg, const char *layout_json, uint32_t layout_len) {
+    if (!cfg || cfg->rule_count == 0) return 0;
+
+    /* Scan existing slots to find next available or duplicate version_id */
+    int slot_to_use = -1;
+    for (uint32_t s = 0; s < MAX_HISTORY_ARCHIVES; s++) {
+        uint32_t slot_addr = PARTITION_RULES_HISTORY_ADDR + s * ARCHIVE_SLOT_SIZE;
+        uint32_t magic = 0;
+        char ver[36] = {0};
+        W25Q_Read(slot_addr, (uint8_t *)&magic, 4);
+        if (magic == ARCHIVE_SLOT_MAGIC) {
+            W25Q_Read(slot_addr + 4, (uint8_t *)ver, sizeof(ver));
+            if (strncmp(ver, cfg->version_id, sizeof(ver)) == 0) {
+                slot_to_use = (int)s; /* Overwrite existing version */
+                break;
+            }
+        } else if (slot_to_use < 0) {
+            slot_to_use = (int)s;
+        }
+    }
+
+    if (slot_to_use < 0) slot_to_use = 0; /* Ring buffer wrap */
+
+    uint32_t target_addr = PARTITION_RULES_HISTORY_ADDR + (uint32_t)slot_to_use * ARCHIVE_SLOT_SIZE;
+
+    /* Erase the 2 sectors allocated for this archive slot (8 KB) */
+    W25Q_EraseSector(target_addr);
+    W25Q_EraseSector(target_addr + 4096U);
+
+    /* Write Header: [magic:4] [version_id:36] [timestamp:36] [rule_count:4] [layout_bytes:4] [rules_crc:4] */
+    uint32_t magic = ARCHIVE_SLOT_MAGIC;
+    uint32_t r_cnt = cfg->rule_count;
+    uint32_t l_len = (layout_json && layout_len > 0 && layout_len < 3800U) ? layout_len : 0;
+    uint32_t r_crc = Compute_CRC32((const uint8_t *)cfg, offsetof(RuleConfig_t, checksum));
+
+    W25Q_Write(target_addr,       (const uint8_t *)&magic, 4);
+    W25Q_Write(target_addr + 4,   (const uint8_t *)cfg->version_id, 36);
+    W25Q_Write(target_addr + 40,  (const uint8_t *)cfg->timestamp, 36);
+    W25Q_Write(target_addr + 76,  (const uint8_t *)&r_cnt, 4);
+    W25Q_Write(target_addr + 80,  (const uint8_t *)&l_len, 4);
+    W25Q_Write(target_addr + 84,  (const uint8_t *)&r_crc, 4);
+
+    /* Write RuleConfig_t at offset 128 */
+    W25Q_Write(target_addr + 128, (const uint8_t *)cfg, sizeof(RuleConfig_t));
+
+    /* Write Layout at sector 2 (offset 4096) */
+    if (l_len > 0 && layout_json) {
+        W25Q_Write(target_addr + 4096U, (const uint8_t *)layout_json, l_len);
+    }
+
+    printf("[Rules Archive] Stored version '%s' in archive slot %d (%lu bytes layout)\r\n",
+           cfg->version_id, slot_to_use, (unsigned long)l_len);
+    return 1;
+}
+
+uint8_t Partition_LoadArchivedRules(const char *version_id, RuleConfig_t *out_rules, char *out_layout, uint32_t layout_max) {
+    if (!version_id || !out_rules) return 0;
+
+    for (uint32_t s = 0; s < MAX_HISTORY_ARCHIVES; s++) {
+        uint32_t slot_addr = PARTITION_RULES_HISTORY_ADDR + s * ARCHIVE_SLOT_SIZE;
+        uint32_t magic = 0;
+        char ver[36] = {0};
+        W25Q_Read(slot_addr, (uint8_t *)&magic, 4);
+        if (magic == ARCHIVE_SLOT_MAGIC) {
+            W25Q_Read(slot_addr + 4, (uint8_t *)ver, sizeof(ver));
+            if (strncmp(ver, version_id, sizeof(ver)) == 0) {
+                W25Q_Read(slot_addr + 128, (uint8_t *)out_rules, sizeof(RuleConfig_t));
+                uint32_t stored_crc = 0, l_len = 0;
+                W25Q_Read(slot_addr + 80, (uint8_t *)&l_len, 4);
+                W25Q_Read(slot_addr + 84, (uint8_t *)&stored_crc, 4);
+                uint32_t cal_crc = Compute_CRC32((const uint8_t *)out_rules, offsetof(RuleConfig_t, checksum));
+                if (stored_crc != cal_crc) {
+                    printf("[Rules Archive] Slot %lu CRC check failed for version '%s'\r\n", (unsigned long)s, version_id);
+                    return 0;
+                }
+                if (out_layout && layout_max > 0 && l_len > 0) {
+                    uint32_t read_len = (l_len < layout_max - 1) ? l_len : (layout_max - 1);
+                    W25Q_Read(slot_addr + 4096U, (uint8_t *)out_layout, read_len);
+                    out_layout[read_len] = '\0';
+                }
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+uint8_t Partition_RollbackRules(const char *target_version_id, RuleConfig_t *out_rules) {
+    if (!target_version_id || !out_rules) return 0;
+
+    static char s_layout_buf[4096] __attribute__((section(".ccmram")));
+    memset(s_layout_buf, 0, sizeof(s_layout_buf));
+
+    if (!Partition_LoadArchivedRules(target_version_id, out_rules, s_layout_buf, sizeof(s_layout_buf))) {
+        printf("[Rollback] Target version '%s' not found in archives.\r\n", target_version_id);
+        return 0;
+    }
+
+    out_rules->rules_valid = 1;
+    Partition_SaveRules(out_rules);
+
+    if (s_layout_buf[0] != '\0') {
+        Partition_SaveLayout(s_layout_buf, strlen(s_layout_buf));
+    }
+
+    char r_msg[96];
+    snprintf(r_msg, sizeof(r_msg), "Rules rolled back to version %s", target_version_id);
+    Partition_Log_Append(RTC_GetUptimeSeconds(), 0, r_msg);
+    printf("[Rollback] Successfully restored rules & layout for version '%s'\r\n", target_version_id);
+    return 1;
+}
+
+int Partition_FormatRulesHistoryJSON(char *buf, int max_len, const char *active_version) {
+    if (!buf || max_len <= 0) return 0;
+    int pos = snprintf(buf, max_len, "[");
+    uint8_t emitted = 0;
+
+    for (uint32_t s = 0; s < MAX_HISTORY_ARCHIVES; s++) {
+        uint32_t slot_addr = PARTITION_RULES_HISTORY_ADDR + s * ARCHIVE_SLOT_SIZE;
+        uint32_t magic = 0;
+        W25Q_Read(slot_addr, (uint8_t *)&magic, 4);
+        if (magic == ARCHIVE_SLOT_MAGIC) {
+            char ver[36] = {0};
+            char ts[36] = {0};
+            uint32_t r_cnt = 0;
+            W25Q_Read(slot_addr + 4,  (uint8_t *)ver, sizeof(ver));
+            W25Q_Read(slot_addr + 40, (uint8_t *)ts,  sizeof(ts));
+            W25Q_Read(slot_addr + 76, (uint8_t *)&r_cnt, 4);
+
+            uint8_t is_act = (active_version && strcmp(ver, active_version) == 0) ? 1 : 0;
+            pos += snprintf(buf + pos, max_len - pos,
+                "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%lu,\"is_active\":%s}",
+                emitted ? "," : "",
+                ver, ts, (unsigned long)r_cnt, is_act ? "true" : "false");
+            emitted = 1;
+        }
+    }
+
+    pos += snprintf(buf + pos, max_len - pos, "]");
+    return pos;
 }
 
