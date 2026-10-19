@@ -62,13 +62,18 @@ void SPI2_Init(void) {
     // 1. Enable SPI2 clock
     RCC->APB1ENR |= (1U << 14);
 
-    // 2. Configure SPI2
-    // Master mode, baud rate = fPCLK / 2 = 8MHz, CPOL = 0, CPHA = 0 (Mode 0)
-    // 8-bit data frame, MSB first, Software slave management (SSM=1, SSI=1)
+    // 2. Clear any pending errors or stale data
+    volatile uint32_t dummy = SPI2->DR;
+    dummy = SPI2->SR;
+    (void)dummy;
+
+    // 3. Configure SPI2
+    // Master mode, baud rate = fPCLK1 / 8 = 5.25 MHz (BR[2:0] = 010)
+    // CPOL = 0, CPHA = 0 (Mode 0), 8-bit data frame, MSB first, Software slave management (SSM=1, SSI=1)
     SPI2->CR1 = (1U << 9) | // SSM = 1
                 (1U << 8) | // SSI = 1
                 (1U << 2) | // MSTR = 1
-                (0U << 3);  // BR[2:0] = 000 (fPCLK/2)
+                (2U << 3);  // BR[2:0] = 010 (fPCLK1/8 = 5.25 MHz for high noise immunity)
 
     // Enable SPI2
     SPI2->CR1 |= (1U << 6); // SPE = 1
@@ -76,6 +81,14 @@ void SPI2_Init(void) {
 
 uint8_t SPI2_ReadWriteByte(uint8_t data) {
     uint32_t timeout = 100000;
+
+    // Clear overrun error if present
+    if (SPI2->SR & (1U << 6)) {
+        volatile uint32_t dummy = SPI2->DR;
+        dummy = SPI2->SR;
+        (void)dummy;
+    }
+
     // Wait until TXE (Transmit buffer empty)
     while (!(SPI2->SR & (1U << 1))) {
         if (--timeout == 0) return 0xFF;

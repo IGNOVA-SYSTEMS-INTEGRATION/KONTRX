@@ -4072,6 +4072,7 @@ void Task_HTTPServer(void *arg) {
                     if (sock_ret < 0) {
                         /* Only check W5500 health after 3 failed attempts with delays */
                         Ensure_W5500_Network_Alive();
+                        osDelay(250);
                     }
                 }
                 break;

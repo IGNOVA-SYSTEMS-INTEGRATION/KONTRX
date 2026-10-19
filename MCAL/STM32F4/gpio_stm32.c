@@ -110,7 +110,11 @@ void GPIO_Init_W5500_Pins(void) {
     GPIOB->OSPEEDR &= ~((3U << (13 * 2)) | (3U << (14 * 2)) | (3U << (15 * 2)));
     GPIOB->OSPEEDR |=  ((2U << (13 * 2)) | (2U << (14 * 2)) | (2U << (15 * 2)));
 
-    // 3. Set AF5 for SPI2
+    // 3. Configure Pull-Up on MISO (PB14) and CS (PB12) to ensure stable bus idle states
+    GPIOB->PUPDR   &= ~((3U << (12 * 2)) | (3U << (14 * 2)));
+    GPIOB->PUPDR   |=  ((1U << (12 * 2)) | (1U << (14 * 2)));
+
+    // 4. Set AF5 for SPI2
     GPIOB->AFR[1] &= ~((0xFU << ((13 - 8) * 4)) | (0xFU << ((14 - 8) * 4)) | (0xFU << ((15 - 8) * 4)));
     GPIOB->AFR[1] |=  ((5U << ((13 - 8) * 4)) | (5U << ((14 - 8) * 4)) | (5U << ((15 - 8) * 4)));
 
