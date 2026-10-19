@@ -276,9 +276,13 @@ int main(void) {
     reg_wizchip_cs_cbfunc(W5500_CS_Select, W5500_CS_Deselect);
     reg_wizchip_spi_cbfunc(W5500_SPI_ReadByte, W5500_SPI_WriteByte);
 
-    /* Start from known W5500 register state.  This also clears a stale
-     * PING-block/PPPoE mode or an abandoned socket left by a brown-out. */
+    /* Ensure CS is deselected and lines are settled */
+    W5500_CS_Deselect();
+    for (volatile uint32_t i = 0; i < 500000; i++) __asm__("nop");
+
+    /* Start from known W5500 register state. */
     wizchip_sw_reset();
+    for (volatile uint32_t i = 0; i < 200000; i++) __asm__("nop");
 
     /* Set RX/TX buffer sizes for 8 sockets (2KB each = 16KB total) */
     uint8_t rx_tx_buf_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
@@ -286,10 +290,15 @@ int main(void) {
         printf("[NET] wizchip_init FAILED\r\n");
     }
 
-    /* VERSIONR is a direct SPI sanity check.  It must be 0x04 on a W5500;
-     * report a wiring/reset fault explicitly instead of only printing an IP
-     * address that was stored in software. */
-    uint8_t w5500_version = getVERSIONR();
+    /* VERSIONR is a direct SPI sanity check. Retry up to 5 times to allow
+     * internal W5500 PLL / clock to stabilize if recently powered on. */
+    uint8_t w5500_version = 0;
+    for (int retry = 0; retry < 5; retry++) {
+        w5500_version = getVERSIONR();
+        if (w5500_version == 0x04U) break;
+        for (volatile uint32_t i = 0; i < 200000; i++) __asm__("nop");
+    }
+
     if (w5500_version != 0x04U) {
         printf("[NET] W5500 SPI FAILED: VERSIONR=0x%02X (expected 0x04)\r\n",
                w5500_version);

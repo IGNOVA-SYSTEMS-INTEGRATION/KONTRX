@@ -58,6 +58,8 @@ static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay ta
 #include "led.h"
 #include "dns.h"
 #include "wizchip_conf.h"
+#include "spi_stm32.h"
+#include "gpio_stm32.h"
 #include "cJSON.h"
 
 RuleConfig_t activeRules;
@@ -1381,6 +1383,13 @@ static void messageArrived(MessageData* data) {
 }
 
 void Ensure_W5500_Network_Alive(void) {
+    static uint32_t s_last_heal_tick = 0;
+    uint32_t now = osKernelGetTickCount();
+    if (s_last_heal_tick != 0 && (now - s_last_heal_tick) < 5000) {
+        return; /* Rate limit: execute health check at most once every 5 seconds */
+    }
+    s_last_heal_tick = now;
+
     wiz_NetInfo ni;
     ctlnetwork(CN_GET_NETINFO, &ni);
     uint8_t ver = getVERSIONR();
@@ -1392,7 +1401,14 @@ void Ensure_W5500_Network_Alive(void) {
         
         Log_Event("SYS", "W5500 self-healing triggered (IP loss detected)");
 
+        /* Cycle CS and reinitialize SPI2 in case the bus state machine was desynced */
+        W5500_CS_Deselect();
+        osDelay(10);
+        SPI2_Init();
+        osDelay(10);
+
         wizchip_sw_reset();
+        osDelay(20);
         uint8_t rx_tx_buf_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
         wizchip_init(rx_tx_buf_sizes, rx_tx_buf_sizes);
 
@@ -1409,8 +1425,14 @@ void Ensure_W5500_Network_Alive(void) {
 
         wiz_NetInfo rb;
         ctlnetwork(CN_GET_NETINFO, &rb);
-        printf("[NET] ✅ W5500 self-healing complete! IP re-assigned to %d.%d.%d.%d\r\n",
-               rb.ip[0], rb.ip[1], rb.ip[2], rb.ip[3]);
+        uint8_t ver_after = getVERSIONR();
+        if (ver_after == 0x04U && (rb.ip[0] != 0 || rb.ip[1] != 0)) {
+            printf("[NET] ✅ W5500 self-healing complete! IP re-assigned to %d.%d.%d.%d\r\n",
+                   rb.ip[0], rb.ip[1], rb.ip[2], rb.ip[3]);
+        } else {
+            printf("[NET] ❌ W5500 self-healing failed: VER=0x%02X, IP=%d.%d.%d.%d (SPI bus unresponsive)\r\n",
+                   ver_after, rb.ip[0], rb.ip[1], rb.ip[2], rb.ip[3]);
+        }
     }
 }
 
