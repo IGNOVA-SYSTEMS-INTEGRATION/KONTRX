@@ -150,13 +150,18 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
     for (volatile int d = 0; d < 2000; d++); /* microsecond settle delay */
 
     /* 3. Send Modbus query */
+    USART3->SR &= ~(1U << 6); /* Clear TC flag before sending */
     for(int i=0; i<8; i++) {
-        uint32_t tx_timeout = 10000;
+        uint32_t tx_timeout = 100000;
         while(!(USART3->SR & (1U << 7)) && --tx_timeout);
         USART3->DR = f[i];
     }
-    uint32_t tc_timeout = 20000;
+    /* At 9600 baud, 1 byte takes ~1.04ms (175,000 cycles at 168MHz). 
+     * tc_timeout must be at least 500,000 cycles so the last byte is fully sent! */
+    uint32_t tc_timeout = 500000;
     while(!(USART3->SR & (1U << 6)) && --tc_timeout);
+
+    for (volatile int d = 0; d < 200; d++); /* STOP bit settle delay */
 
     /* 4. Switch back to RX mode immediately */
     MAX485_RX();
@@ -236,14 +241,16 @@ static uint8_t Modbus_Write_Register_FC06(uint8_t slave, uint16_t reg, uint16_t 
     MAX485_TX();
     for (volatile int d = 0; d < 2000; d++);
 
+    USART3->SR &= ~(1U << 6);
     for (int i = 0; i < 8; i++) {
-        uint32_t tx_timeout = 10000;
+        uint32_t tx_timeout = 100000;
         while (!(USART3->SR & (1U << 7)) && --tx_timeout);
         USART3->DR = f[i];
     }
-    uint32_t tc_timeout = 20000;
+    uint32_t tc_timeout = 500000;
     while (!(USART3->SR & (1U << 6)) && --tc_timeout);
 
+    for (volatile int d = 0; d < 200; d++);
     MAX485_RX();
 
     uint8_t rx[16]; int received = 0;
