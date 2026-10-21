@@ -123,7 +123,7 @@ static const char *get_sensor_type_name(uint8_t type) {
         case 4: return "DO";
         case 5: return "Ammonia";
         case 6: return "Ultrasonic";
-        case 7: return "Multi-US";
+        case 7: return "Multi-Sensor";
         default: return "Unknown";
     }
 }

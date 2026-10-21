@@ -44,14 +44,31 @@ typedef struct {
     uint32_t sample_count;
 } SensorReading_t;
 
-/* Multi-US board: 8 distances + avg/comp/temp */
+/* Water Flow Sensor Channel (5 registers: Rate 0.1 L/min, Total High/Low Word, Freq Hz, Status) */
 typedef struct {
-    float   dist[8];
-    float   avg;
-    float   comp;
-    float   temp;
-    uint8_t id;
-} MultiUS_t;
+    float    rate;       /* Flow Rate in L/min (Reg[0] / 10.0f) */
+    uint32_t total_l;    /* Total Volume in Liters ((Reg[1] << 16) | Reg[2]) */
+    float    freq_hz;    /* Frequency in Hz (Reg[3]) */
+    uint8_t  status;     /* Status: 1=Normal Flow, 0=Stopped (Reg[4]) */
+} WaterFlow_Channel_t;
+
+/* Multi-Sensor Board (3 Ultrasonic, 3 Water Flow, 2 DS18B20 Temp, Mode Switch & FC04 Summary) */
+typedef struct {
+    uint8_t             id;
+    float               dist[3];        /* 3 Ultrasonic distances (mm) - Offsets 0x00, 0x10, 0x20 */
+    WaterFlow_Channel_t flow[3];        /* 3 Water flow sensors - Offsets 0x30, 0x40, 0x50 */
+    float               temp[2];        /* 2 DS18B20 temp sensors (°C) - Offsets 0x60, 0x70 */
+    uint16_t            summary[10];    /* FC04 Input Registers summary (Start 0, Qty 10) */
+    uint8_t             mode;           /* 0=Normal Mode, 1=Simulation Mode (FC06 Reg 165) */
+    uint8_t             valid;
+
+    /* Legacy / Compatibility fields */
+    float               avg;            /* Average distance of valid US sensors */
+    float               comp;           /* Status / comp */
+    float               legacy_temp;    /* Primary temp */
+} MultiSensorBoard_t;
+
+typedef MultiSensorBoard_t MultiUS_t;
 
 /* Shared Sensor Data Structure */
 typedef struct {
@@ -194,5 +211,7 @@ void Get_Shared_Sensor_Data(Modbus_SensorData_t *dest);
 void Update_Shared_Sensor_Data(const Modbus_SensorData_t *src);
 void Get_Shared_Config(Gateway_Config_t *dest);
 void Update_Shared_Config(const Gateway_Config_t *src);
+
+uint8_t Modbus_SetMultiSensorMode(uint8_t slave_id, uint8_t mode);
 
 #endif /* MODBUS_DMA_H */

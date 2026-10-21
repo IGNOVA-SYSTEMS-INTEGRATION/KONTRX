@@ -182,3 +182,62 @@ class TestSmartBackoff:
         fail_count = 5
         fail_count = 0  # simulates successful read
         assert fail_count < self.BACKOFF_THRESHOLD
+
+
+# ── Multi-Sensor Board Protocol Tests ─────────────────────
+
+class TestMultiSensorBoard:
+    def test_flow_sensor_decoding(self):
+        # 5 registers: [Rate 0.1 L/min, Total High, Total Low, Freq Hz, Status]
+        regs = [155, 0, 1240, 45, 1]
+        rate = regs[0] / 10.0
+        total = (regs[1] << 16) | regs[2]
+        freq = float(regs[3])
+        status = regs[4]
+
+        assert rate == 15.5
+        assert total == 1240
+        assert freq == 45.0
+        assert status == 1
+
+    def test_flow_sensor_large_total(self):
+        # Total volume exceeding 65535 liters
+        regs = [200, 3, 500, 60, 1]
+        total = (regs[1] << 16) | regs[2]
+        assert total == (3 * 65536) + 500
+
+    def test_ds18b20_temperature_decoding(self):
+        reg_positive = 245
+        temp_pos = reg_positive / 10.0
+        assert temp_pos == 24.5
+
+        # Signed 16-bit negative temperature (-2.5 C -> 65511 / 0xFFE7)
+        reg_neg = 0xFFE7
+        signed_val = struct.unpack(">h", struct.pack(">H", reg_neg))[0]
+        assert (signed_val / 10.0) == -2.5
+
+    def test_fc06_mode_switch_frame(self):
+        slave_id = 1
+        reg_addr = 165  # 0x00A5
+        val_sim = 1
+        frame = struct.pack(">BBHH", slave_id, 0x06, reg_addr, val_sim)
+        crc = modbus_crc16(frame)
+        full_frame = frame + struct.pack("<H", crc)
+        assert len(full_frame) == 8
+        assert full_frame[0] == 1
+        assert full_frame[1] == 0x06
+        assert full_frame[2] == 0x00
+        assert full_frame[3] == 0xA5
+        assert full_frame[5] == 1
+        assert modbus_crc16(full_frame) == 0
+
+    def test_fc04_summary_request_frame(self):
+        slave_id = 1
+        start_reg = 0
+        qty = 10
+        frame = struct.pack(">BBHH", slave_id, 0x04, start_reg, qty)
+        crc = modbus_crc16(frame)
+        full_frame = frame + struct.pack("<H", crc)
+        assert len(full_frame) == 8
+        assert full_frame[1] == 0x04
+        assert modbus_crc16(full_frame) == 0
