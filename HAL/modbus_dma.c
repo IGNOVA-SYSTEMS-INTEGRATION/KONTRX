@@ -220,6 +220,73 @@ static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc,
     return Modbus_Safe_Transaction_T(slave, fc, reg, num, out, 40);
 }
 
+/* FC06 — Write Single Register (e.g. Simulation Mode Switch at Address 165) */
+static uint8_t Modbus_Write_Register_FC06(uint8_t slave, uint16_t reg, uint16_t val, uint32_t timeout_ms) {
+    uint8_t f[8] = {slave, 0x06, (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF), (uint8_t)(val >> 8), (uint8_t)(val & 0xFF), 0, 0};
+    uint16_t crc = Modbus_CRC16(f, 6);
+    f[6] = (uint8_t)(crc & 0xFF); f[7] = (uint8_t)(crc >> 8);
+
+    while (USART3->SR & (1U << 5)) {
+        volatile uint32_t junk = USART3->DR;
+        (void)junk;
+    }
+    if (USART3->SR & 0x0F) {
+        volatile uint32_t junk_dr = USART3->DR;
+        (void)junk_dr;
+    }
+
+    MAX485_TX();
+    for (volatile int d = 0; d < 2000; d++);
+
+    for (int i = 0; i < 8; i++) {
+        uint32_t tx_timeout = 10000;
+        while (!(USART3->SR & (1U << 7)) && --tx_timeout);
+        USART3->DR = f[i];
+    }
+    uint32_t tc_timeout = 20000;
+    while (!(USART3->SR & (1U << 6)) && --tc_timeout);
+
+    MAX485_RX();
+
+    uint8_t rx[16]; int received = 0;
+    uint32_t start = osKernelGetTickCount();
+    while ((osKernelGetTickCount() - start) < timeout_ms) {
+        if (USART3->SR & (1U << 5)) {
+            uint8_t b = (uint8_t)USART3->DR;
+            if (received == 0 && b != slave) { osDelay(1); continue; }
+            if (received == 1 && b != 0x06) { received = 0; if (b == slave) rx[received++] = b; osDelay(1); continue; }
+            if (received < 16) rx[received++] = b;
+            if (received >= 8) break;
+        } else {
+            osDelay(1);
+        }
+        if (USART3->SR & 0x0F) {
+            volatile uint32_t d = USART3->DR;
+            (void)d;
+        }
+    }
+    if (received < 8 || rx[0] != slave || rx[1] != 0x06) return 0;
+    if (Modbus_CRC16(rx, 6) != (rx[6] | (rx[7] << 8))) return 0;
+    return 1;
+}
+
+uint8_t Modbus_SetMultiSensorMode(uint8_t slave_id, uint8_t mode) {
+    uint8_t ok = Modbus_Write_Register_FC06(slave_id, 165, mode ? 1 : 0, 50);
+    if (ok) {
+        Modbus_SensorData_t local;
+        Get_Shared_Sensor_Data(&local);
+        for (uint8_t i = 0; i < local.multi_us_count && i < MAX_MULTI_US; i++) {
+            if (local.multi_us[i].id == slave_id) {
+                local.multi_us[i].mode = mode ? 1 : 0;
+                break;
+            }
+        }
+        Update_Shared_Sensor_Data(&local);
+        printf("[MODBUS] Multi-Sensor Board (ID %u) mode set to %s\r\n", slave_id, mode ? "SIMULATION" : "NORMAL");
+    }
+    return ok;
+}
+
 void Modbus_DMA_PollSensors(void) {
     /* ----------------------------------------------------------------
      * Latency & Timing Optimization:
@@ -339,9 +406,9 @@ void Modbus_DMA_PollSensors(void) {
                 }
                 break;
 
-            case 7: /* Multi-US board — 8 channels */
+            case 7: /* Multi-Sensor Board (3 Ultrasonic, 3 Flow, 2 Temp) */
                 if (mu_idx < MAX_MULTI_US) {
-                    MultiUS_t *mu = &local.multi_us[mu_idx];
+                    MultiSensorBoard_t *mu = &local.multi_us[mu_idx];
                     
                     /* Restore previous board metadata */
                     uint8_t found_meta = 0;
@@ -354,26 +421,56 @@ void Modbus_DMA_PollSensors(void) {
                     }
                     if (!found_meta || mu->id != sid) {
                         mu->id = sid;
-                        for (uint8_t c = 0; c < 8; c++) mu->dist[c] = -1000.0f;
+                        for (uint8_t c = 0; c < 3; c++) mu->dist[c] = -1000.0f;
+                        for (uint8_t c = 0; c < 3; c++) {
+                            mu->flow[c].rate = 0.0f;
+                            mu->flow[c].total_l = 0;
+                            mu->flow[c].freq_hz = 0.0f;
+                            mu->flow[c].status = 0;
+                        }
+                        mu->temp[0] = -1000.0f;
+                        mu->temp[1] = -1000.0f;
+                        mu->mode = 0;
                         mu->avg = -1000.0f;
-                        mu->comp = -1000.0f;
-                        mu->temp = -1000.0f;
+                        mu->legacy_temp = -1000.0f;
                     }
 
                     /* Poll 2 channels of the 8 in this cycle to avoid blocking the bus */
                     for (uint8_t c = 0; c < 2; c++) {
                         uint8_t ch = (multi_us_channel_offset + c) % 8;
-                        if (Modbus_Safe_Transaction_T(sid, 0x03, ch * 0x10, 3, rs, 40)) {
-                            mu->dist[ch] = (float)rs[0];
-                        } else {
-                            mu->dist[ch] = -1000.0f;
+                        uint16_t reg_addr = ch * 0x10;
+
+                        if (ch <= 2) {
+                            /* Channels 0..2: Ultrasonic 1, 2, 3 (offsets 0x0000, 0x0010, 0x0020) */
+                            if (Modbus_Safe_Transaction_T(sid, 0x03, reg_addr, 3, rs, 40)) {
+                                mu->dist[ch] = (float)rs[0];
+                                ok = 1;
+                            }
+                        } else if (ch >= 3 && ch <= 5) {
+                            /* Channels 3..5: Water Flow 1, 2, 3 (offsets 0x0030, 0x0040, 0x0050) */
+                            /* 5 registers: Rate (0.1 L/min), Total High, Total Low, Freq (Hz), Status */
+                            if (Modbus_Safe_Transaction_T(sid, 0x03, reg_addr, 5, rs, 40)) {
+                                uint8_t f = ch - 3;
+                                mu->flow[f].rate    = (float)rs[0] / 10.0f;
+                                mu->flow[f].total_l = ((uint32_t)rs[1] << 16) | (uint32_t)rs[2];
+                                mu->flow[f].freq_hz = (float)rs[3];
+                                mu->flow[f].status  = (uint8_t)rs[4];
+                                ok = 1;
+                            }
+                        } else if (ch == 6 || ch == 7) {
+                            /* Channels 6..7: DS18B20 Temp 1, 2 (offsets 0x0060, 0x0070) */
+                            if (Modbus_Safe_Transaction_T(sid, 0x03, reg_addr, 2, rs, 40)) {
+                                uint8_t t = ch - 6;
+                                mu->temp[t] = ((int16_t)rs[0]) / 10.0f;
+                                ok = 1;
+                            }
                         }
-                        osDelay(15); /* 15ms inter-channel gap for line discharge */
+                        osDelay(15); /* 15ms inter-channel gap */
                     }
 
-                    /* Calculate average from all channels that have valid values */
+                    /* Calculate average from valid US channels */
                     uint32_t sum = 0; uint8_t valid = 0;
-                    for (uint8_t i = 0; i < 8; i++) {
+                    for (uint8_t i = 0; i < 3; i++) {
                         if (mu->dist[i] > 0.0f && mu->dist[i] < 10000.0f) {
                             sum += (uint32_t)mu->dist[i];
                             valid++;
@@ -382,24 +479,26 @@ void Modbus_DMA_PollSensors(void) {
                     if (valid > 0) {
                         mu->avg = (float)(sum / valid);
                         ok = 1;
-                    } else {
-                        mu->avg = -1000.0f;
+                    } else if (mu->flow[0].total_l > 0 || mu->flow[1].total_l > 0 || mu->flow[2].total_l > 0 ||
+                               mu->flow[0].rate > 0.0f || mu->temp[0] > -50.0f || mu->temp[1] > -50.0f) {
+                        ok = 1;
                     }
 
-                    /* Poll temp & config compensation once in a while */
+                    /* Poll FC04 Summary (10 registers) once per full cycle */
                     if (multi_us_channel_offset == 0) {
-                        if (Modbus_Safe_Transaction_T(sid, 0x03, 0x0080, 3, rs, 40)) {
-                            mu->temp = rs[0] / 10.0f;
-                        }
-                        if (Modbus_Safe_Transaction_T(sid, 0x04, 0x0000, 3, rs, 40)) {
-                            mu->comp = (float)rs[2];
+                        if (Modbus_Safe_Transaction_T(sid, 0x04, 0x0000, 10, rs, 40)) {
+                            for (uint8_t k = 0; k < 10; k++) {
+                                mu->summary[k] = rs[k];
+                            }
+                            ok = 1;
                         }
                     }
 
                     if (mu_idx >= local.multi_us_count) local.multi_us_count = mu_idx + 1;
                     mu_idx++;
-                    rd->value = mu->avg;
-                    rd->temp  = mu->temp;
+                    rd->value = (mu->avg > 0.0f) ? mu->avg : mu->flow[0].rate;
+                    rd->temp  = (mu->temp[0] > -50.0f) ? mu->temp[0] : ((mu->temp[1] > -50.0f) ? mu->temp[1] : 0.0f);
+                    mu->legacy_temp = rd->temp;
                 }
                 break;
 
@@ -425,7 +524,7 @@ void Modbus_DMA_PollSensors(void) {
                 else if (rd->type == 4) tname = "DO";
                 else if (rd->type == 5) tname = "Ammonia";
                 else if (rd->type == 6) tname = "Ultrasonic";
-                else if (rd->type == 7) tname = "Multi-US";
+                else if (rd->type == 7) tname = "Multi-Sensor";
                 
                  char log_buf[64];
                 snprintf(log_buf, sizeof(log_buf), "Sensor %s (ID %u) connected.", tname, rd->id);
@@ -450,7 +549,7 @@ void Modbus_DMA_PollSensors(void) {
                 else if (rd->type == 4) tname = "DO";
                 else if (rd->type == 5) tname = "Ammonia";
                 else if (rd->type == 6) tname = "Ultrasonic";
-                else if (rd->type == 7) tname = "Multi-US";
+                else if (rd->type == 7) tname = "Multi-Sensor";
                 
                 char log_buf[64];
                 snprintf(log_buf, sizeof(log_buf), "Sensor %s (ID %u) disconnected.", tname, rd->id);

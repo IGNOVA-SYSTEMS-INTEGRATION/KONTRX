@@ -228,7 +228,7 @@ const char *SensorTypeName(uint8_t type) {
         case 4: return "do";
         case 5: return "ammonia";
         case 6: return "ultrasonic";
-        case 7: return "multi_us";
+        case 7: return "multi_sensor";
         default: return "unknown";
     }
 }
@@ -859,17 +859,44 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
 
-    /* --- multi-us boards --- */
+    /* --- multi-sensor boards --- */
+    pos += snprintf(buf + pos, buflen - pos, "\"multi_sensor\":[");
+    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *m = &s_sd.multi_us[i];
+        pos += snprintf(buf + pos, buflen - pos,
+            "{\"id\":%u,\"mode\":%u,"
+            "\"us\":[%.0f,%.0f,%.0f],"
+            "\"flow\":["
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u},"
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u},"
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u}"
+            "],"
+            "\"temp\":[%.1f,%.1f],"
+            "\"summary\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+            "\"avg\":%.0f}%s",
+            m->id, (unsigned int)m->mode,
+            m->dist[0], m->dist[1], m->dist[2],
+            m->flow[0].rate, (unsigned long)m->flow[0].total_l, m->flow[0].freq_hz, (unsigned int)m->flow[0].status,
+            m->flow[1].rate, (unsigned long)m->flow[1].total_l, m->flow[1].freq_hz, (unsigned int)m->flow[1].status,
+            m->flow[2].rate, (unsigned long)m->flow[2].total_l, m->flow[2].freq_hz, (unsigned int)m->flow[2].status,
+            m->temp[0], m->temp[1],
+            m->summary[0], m->summary[1], m->summary[2], m->summary[3], m->summary[4],
+            m->summary[5], m->summary[6], m->summary[7], m->summary[8], m->summary[9],
+            m->avg,
+            (i < s_sd.multi_us_count - 1) ? "," : "");
+    }
+    pos += snprintf(buf + pos, buflen - pos, "],");
+
+    /* Backward-compatible multi_us alias */
     pos += snprintf(buf + pos, buflen - pos, "\"multi_us\":[");
     for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
-        const MultiUS_t *m = &s_sd.multi_us[i];
+        const MultiSensorBoard_t *m = &s_sd.multi_us[i];
         pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"dist\":[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f],"
+            "{\"id\":%u,\"dist\":[%.0f,%.0f,%.0f,0,0,0,0,0],"
             "\"avg\":%.0f,\"comp\":%.0f,\"temp\":%.1f}%s",
             m->id,
-            m->dist[0], m->dist[1], m->dist[2], m->dist[3],
-            m->dist[4], m->dist[5], m->dist[6], m->dist[7],
-            m->avg, m->comp, m->temp,
+            m->dist[0], m->dist[1], m->dist[2],
+            m->avg, (float)m->mode, m->temp[0],
             (i < s_sd.multi_us_count - 1) ? "," : "");
     }
     pos += snprintf(buf + pos, buflen - pos, "],");
@@ -3714,7 +3741,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             else if (strcmp(type_str, "do") == 0)   type = 4;
             else if (strcmp(type_str, "ammonia") == 0) type = 5;
             else if (strcmp(type_str, "ultrasonic") == 0) type = 6;
-            else if (strcmp(type_str, "multi_us") == 0)  type = 7;
+            else if (strcmp(type_str, "multi_us") == 0 || strcmp(type_str, "multi_sensor") == 0)  type = 7;
 
             if (type < 1 || type > 7) {
                 snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Unknown sensor type %s.\"}", type_str);
@@ -3803,6 +3830,33 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         
         send(sn, (uint8_t *)HTTP_200_JSON, strlen(HTTP_200_JSON));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/sensor/mode  → Set Multi-Sensor Board Mode (0=Normal, 1=Sim)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/sensor/mode", 21) == 0 ||
+        strncmp(line, "POST /api/sensor/multi/mode", 27) == 0) {
+        int id = 1;
+        int mode = 0;
+        char *qid = strstr(line, "id=");
+        if (qid) id = atoi(qid + 3);
+        char *qm = strstr(line, "mode=");
+        if (qm) mode = atoi(qm + 5);
+
+        char *b_start = strstr(line, "\r\n\r\n");
+        if (b_start) {
+            b_start += 4;
+            int bid = JSON_ReadInt(b_start, "id");
+            if (bid > 0) id = bid;
+            int bmode = JSON_ReadInt(b_start, "mode");
+            if (bmode >= 0) mode = bmode;
+        }
+
+        uint8_t ok = Modbus_SetMultiSensorMode((uint8_t)id, (uint8_t)mode);
+        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":%s,\"id\":%d,\"mode\":%d}", ok ? "true" : "false", id, mode);
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
         return;
     }
 

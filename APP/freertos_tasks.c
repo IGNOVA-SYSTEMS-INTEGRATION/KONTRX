@@ -593,7 +593,7 @@ static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *c
     else if (string_equals_ci(input_id, "do")) target_type = 4;
     else if (string_equals_ci(input_id, "ammonia")) target_type = 5;
     else if (string_equals_ci(input_id, "ultasonic") || string_equals_ci(input_id, "ultrasonic")) target_type = 6;
-    else if (string_equals_ci(input_id, "multi_us")) target_type = 7;
+    else if (string_equals_ci(input_id, "multi_us") || string_equals_ci(input_id, "multi_sensor")) target_type = 7;
     else if (strstr(input_id, "temp") != NULL || strstr(input_id, "Temp") != NULL) {
         is_temp = 1;
     }
