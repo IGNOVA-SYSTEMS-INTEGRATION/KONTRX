@@ -169,9 +169,8 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
         if(USART3->SR & (1U << 5)) {
             uint8_t b = (uint8_t)USART3->DR;
 
-            /* Reject leading noise: first byte must be the target slave ID */
+            /* Reject leading noise: first byte must be the target slave ID (no sleep) */
             if (received == 0 && b != slave) {
-                osDelay(1);
                 continue;
             }
             
@@ -181,7 +180,6 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
                 if (b == slave) {
                     rx[received++] = b;
                 }
-                osDelay(1);
                 continue;
             }
             
@@ -342,8 +340,9 @@ void Modbus_DMA_PollSensors(void) {
     extern volatile uint32_t g_uptime_seconds;
 
     for (uint8_t s = 0; s < cfg.sensors.count && s < MAX_SENSORS; s++) {
-        /* Smart Backoff: if sensor is offline/unresponsive, skip polling for 4 seconds */
-        if (fail_cnt[s] >= 2 && g_uptime_seconds < fail_until_s[s]) {
+        /* Smart Backoff: if sensor is offline/unresponsive, skip polling for 4 seconds (exempt type 7) */
+        uint8_t sensor_type_peek = cfg.sensors.entries[s].type;
+        if (sensor_type_peek != 7 && fail_cnt[s] >= 2 && g_uptime_seconds < fail_until_s[s]) {
             local.readings[s].valid = 0;
             continue;
         }
@@ -437,11 +436,9 @@ void Modbus_DMA_PollSensors(void) {
 
                     uint8_t target_sid = sid;
 
-                    /* 1. Try FC04 Summary (Start 0, Quantity 10) first with 120ms timeout */
-                    if (Modbus_Safe_Transaction_T(target_sid, 0x04, 0x0000, 10, rs, 120)) {
-                        for (uint8_t k = 0; k < 10; k++) {
-                            mu->summary[k] = rs[k];
-                        }
+                    /* 1. Try FC04 Summary (Start 0, Quantity 10) with 60ms timeout */
+                    if (Modbus_Safe_Transaction_T(target_sid, 0x04, 0x0000, 10, rs, 60)) {
+                        for (uint8_t k = 0; k < 10; k++) mu->summary[k] = rs[k];
                         mu->dist[0] = (float)rs[0];
                         mu->dist[1] = (float)rs[1];
                         mu->dist[2] = (float)rs[2];
@@ -452,8 +449,8 @@ void Modbus_DMA_PollSensors(void) {
                         mu->temp[1] = ((int16_t)rs[7]) / 10.0f;
                         ok = 1;
                     }
-                    /* Fallback: if configured sid != 1 and no response, check Slave ID 1 */
-                    else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x04, 0x0000, 10, rs, 100)) {
+                    /* Auto-detect fallback: if sid != 1 and no response, probe Slave ID 1 */
+                    else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x04, 0x0000, 10, rs, 60)) {
                         target_sid = 1;
                         mu->id = 1;
                         for (uint8_t k = 0; k < 10; k++) mu->summary[k] = rs[k];
@@ -468,35 +465,32 @@ void Modbus_DMA_PollSensors(void) {
                         ok = 1;
                     }
 
-                    /* 2. Poll FC03 channel blocks for detailed registers (Rate, Total Liters, Freq, Status) */
+                    /* 2. Poll FC03 channel blocks for detailed registers (Offsets 0x00..0x70) */
                     for (uint8_t c = 0; c < 2; c++) {
                         uint8_t ch = (multi_us_channel_offset + c) % 8;
                         uint16_t reg_addr = ch * 0x10;
 
                         if (ch <= 2) {
-                            /* Channels 0..2: Ultrasonic 1, 2, 3 (offsets 0x0000, 0x0010, 0x0020) */
-                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 100)) {
+                            /* Ultrasonic 1..3 */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 60)) {
                                 mu->dist[ch] = (float)rs[0];
                                 ok = 1;
-                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 3, rs, 80)) {
-                                target_sid = 1;
-                                mu->id = 1;
+                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 3, rs, 60)) {
+                                target_sid = 1; mu->id = 1;
                                 mu->dist[ch] = (float)rs[0];
                                 ok = 1;
                             }
                         } else if (ch >= 3 && ch <= 5) {
-                            /* Channels 3..5: Water Flow 1, 2, 3 (offsets 0x0030, 0x0040, 0x0050) */
-                            /* 5 registers: Rate (0.1 L/min), Total High, Total Low, Freq (Hz), Status */
-                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 5, rs, 100)) {
+                            /* Water Flow 1..3: 5 registers */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 5, rs, 60)) {
                                 uint8_t f = ch - 3;
                                 mu->flow[f].rate    = (float)rs[0] / 10.0f;
                                 mu->flow[f].total_l = ((uint32_t)rs[1] << 16) | (uint32_t)rs[2];
                                 mu->flow[f].freq_hz = (float)rs[3];
                                 mu->flow[f].status  = (uint8_t)rs[4];
                                 ok = 1;
-                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 5, rs, 80)) {
-                                target_sid = 1;
-                                mu->id = 1;
+                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 5, rs, 60)) {
+                                target_sid = 1; mu->id = 1;
                                 uint8_t f = ch - 3;
                                 mu->flow[f].rate    = (float)rs[0] / 10.0f;
                                 mu->flow[f].total_l = ((uint32_t)rs[1] << 16) | (uint32_t)rs[2];
@@ -505,20 +499,19 @@ void Modbus_DMA_PollSensors(void) {
                                 ok = 1;
                             }
                         } else if (ch == 6 || ch == 7) {
-                            /* Channels 6..7: DS18B20 Temp 1, 2 (offsets 0x0060, 0x0070) */
-                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 2, rs, 100)) {
+                            /* Temp 1..2 */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 2, rs, 60)) {
                                 uint8_t t = ch - 6;
                                 mu->temp[t] = ((int16_t)rs[0]) / 10.0f;
                                 ok = 1;
-                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 2, rs, 80)) {
-                                target_sid = 1;
-                                mu->id = 1;
+                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 2, rs, 60)) {
+                                target_sid = 1; mu->id = 1;
                                 uint8_t t = ch - 6;
                                 mu->temp[t] = ((int16_t)rs[0]) / 10.0f;
                                 ok = 1;
                             }
                         }
-                        osDelay(15);
+                        osDelay(10);
                     }
 
                     /* Calculate average distance from valid US channels */
@@ -537,6 +530,17 @@ void Modbus_DMA_PollSensors(void) {
                     rd->value = (mu->avg > 0.0f) ? mu->avg : mu->flow[0].rate;
                     rd->temp  = (mu->temp[0] > -50.0f) ? mu->temp[0] : ((mu->temp[1] > -50.0f) ? mu->temp[1] : 0.0f);
                     mu->legacy_temp = rd->temp;
+
+                    /* Periodically log diagnostic event */
+                    static uint32_t last_dbg_s = 0;
+                    if (g_uptime_seconds - last_dbg_s >= 5) {
+                        last_dbg_s = g_uptime_seconds;
+                        char dbg[64];
+                        snprintf(dbg, sizeof(dbg), "MultiSensor: target_sid=%u ok=%u (U1=%.0f, F1=%.1f, T1=%.1f)",
+                                 target_sid, ok, mu->dist[0], mu->flow[0].rate, mu->temp[0]);
+                        extern void Log_Event(const char *category, const char *message);
+                        Log_Event("MODBUS", dbg);
+                    }
                 }
                 break;
 
