@@ -59,11 +59,26 @@ static volatile uint8_t  s_rx_buf[RS485_RX_BUF_SIZE];
 static volatile uint16_t s_rx_head = 0;
 static volatile uint16_t s_rx_tail = 0;
 
+/* Bus diagnostics: raw byte count, framing/noise and overrun errors, and the
+ * last 4 raw bytes seen. Zero bytes => wiring/slave silent; bytes with
+ * framing errors => baud/format mismatch. */
+static volatile uint32_t s_rx_bytes = 0;
+static volatile uint32_t s_rx_fe    = 0;
+static volatile uint32_t s_rx_ore   = 0;
+static volatile uint8_t  s_rx_last[4];
+
 void USART3_IRQHandler(void) {
     uint32_t sr = USART3->SR;
     if (sr & ((1U << 5) | 0x0FU)) {
         uint8_t b = (uint8_t)USART3->DR; /* DR read also clears ORE/FE/NE/PE */
+        if (sr & ((1U << 1) | (1U << 2))) s_rx_fe++;
+        if (sr & (1U << 3)) s_rx_ore++;
         if (sr & (1U << 5)) {
+            s_rx_bytes++;
+            s_rx_last[0] = s_rx_last[1];
+            s_rx_last[1] = s_rx_last[2];
+            s_rx_last[2] = s_rx_last[3];
+            s_rx_last[3] = b;
             uint16_t next = (uint16_t)((s_rx_head + 1U) % RS485_RX_BUF_SIZE);
             if (next != s_rx_tail) {
                 s_rx_buf[s_rx_head] = b;
@@ -551,6 +566,10 @@ void Modbus_DMA_PollSensors(void) {
                         snprintf(dbg, sizeof(dbg), "MultiSensor: target_sid=%u ok=%u (U1=%.0f, F1=%.1f, T1=%.1f)",
                                  target_sid, ok, mu->dist[0], mu->flow[0].rate, mu->temp[0]);
                         extern void Log_Event(const char *category, const char *message);
+                        Log_Event("MODBUS", dbg);
+                        snprintf(dbg, sizeof(dbg), "RS485 rx=%lu fe=%lu ore=%lu last=%02X %02X %02X %02X",
+                                 (unsigned long)s_rx_bytes, (unsigned long)s_rx_fe, (unsigned long)s_rx_ore,
+                                 s_rx_last[0], s_rx_last[1], s_rx_last[2], s_rx_last[3]);
                         Log_Event("MODBUS", dbg);
                     }
                 }
