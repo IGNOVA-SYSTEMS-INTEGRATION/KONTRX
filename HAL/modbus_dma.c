@@ -273,13 +273,6 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
     return 1;
 }
 
-/* Backward-compatible wrapper with optimized 40ms default */
-static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc,
-                                        uint16_t reg, uint8_t num,
-                                        uint16_t *out) {
-    return Modbus_Safe_Transaction_T(slave, fc, reg, num, out, 40);
-}
-
 /* FC06 — Write Single Register (e.g. Simulation Mode Switch at Address 165) */
 static uint8_t Modbus_Write_Register_FC06(uint8_t slave, uint16_t reg, uint16_t val, uint32_t timeout_ms) {
     uint8_t f[8] = {slave, 0x06, (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF), (uint8_t)(val >> 8), (uint8_t)(val & 0xFF), 0, 0};
@@ -664,6 +657,10 @@ void Modbus_DMA_ConsumeBatch(TelemetryBatch_t *dest) {
     }
 }
 
+/* Scan probes use a generous turnaround: unknown slaves (e.g. a Blue Pill
+ * board) may take tens of ms to start replying. */
+#define SCAN_TURNAROUND_MS 100U
+
 void Modbus_DMA_PerformScan(void) {
     g_scan_status.is_scanning = 1;
     g_scan_status.count = 0;
@@ -671,31 +668,43 @@ void Modbus_DMA_PerformScan(void) {
     for(int i=1; i<=247; i++) {
         if(!g_scan_status.is_scanning) break;
         uint8_t type = 0;
-        /* Check for DO sensor (Kacise KWS-630) */
-        if(Modbus_Safe_Transaction(i, 0x03, 0x2600, 6, d)) {
-            type = 4;
-        /* Check for multi-ultrasonic board (read US#1 block at 0x00) */
-        } else if(Modbus_Safe_Transaction(i, 0x03, 0x00, 3, d)) {
-            if(d[0] > 0 && d[0] < 10000 && d[2] == 0) {
-                if(Modbus_Safe_Transaction(i, 0x03, 0x10, 3, d))
-                    type = 7;
-            }
-            if(!type && Modbus_Safe_Transaction(i, 0x03, 0, 10, d)) {
+
+        /* 1. Presence probe: any valid reply, including an exception frame,
+         *    proves a device lives at this address. */
+        uint8_t present = Modbus_Safe_Transaction_T(i, 0x03, 0x0000, 1, d, SCAN_TURNAROUND_MS);
+        if (!present && s_last_exception) present = 1;
+
+        if (present) {
+            osDelay(10);
+            /* 2. Multi-Sensor Board: FC04 summary (0, qty 10) AND the
+             *    DS18B20 block at 0x60, which plain sensors do not expose. */
+            if (Modbus_Safe_Transaction_T(i, 0x04, 0x0000, 10, d, SCAN_TURNAROUND_MS) &&
+                Modbus_Safe_Transaction_T(i, 0x03, 0x0060, 2, d, SCAN_TURNAROUND_MS)) {
+                type = 7;
+            /* 3. DO sensor (Kacise KWS-630) */
+            } else if (Modbus_Safe_Transaction_T(i, 0x03, 0x2600, 6, d, SCAN_TURNAROUND_MS)) {
+                type = 4;
+            /* 4. Single ultrasonic: 10-register block at 0 */
+            } else if (Modbus_Safe_Transaction_T(i, 0x03, 0x0000, 10, d, SCAN_TURNAROUND_MS)) {
                 type = 6;
+            /* 5. Generic 2-register water-quality sensor (pH/ORP/EC/Ammonia) */
+            } else if (Modbus_Safe_Transaction_T(i, 0x03, 0x0000, 2, d, SCAN_TURNAROUND_MS)) {
+                type = 1;
+            } else {
+                type = 255; /* present but unrecognised */
             }
-            if(!type) type = 1;
         }
-        if(type && g_scan_status.count < 32) {
+
+        if(type && g_scan_status.count < SCAN_MAX_DEVICES) {
             g_scan_status.devices[g_scan_status.count].id = i;
             g_scan_status.devices[g_scan_status.count].type = type;
             g_scan_status.count++;
+            printf("[SCAN] Found device ID %d type %u\r\n", i, type);
         }
         g_scan_status.progress = (i * 100) / 247;
-        osDelay(10); /* 10ms between probed addresses: lets a non-responding
-                      * slave's timeout elapse before the next probe. A full
-                      * network scan sweeps 247 addresses => many seconds,
-                      * far beyond 1ms (it's a one-shot background operation). */
+        osDelay(10); /* inter-frame silence before probing the next address */
     }
+    g_scan_status.progress = 100;
     g_scan_status.is_scanning = 0;
 }
 
