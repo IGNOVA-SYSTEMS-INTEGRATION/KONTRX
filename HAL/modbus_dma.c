@@ -463,21 +463,6 @@ void Modbus_DMA_PollSensors(void) {
                         mu->temp[1] = ((int16_t)rs[7]) / 10.0f;
                         ok = 1;
                     }
-                    /* Auto-detect fallback: if sid != 1 and no response, probe Slave ID 1 */
-                    else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x04, 0x0000, 10, rs, 60)) {
-                        target_sid = 1;
-                        mu->id = 1;
-                        for (uint8_t k = 0; k < 10; k++) mu->summary[k] = rs[k];
-                        mu->dist[0] = (float)rs[0];
-                        mu->dist[1] = (float)rs[1];
-                        mu->dist[2] = (float)rs[2];
-                        mu->flow[0].rate = (float)rs[3] / 10.0f;
-                        mu->flow[1].rate = (float)rs[4] / 10.0f;
-                        mu->flow[2].rate = (float)rs[5] / 10.0f;
-                        mu->temp[0] = ((int16_t)rs[6]) / 10.0f;
-                        mu->temp[1] = ((int16_t)rs[7]) / 10.0f;
-                        ok = 1;
-                    }
 
                     /* 2. Poll FC03 channel blocks for detailed registers (Offsets 0x00..0x70) */
                     for (uint8_t c = 0; c < 2; c++) {
@@ -487,10 +472,6 @@ void Modbus_DMA_PollSensors(void) {
                         if (ch <= 2) {
                             /* Ultrasonic 1..3 */
                             if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 60)) {
-                                mu->dist[ch] = (float)rs[0];
-                                ok = 1;
-                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 3, rs, 60)) {
-                                target_sid = 1; mu->id = 1;
                                 mu->dist[ch] = (float)rs[0];
                                 ok = 1;
                             }
@@ -503,23 +484,10 @@ void Modbus_DMA_PollSensors(void) {
                                 mu->flow[f].freq_hz = (float)rs[3];
                                 mu->flow[f].status  = (uint8_t)rs[4];
                                 ok = 1;
-                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 5, rs, 60)) {
-                                target_sid = 1; mu->id = 1;
-                                uint8_t f = ch - 3;
-                                mu->flow[f].rate    = (float)rs[0] / 10.0f;
-                                mu->flow[f].total_l = ((uint32_t)rs[1] << 16) | (uint32_t)rs[2];
-                                mu->flow[f].freq_hz = (float)rs[3];
-                                mu->flow[f].status  = (uint8_t)rs[4];
-                                ok = 1;
                             }
                         } else if (ch == 6 || ch == 7) {
                             /* Temp 1..2 */
                             if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 2, rs, 60)) {
-                                uint8_t t = ch - 6;
-                                mu->temp[t] = ((int16_t)rs[0]) / 10.0f;
-                                ok = 1;
-                            } else if (target_sid != 1 && Modbus_Safe_Transaction_T(1, 0x03, reg_addr, 2, rs, 60)) {
-                                target_sid = 1; mu->id = 1;
                                 uint8_t t = ch - 6;
                                 mu->temp[t] = ((int16_t)rs[0]) / 10.0f;
                                 ok = 1;
