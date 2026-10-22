@@ -6,6 +6,7 @@
 #include "modbus_dma.h"
 #include "dsp_filter.h"
 #include "stm32f407_regs.h"
+#include "rcc_stm32.h"
 #include "cmsis_os2.h"
 #include <string.h>
 #include <stdio.h>
@@ -64,7 +65,13 @@ void Modbus_DMA_Init(void) {
     GPIOD->MODER |= ((1U << 4) | (1U << 6));
     GPIOD->OSPEEDR |= ((2U << 4) | (2U << 6));
     MAX485_RX();
-    USART3->BRR = 0x0683;
+    /* Compute BRR from the live PCLK1 (42 MHz at 168 MHz SYSCLK). The old
+     * hardcoded 0x0683 assumed 16 MHz HSI and produced ~25.2 kbaud. */
+    {
+        uint32_t pclk1 = RCC_GetPCLK1Freq();
+        uint32_t div_x16 = (2U * pclk1 + 9600U) / (2U * 9600U);
+        USART3->BRR = ((div_x16 / 16U) << 4) | (div_x16 % 16U);
+    }
     USART3->CR2 = 0;
     USART3->CR1 = (1U << 13) | (1U << 3) | (1U << 2);
 
@@ -99,7 +106,7 @@ void Modbus_DMA_Init(void) {
  * Modbus_Safe_Transaction — one blocking RS485 read (polling, no DMA).
  *
  * WHY THIS IS SLOW (> 1 ms per call, unavoidable):
- *   UART runs at 9600 baud (USART3 BRR=0x0683 => ~9598 baud), so one byte
+ *   UART runs at 9600 baud (USART3 BRR computed from PCLK1), so one byte
  *   takes ~1.04 ms on the wire. A single 8-byte request + 3.5-char gap +
  *   9-byte response is ~21 ms minimum, plus the slave's own reply delay.
  *   Modbus RTU protocol REQUIRES the 3.5-char silent gap between frames,
