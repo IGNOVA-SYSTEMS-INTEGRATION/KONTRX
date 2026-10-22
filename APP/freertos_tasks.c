@@ -1018,13 +1018,11 @@ static void Task_ModbusSensorPoll(void *arg) {
         }
 
         if (g_scan_status.is_scanning) {
-            /* Drop to low priority during the one-shot network scan
-             * so it doesn't starve real-time operations. */
-            printf("[Task] Scan mode active: lowering priority to 1\r\n");
-            vTaskPrioritySet(NULL, 1);
+            /* Keep normal priority: the scan sleeps between bytes (RX is
+             * interrupt-driven), so it does not starve other tasks. */
+            printf("[Task] Scan mode active\r\n");
             Modbus_DMA_PerformScan();
-            printf("[Task] Scan mode done: restoring priority to 3\r\n");
-            vTaskPrioritySet(NULL, 3);
+            printf("[Task] Scan mode done\r\n");
             osDelay(2000); /* 2s cool-down after a full 247-address scan. */
         } else {
             /* Poll sensors if RS485 Bus 1 (index 3) is enabled; yield 350ms between cycles */
