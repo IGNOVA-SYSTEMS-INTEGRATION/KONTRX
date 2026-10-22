@@ -51,6 +51,45 @@ static float Decode_Float_DCBA(uint16_t r0, uint16_t r1) {
 static inline void MAX485_TX(void) { GPIOD->BSRR = (1U << 3) | (1U << 2); }
 static inline void MAX485_RX(void) { GPIOD->BSRR = (1U << (3+16)) | (1U << (2+16)); }
 
+/* USART3 RX ring buffer, filled by the RXNE interrupt. A single-byte DR
+ * with task polling loses bytes (overrun) whenever a higher-priority task
+ * runs for more than one character time (~1.04 ms at 9600 baud). */
+#define RS485_RX_BUF_SIZE 256U
+static volatile uint8_t  s_rx_buf[RS485_RX_BUF_SIZE];
+static volatile uint16_t s_rx_head = 0;
+static volatile uint16_t s_rx_tail = 0;
+
+void USART3_IRQHandler(void) {
+    uint32_t sr = USART3->SR;
+    if (sr & ((1U << 5) | 0x0FU)) {
+        uint8_t b = (uint8_t)USART3->DR; /* DR read also clears ORE/FE/NE/PE */
+        if (sr & (1U << 5)) {
+            uint16_t next = (uint16_t)((s_rx_head + 1U) % RS485_RX_BUF_SIZE);
+            if (next != s_rx_tail) {
+                s_rx_buf[s_rx_head] = b;
+                s_rx_head = next;
+            }
+        }
+    }
+}
+
+static void RS485_RxFlush(void) {
+    s_rx_tail = s_rx_head;
+}
+
+static int RS485_RxGet(uint8_t *b) {
+    if (s_rx_tail == s_rx_head) return 0;
+    *b = s_rx_buf[s_rx_tail];
+    s_rx_tail = (uint16_t)((s_rx_tail + 1U) % RS485_RX_BUF_SIZE);
+    return 1;
+}
+
+/* Response window = slave turnaround allowance + wire time of the expected
+ * reply (~1.1 ms per byte at 9600 8N1, with margin). */
+static uint32_t RS485_ReplyTimeout(uint32_t turnaround_ms, uint32_t reply_bytes) {
+    return turnaround_ms + (reply_bytes * 11U + 9U) / 10U;
+}
+
 void Modbus_DMA_Init(void) {
     if (!sensorMutex) sensorMutex = osMutexNew(NULL);
     if (!configMutex) configMutex = osMutexNew(NULL);
@@ -73,7 +112,9 @@ void Modbus_DMA_Init(void) {
         USART3->BRR = ((div_x16 / 16U) << 4) | (div_x16 % 16U);
     }
     USART3->CR2 = 0;
-    USART3->CR1 = (1U << 13) | (1U << 3) | (1U << 2);
+    USART3->CR1 = (1U << 13) | (1U << 5) | (1U << 3) | (1U << 2); /* UE | RXNEIE | TE | RE */
+    NVIC_IPR[39] = (uint8_t)(6U << 4);  /* USART3_IRQn = 39; no RTOS calls in ISR */
+    NVIC_ISER[1] |= (1U << (39 - 32));
 
     /* Default config: empty sensor list (user adds via Auto-Scan / UI) + default relays */
     Get_Shared_Config(&cfg);
@@ -123,7 +164,9 @@ void Modbus_DMA_Init(void) {
 /*
  * Modbus_Safe_Transaction — one blocking RS485 read (polling, no DMA).
  *
- * timeout_ms: how long to wait for the slave's first byte.
+ * timeout_ms: slave turnaround allowance. The wire time of the expected
+ *   reply is added on top (see RS485_ReplyTimeout), so long frames such as
+ *   the Multi-Sensor FC04 summary (25 bytes) are not cut short.
  *   Fast sensors (pH/ORP/EC/Ammonia/Ultrasonic): 80ms  — respond in <50ms
  *   Slow sensors (DO KWS-630):                  300ms  — response can take >100ms
  *   Multi-US per channel:                        80ms  — each channel is fast
@@ -134,6 +177,10 @@ void Modbus_DMA_Init(void) {
  *   2 × 250ms = 500ms wasted per cycle, causing data to look stale and the
  *   MQTT payload to always be incomplete.
  */
+/* Set by the last Modbus_Safe_Transaction_T() when the slave answered with
+ * a valid exception frame (it is present but rejected the request). */
+static uint8_t s_last_exception = 0;
+
 static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
                                           uint16_t reg, uint8_t num,
                                           uint16_t *out, uint32_t timeout_ms) {
@@ -141,16 +188,8 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
     uint16_t crc = Modbus_CRC16(f, 6);
     f[6] = crc & 0xFF; f[7] = crc >> 8;
 
-    /* 1. Flush any stale bytes from UART RX buffer to guarantee a clean start */
-    while (USART3->SR & (1U << 5)) {
-        volatile uint32_t junk = USART3->DR;
-        (void)junk;
-    }
-    /* Clear error flags */
-    if (USART3->SR & 0x0F) {
-        volatile uint32_t junk_dr = USART3->DR;
-        (void)junk_dr;
-    }
+    /* 1. Drop any stale bytes so the reply starts from a clean buffer */
+    RS485_RxFlush();
 
     /* 2. Switch MAX485 to TX mode and settle without yielding the CPU */
     MAX485_TX();
@@ -172,51 +211,62 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
 
     /* 4. Switch back to RX mode immediately */
     MAX485_RX();
+    RS485_RxFlush(); /* discard any echo/glitch captured while DE was high */
 
-    /* 5. Read response with noise rejection state machine */
-    uint8_t rx[50]; int received = 0;
+    /* 5. Read response with noise rejection state machine. Bytes arrive via
+     *    the RXNE interrupt, so sleeping between checks cannot overrun. */
+    uint8_t rx[64]; int received = 0;
+    const int expected = 3 + num * 2 + 2;
+    uint8_t is_exception = 0;
+    uint32_t window = RS485_ReplyTimeout(timeout_ms, (uint32_t)expected);
     uint32_t start = osKernelGetTickCount();
-    
-    while((osKernelGetTickCount() - start) < timeout_ms) {
-        if(USART3->SR & (1U << 5)) {
-            uint8_t b = (uint8_t)USART3->DR;
 
-            /* Reject leading noise: first byte must be the target slave ID (no sleep) */
-            if (received == 0 && b != slave) {
-                continue;
-            }
-            
-            /* Reject frame shift: second byte must match function code */
-            if (received == 1 && b != fc) {
+    while ((osKernelGetTickCount() - start) < window) {
+        uint8_t b;
+        if (!RS485_RxGet(&b)) {
+            osDelay(1);
+            continue;
+        }
+
+        /* Reject leading noise: first byte must be the target slave ID */
+        if (received == 0 && b != slave) {
+            continue;
+        }
+
+        /* Second byte must be the function code or its exception (fc|0x80) */
+        if (received == 1 && b != fc) {
+            if (b == (uint8_t)(fc | 0x80U)) {
+                is_exception = 1;
+            } else {
                 received = 0;
                 if (b == slave) {
                     rx[received++] = b;
                 }
                 continue;
             }
-            
-            if(received < 50) {
-                rx[received++] = b;
-            }
-            
-            /* Check if we got the expected packet length */
-            if(received >= (3 + num*2 + 2)) {
-                break;
-            }
-        } else {
-            /* No byte yet — sleep for 1ms to allow lower-priority tasks
-             * (HTTP dashboard, MQTT client) to run. */
-            osDelay(1);
         }
-        
-        /* Clean any hardware errors (Overrun, Framing, Noise) on the fly */
-        if(USART3->SR & 0x0F) {
-            volatile uint32_t d = USART3->DR;
-            (void)d;
+
+        if (received < (int)sizeof(rx)) {
+            rx[received++] = b;
+        }
+
+        /* Exception reply: slave + (fc|0x80) + code + CRC = 5 bytes */
+        if (is_exception && received >= 5) {
+            break;
+        }
+        if (received >= expected) {
+            break;
         }
     }
-    
-    if(received < 5 || rx[0] != slave || rx[1] != fc) return 0;
+
+    s_last_exception = 0;
+    if (is_exception && received >= 5 &&
+        Modbus_CRC16(rx, 3) == (rx[3] | (rx[4] << 8))) {
+        s_last_exception = 1; /* device exists but rejected the request */
+        return 0;
+    }
+
+    if(received < expected || rx[0] != slave || rx[1] != fc) return 0;
     if(Modbus_CRC16(rx, received-2) != (rx[received-2]|(rx[received-1]<<8))) return 0;
     
     for(int i=0; i<num; i++) out[i] = (rx[3+i*2]<<8) | rx[4+i*2];
@@ -236,14 +286,7 @@ static uint8_t Modbus_Write_Register_FC06(uint8_t slave, uint16_t reg, uint16_t 
     uint16_t crc = Modbus_CRC16(f, 6);
     f[6] = (uint8_t)(crc & 0xFF); f[7] = (uint8_t)(crc >> 8);
 
-    while (USART3->SR & (1U << 5)) {
-        volatile uint32_t junk = USART3->DR;
-        (void)junk;
-    }
-    if (USART3->SR & 0x0F) {
-        volatile uint32_t junk_dr = USART3->DR;
-        (void)junk_dr;
-    }
+    RS485_RxFlush();
 
     MAX485_TX();
     for (volatile int d = 0; d < 2000; d++);
@@ -261,21 +304,15 @@ static uint8_t Modbus_Write_Register_FC06(uint8_t slave, uint16_t reg, uint16_t 
     MAX485_RX();
 
     uint8_t rx[16]; int received = 0;
+    uint32_t window = RS485_ReplyTimeout(timeout_ms, 8U);
     uint32_t start = osKernelGetTickCount();
-    while ((osKernelGetTickCount() - start) < timeout_ms) {
-        if (USART3->SR & (1U << 5)) {
-            uint8_t b = (uint8_t)USART3->DR;
-            if (received == 0 && b != slave) { osDelay(1); continue; }
-            if (received == 1 && b != 0x06) { received = 0; if (b == slave) rx[received++] = b; osDelay(1); continue; }
-            if (received < 16) rx[received++] = b;
-            if (received >= 8) break;
-        } else {
-            osDelay(1);
-        }
-        if (USART3->SR & 0x0F) {
-            volatile uint32_t d = USART3->DR;
-            (void)d;
-        }
+    while ((osKernelGetTickCount() - start) < window) {
+        uint8_t b;
+        if (!RS485_RxGet(&b)) { osDelay(1); continue; }
+        if (received == 0 && b != slave) continue;
+        if (received == 1 && b != 0x06) { received = 0; if (b == slave) rx[received++] = b; continue; }
+        if (received < 16) rx[received++] = b;
+        if (received >= 8) break;
     }
     if (received < 8 || rx[0] != slave || rx[1] != 0x06) return 0;
     if (Modbus_CRC16(rx, 6) != (rx[6] | (rx[7] << 8))) return 0;
@@ -721,5 +758,4 @@ void Update_Shared_Config(const Gateway_Config_t *src) {
     }
 }   
 
-void USART3_IRQHandler(void) { }
 void DMA1_Stream3_IRQHandler(void) { }
