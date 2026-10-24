@@ -892,6 +892,10 @@ static int JSON_StatusResponse(char *buf, int buflen) {
             "],"
             "\"temp\":[%.1f,%.1f],"
             "\"summary\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+            /* FC04 summary decoded with the slave's input-register map */
+            "\"summary_decoded\":{\"ok\":%u,\"dist_avg\":%u,\"temp\":%.1f,\"dist_comp\":%u,"
+              "\"flow_total\":%.1f,\"volume\":%lu,\"freq_total\":%u,\"health\":%u,"
+              "\"uptime\":%u,\"error\":%u},"
             "\"avg\":%.0f}%s",
             m->id, (unsigned int)m->mode,
             m->dist[0], m->dist[1], m->dist[2],
@@ -901,6 +905,10 @@ static int JSON_StatusResponse(char *buf, int buflen) {
             m->temp[0], m->temp[1],
             m->summary[0], m->summary[1], m->summary[2], m->summary[3], m->summary[4],
             m->summary[5], m->summary[6], m->summary[7], m->summary[8], m->summary[9],
+            (unsigned int)m->summary_ok, (unsigned int)m->summary[0], ((int16_t)m->summary[1]) / 10.0f,
+            (unsigned int)m->summary[2], m->summary[3] / 10.0f,
+            ((unsigned long)m->summary[4] << 16) | m->summary[5], (unsigned int)m->summary[6],
+            (unsigned int)m->summary[7], (unsigned int)m->summary[8], (unsigned int)m->summary[9],
             m->avg,
             (i < s_sd.multi_us_count - 1) ? "," : "");
     }
