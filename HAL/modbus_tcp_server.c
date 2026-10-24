@@ -74,10 +74,13 @@ static uint16_t ReadHoldingRegister(uint16_t addr) {
     return 0;
 }
 
+/* test_mode is one byte, read atomically: no 2.4 KB config copy on the stack. */
+static uint8_t Test_Mode_Active(void) {
+    return (*(volatile const uint8_t *)&sharedConfig.test_mode == 1U);
+}
+
 static void WriteHoldingRegister(uint16_t addr, uint16_t val) {
-    Gateway_Config_t cfg;
-    Get_Shared_Config(&cfg);
-    if (cfg.test_mode != 1) return; // Manual actuator write blocked when test mode is OFF
+    if (!Test_Mode_Active()) return; // Manual actuator write blocked when test mode is OFF
 
     if (addr < 16) {
         Relay_SetState(addr, val ? 1 : 0);
@@ -171,9 +174,7 @@ void Modbus_TCP_Server_Poll(void) {
         } else if (fc == 0x05) { // Write Single Coil
             uint16_t coil_addr = (s_rx_buf[8] << 8) | s_rx_buf[9];
             uint16_t coil_val  = (s_rx_buf[10] << 8) | s_rx_buf[11];
-            Gateway_Config_t cfg;
-            Get_Shared_Config(&cfg);
-            if (cfg.test_mode == 1 && coil_addr < 16) {
+            if (Test_Mode_Active() && coil_addr < 16) {
                 Relay_SetState(coil_addr, (coil_val == 0xFF00) ? 1 : 0);
             }
             send(SN, s_rx_buf, 12);
