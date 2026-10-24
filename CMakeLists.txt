@@ -85,7 +85,8 @@ set(RTOS_APP_SOURCES
     APP/sparkplug_b_enc.c
     APP/http_server_task.c
     APP/ota_task.c
-    APP/cJSON.c
+    APP/jspan.c
+    APP/rules_parser.c
     APP/dsp_filter.c
     HAL/sdcard.c
     HAL/modbus_dma.c

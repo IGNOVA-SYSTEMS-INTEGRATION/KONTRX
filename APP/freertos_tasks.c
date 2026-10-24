@@ -60,7 +60,6 @@ static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay ta
 #include "wizchip_conf.h"
 #include "spi_stm32.h"
 #include "gpio_stm32.h"
-#include "cJSON.h"
 #include "safe_fmt.h"
 #include "fault_supervisor.h"
 #include "timekeeper.h"
@@ -2634,13 +2633,6 @@ static osThreadId_t s_tid_http;
 static osThreadId_t s_tid_ota;
 
 void RTOS_Tasks_Init(void) {
-    // 1. Initialize cJSON hooks with FreeRTOS heap memory functions
-    cJSON_Hooks cjson_hooks = {
-        .malloc_fn = pvPortMalloc,
-        .free_fn = vPortFree
-    };
-    cJSON_InitHooks(&cjson_hooks);
-
     // 2. Initialize rules mutex and load rules configuration
     if (!rulesMutex) {
         rulesMutex = osMutexNew(NULL);
