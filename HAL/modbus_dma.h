@@ -15,7 +15,11 @@
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. */
+#ifdef KONTRX_FAULT_TEST
+#define FW_VERSION "2.2.2-faulttest"   /* test image: fault-injection endpoint built in */
+#else
 #define FW_VERSION "2.2.2"
+#endif
 
 /* Sensor types: 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US */
 typedef struct {

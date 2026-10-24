@@ -44,10 +44,12 @@
 #include "analog_010v.h"
 #include "interface_discovery.h"
 #include "safe_fmt.h"
+#include "fault_supervisor.h"
 #include "sdcard.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 /* ======================================================================
  *  OTA inter-task state (defined here, declared extern in header)
@@ -1068,6 +1070,9 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         (unsigned)has_pending,
         pending_ver);
 
+    pos = sfmt_advance(buflen, pos, Supervisor_FormatHealthJSON(buf + pos, buflen - (int)pos));
+    pos = sfmt_append(buf, buflen, pos, ",");
+
     pos = sfmt_append(buf, buflen, pos, "\"interfaces\":");
     pos = sfmt_advance(buflen, pos, Interface_BuildArrayJSON(buf + pos, buflen - pos));
     pos = sfmt_append(buf, buflen, pos, ",");
@@ -1408,6 +1413,25 @@ static void Build_CORS_Headers(const char *req, char *out_cors, size_t maxlen) {
     }
 }
 
+/* Value of the Content-Length header (any letter case), or -1 if absent.
+ * Only the header block (before the blank line) is searched. */
+static int Find_Content_Length(const char *req, const char *hdr_end) {
+    static const char key[] = "content-length:";
+    for (const char *p = req; p < hdr_end; p++) {
+        if (*p != '\n') continue;
+        const char *k = p + 1;
+        size_t i = 0;
+        while (key[i] && k + i < hdr_end &&
+               (char)tolower((unsigned char)k[i]) == key[i]) i++;
+        if (key[i] == '\0') {
+            const char *v = k + i;
+            while (*v == ' ' || *v == '\t') v++;
+            return atoi(v);
+        }
+    }
+    return -1;
+}
+
 /* ======================================================================
  *  Request dispatcher
  * ====================================================================== */
@@ -1630,12 +1654,35 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         strncmp(line, "POST /api/modbus", 16) == 0 ||
         strncmp(line, "POST /api/provision/delete", 26) == 0 ||
         strncmp(line, "POST /api/provision/manual", 26) == 0 ||
-        strncmp(line, "POST /api/queue/clear", 21) == 0) {
+        strncmp(line, "POST /api/queue/clear", 21) == 0 ||
+        strncmp(line, "POST /api/debug/", 16) == 0) {
         if (!Is_Session_Valid(line)) {
             Send_Response(sn, HTTP_401, NULL);
             return;
         }
     }
+
+#ifdef KONTRX_FAULT_TEST
+    /* -----------------------------------------------------------------
+     * POST /api/debug/fault?task=NAME&type=N  (test builds only, login
+     * required) -> the named task faults at its next test point.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/debug/fault", 21) == 0) {
+        char task[configMAX_TASK_NAME_LEN] = {0};
+        const char *t = strstr(line, "task=");
+        if (t) {
+            t += 5;
+            size_t n = 0;
+            while (n < sizeof(task) - 1U && t[n] && t[n] != '&' && t[n] != ' ') { task[n] = t[n]; n++; }
+        }
+        int type = ParseQueryInt(line, "type");
+        int ok = FaultTest_Arm(task, (uint8_t)((type > 0 && type < 256) ? type : 0));
+        char resp[96];
+        snprintf(resp, sizeof(resp), "{\"ok\":%s,\"task\":\"%s\",\"type\":%d}", ok ? "true" : "false", task, type);
+        Send_Response(sn, HTTP_200_JSON, resp);
+        return;
+    }
+#endif
 
     /* -----------------------------------------------------------------
      * POST /api/queue/clear  → Purge stale offline telemetry queue
@@ -4120,6 +4167,7 @@ void Task_HTTPServer(void *arg) {
     static uint32_t s_sock_est_tick[8] = {0};
 
     for (;;) {
+        FAULT_TEST_POINT();
         uint32_t now = osKernelGetTickCount();
 
         for (uint8_t i = 0; i < HTTP_NUM_SOCKS; i++) {
@@ -4203,8 +4251,9 @@ void Task_HTTPServer(void *arg) {
                          * Without this, TCP fragmentation causes partial JSON → save failures. */
                         if (rx_buf[0] == 'P') {
                             rx_buf[total] = '\0';
-                            char *cl = strstr((char *)rx_buf, "Content-Length: ");
                             char *body = strstr((char *)rx_buf, "\r\n\r\n");
+                            int cl_val = body ? Find_Content_Length((char *)rx_buf, body) : -1;
+                            char *cl = (cl_val >= 0) ? body : NULL;
 
                             /* If headers arrived fragmented (no Content-Length or
                              * no end-of-headers yet), wait for more data. */
@@ -4218,8 +4267,9 @@ void Task_HTTPServer(void *arg) {
                                         int32_t r = recv(sn, rx_buf + total, more);
                                         if (r > 0) total += (uint16_t)r;
                                         rx_buf[total] = '\0';
-                                        cl = strstr((char *)rx_buf, "Content-Length: ");
                                         body = strstr((char *)rx_buf, "\r\n\r\n");
+                                        cl_val = body ? Find_Content_Length((char *)rx_buf, body) : -1;
+                                        cl = (cl_val >= 0) ? body : NULL;
                                     } else {
                                         osDelay(2);
                                     }
@@ -4227,10 +4277,25 @@ void Task_HTTPServer(void *arg) {
                             }
 
                             if (cl && body) {
-                                int content_len = atoi(cl + 16);
+                                int content_len = cl_val;
                                 int header_len = (int)(body + 4 - (char *)rx_buf);
                                 int need = header_len + content_len;
-                                if (need > (int)(sizeof(rx_buf) - 1)) need = (int)(sizeof(rx_buf) - 1);
+                                /* POST /update streams the firmware from the socket
+                                 * itself (Dispatch_Request), so it only needs the
+                                 * part that fits here, as before. */
+                                uint8_t is_stream = (strncmp((char *)rx_buf, "POST /update", 12) == 0);
+                                if (need > (int)(sizeof(rx_buf) - 1) && is_stream) {
+                                    need = (int)(sizeof(rx_buf) - 1);
+                                } else if (need > (int)(sizeof(rx_buf) - 1)) {
+                                    /* Body larger than rx_buf: processing a cut copy could
+                                     * save half a config or rule set, so refuse it. */
+                                    Send_Response(sn, "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n"
+                                                      "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                                                  "{\"ok\":false,\"error\":\"Request body too large\"}");
+                                    Log_Event("SYS", "HTTP: request body too large, rejected (413)");
+                                    total = 0;
+                                    need = 0;
+                                }
                                 uint32_t t0 = osKernelGetTickCount();
                                 while ((int)total < need && (osKernelGetTickCount() - t0) < 2500) {
                                     uint16_t more = getSn_RX_RSR(sn);
@@ -4246,7 +4311,7 @@ void Task_HTTPServer(void *arg) {
                             }
                         }
 
-                        Dispatch_Request(sn, rx_buf, total);
+                        if (total > 0) Dispatch_Request(sn, rx_buf, total);
                         
                         /* Flush any leftover/overflow bytes in the socket RX buffer */
                         uint16_t rem_size;

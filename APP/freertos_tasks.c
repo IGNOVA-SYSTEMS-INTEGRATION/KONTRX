@@ -62,6 +62,7 @@ static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay ta
 #include "gpio_stm32.h"
 #include "cJSON.h"
 #include "safe_fmt.h"
+#include "fault_supervisor.h"
 
 RuleConfig_t activeRules;
 RuleConfig_t pendingRules;
@@ -274,7 +275,9 @@ static void Task_LogWriter(void *arg) {
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+        FAULT_TEST_POINT();
 
+        Supervisor_Service();
         Log_Flush();
 
         OfflineRecord_t rec;
@@ -589,6 +592,17 @@ static void Task_IOWorker(void *arg) {
     (void)arg;
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(IO_WORKER_PERIOD_MS));
+        FAULT_TEST_POINT();
+
+        /* Backup supervisor pass, in case the LogWriter itself was the
+         * task that faulted. */
+        static uint32_t s_last_sup = 0;
+        uint32_t now_sup = osKernelGetTickCount();
+        if ((now_sup - s_last_sup) >= pdMS_TO_TICKS(1000)) {
+            s_last_sup = now_sup;
+            Supervisor_Service();
+        }
+
         if (g_ota_in_progress) continue;
 
         Remote_Actuator_Service();
@@ -927,6 +941,7 @@ static void Task_ControlEngine(void *arg) {
     Modbus_SensorData_t sd = { .last_update_time = 0 };
 
     for (;;) {
+        FAULT_TEST_POINT();
         if (g_ota_in_progress) {
             osDelay(50);
             continue;
@@ -1229,6 +1244,7 @@ static void Task_ModbusSensorPoll(void *arg) {
     printf("[Task] ModbusSensorPoll entering continuous poll loop\r\n");
 
     for (;;) {
+        FAULT_TEST_POINT();
         if (g_ota_in_progress) {
             osDelay(50);
             continue;
@@ -1753,6 +1769,7 @@ static void Task_MQTTClient(void *arg) {
     uint32_t mqtt_tcp_backoff_ms = 3000;  /* Exponential backoff for TCP failures: 3s → 5s → 10s → 20s → 30s cap */
     
     for (;;) {
+        FAULT_TEST_POINT();
         if (g_ota_in_progress) {
             osDelay(50);
             continue;
@@ -1991,6 +2008,7 @@ static void Task_MQTTClient(void *arg) {
                      * Note: MQTTYield returns FAILURE on read timeout (no data available), which is normal.
                      * Check actual W5500 socket state to detect connection loss. */
                     MQTTYield(&client, 100);
+                    FAULT_TEST_POINT();
                     uint8_t sock_state = getSn_SR(n.my_socket);
                     if (!client.isconnected || (sock_state != SOCK_ESTABLISHED && sock_state != SOCK_CLOSE_WAIT)) {
                         printf("[MQTT] Network socket disconnected (state=0x%02X)\r\n", sock_state);
@@ -2611,6 +2629,9 @@ osThreadId_t g_tid_mqtt    = NULL;
  *  RTOS_Tasks_Init — Creates all tasks and starts the scheduler
  *  Called from main().  Does NOT return.
  * ====================================================================== */
+static osThreadId_t s_tid_http;
+static osThreadId_t s_tid_ota;
+
 void RTOS_Tasks_Init(void) {
     // 1. Initialize cJSON hooks with FreeRTOS heap memory functions
     cJSON_Hooks cjson_hooks = {
@@ -2632,25 +2653,25 @@ void RTOS_Tasks_Init(void) {
     attr.stack_size = 4096; /* Worst case 2064 B + libc printf (GCC -fstack-usage) now that
                              * Modbus TCP, remote writes and flash work run elsewhere. */
     attr.priority   = osPriorityRealtime;
-    g_tid_control   = osThreadNew(Task_ControlEngine, NULL, &attr);
+    Supervisor_CreateTask(Task_ControlEngine, &attr, &g_tid_control);
 
     /* Task 2 — Modbus Sensor Poll */
     attr.name       = "ModbusPoll";
     attr.stack_size = 3072; /* worst case 496 B + libc printf */
     attr.priority   = osPriorityNormal;
-    g_tid_modbus    = osThreadNew(Task_ModbusSensorPoll, NULL, &attr);
+    Supervisor_CreateTask(Task_ModbusSensorPoll, &attr, &g_tid_modbus);
 
     /* Task 3 — HTTP Server */
     attr.name       = "HTTPServer";
     attr.stack_size = 12288;  /* Increased to 12KB to guarantee absolute stack overflow protection */
     attr.priority   = osPriorityAboveNormal;
-    osThreadNew(Task_HTTPServer, NULL, &attr);
+    Supervisor_CreateTask(Task_HTTPServer, &attr, &s_tid_http);
 
     /* Task 4 — OTA Background */
     attr.name       = "OTAUpdate";
     attr.stack_size = 4096; // Increased to 4KB for firmware write stack buffer safety
     attr.priority   = osPriorityLow;
-    osThreadNew(Task_OTAUpdate, NULL, &attr);
+    Supervisor_CreateTask(Task_OTAUpdate, &attr, &s_tid_ota);
 
     /* Task 5 — MQTT Client */
     attr.name       = "MQTTClient";
@@ -2658,19 +2679,19 @@ void RTOS_Tasks_Init(void) {
                               * LWT payload + sparkplug encode buffers + tx/rx[512]
                               * + deep MQTTConnect/MQTTPublish call frames. */
     attr.priority   = osPriorityAboveNormal;
-    g_tid_mqtt      = osThreadNew(Task_MQTTClient, NULL, &attr);
+    Supervisor_CreateTask(Task_MQTTClient, &attr, &g_tid_mqtt);
 
     /* Task 6 — IO Worker: Modbus TCP server + remote actuator writes */
     attr.name       = "IOWorker";
     attr.stack_size = 2048;  /* worst case 640 B + libc printf */
     attr.priority   = osPriorityAboveNormal;
-    s_io_worker_task = (TaskHandle_t)osThreadNew(Task_IOWorker, NULL, &attr);
+    Supervisor_CreateTask(Task_IOWorker, &attr, (osThreadId_t *)&s_io_worker_task);
 
     /* Task 7 — Log Writer: deferred SPI-flash writes (logs, offline queue, rules) */
     attr.name       = "LogWriter";
     attr.stack_size = 1536;  /* worst case 384 B + libc printf */
     attr.priority   = osPriorityBelowNormal;
-    s_log_writer_task = (TaskHandle_t)osThreadNew(Task_LogWriter, NULL, &attr);
+    Supervisor_CreateTask(Task_LogWriter, &attr, (osThreadId_t *)&s_log_writer_task);
 
     osKernelStart();
 }

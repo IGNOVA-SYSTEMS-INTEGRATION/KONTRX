@@ -80,6 +80,7 @@ set(RTOS_APP_SOURCES
     APP/cmsis_os2.c
     MCAL/STM32F4/uart_debug_tx.c
     APP/freertos_tasks.c
+    APP/fault_supervisor.c
     APP/sparkplug_b_enc.c
     APP/http_server_task.c
     APP/ota_task.c
@@ -158,6 +159,13 @@ set_target_properties(KontrxRTOS PROPERTIES
     LINK_FLAGS "-T${APP_LINKER} ${CPU_FLAGS} -Wl,-Map=KontrxRTOS.map -Wl,--gc-sections --specs=nosys.specs --specs=nano.specs -u _printf_float"
 )
 target_compile_options(KontrxRTOS PRIVATE -flto)
+
+# Test images only: adds POST /api/debug/fault (login required) to prove the
+# fault supervisor recovers tasks on the real board. Never ship with it ON.
+option(KONTRX_FAULT_TEST "Build the fault-injection endpoint (test images only)" OFF)
+if(KONTRX_FAULT_TEST)
+    target_compile_definitions(KontrxRTOS PRIVATE KONTRX_FAULT_TEST=1)
+endif()
 target_link_options(KontrxRTOS PRIVATE -flto)
 
 add_custom_command(TARGET KontrxRTOS POST_BUILD
