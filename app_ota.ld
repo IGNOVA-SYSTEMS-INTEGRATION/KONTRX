@@ -41,6 +41,16 @@ SECTIONS
     _edata = .;
   } >RAM AT> FLASH
 
+  /* Not zeroed at boot: survives a reset (fault record). Kept before .bss
+   * so newlib's heap, which starts at _ebss, never overlaps it. */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   .bss :
   {
     . = ALIGN(4);

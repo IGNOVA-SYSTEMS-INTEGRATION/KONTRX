@@ -1,4 +1,5 @@
 #include "cmsis_os2.h"
+#include "fault_supervisor.h"
 
 static osKernelState_t g_kernel_state = osKernelInactive;
 
@@ -97,6 +98,9 @@ osMutexId_t osMutexNew(const osMutexAttr_t *attr) {
         mutex->handle = xSemaphoreCreateMutex();
     }
     
+    if (mutex->handle) {
+        Supervisor_RegisterMutex(mutex->handle, mutex->is_recursive);
+    }
     if (!mutex->handle) {
         vPortFree(mutex);
         return NULL;

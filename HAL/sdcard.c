@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include "rtc_stm32.h"
 #include "safe_fmt.h"
+#include "fault_supervisor.h"
 
 static SDCard_Status_t s_sd_status = {
     .mounted = 1,
@@ -60,6 +61,7 @@ static void SD_Unlock(void) {
 void SDCard_Init(void) {
     if (sdMutex == NULL) {
         sdMutex = xSemaphoreCreateMutex();
+        Supervisor_RegisterMutex(sdMutex, 0);
     }
     s_sd_status.log_entry_count = Partition_Log_Count(&s_sd_status.log_file_bytes);
     printf("[SDCARD] Ready.\r\n");

@@ -46,6 +46,7 @@
 #include "analog_010v.h"
 #include "interface_discovery.h"
 #include "modbus_tcp_server.h"
+#include "fault_supervisor.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -114,17 +115,14 @@ static void    W5500_SPI_WriteByte(uint8_t data)  { SPI2_ReadWriteByte(data); }
 /* ======================================================================
  *  Stack overflow / malloc hooks
  * ====================================================================== */
+/* No reset and no hang: the overflowing task is removed and restarted by
+ * the fault supervisor; a failed allocation only fails that request. */
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
-    (void)xTask;
-    printf("\r\n!!! STACK OVERFLOW: %s !!!\r\n", pcTaskName);
-    while (1);
+    Supervisor_OnStackOverflow(xTask, pcTaskName);
 }
 
 void vApplicationMallocFailedHook(void) {
-    printf("\r\n!!! FreeRTOS MALLOC FAILED -> Auto-resetting !!!\r\n");
-    UART_Debug_WriteBlocking(NULL, 0);  /* drain queued text before the reset */
-    SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;
-    while (1);
+    Supervisor_OnMallocFailed();
 }
 
 /* ======================================================================
@@ -250,6 +248,7 @@ int main(void) {
 
     /* ---- 0. High-Performance Clock: 168 MHz via PLL (HSE / HSI auto-fallback) ---- */
     RCC_SystemClock_168MHz_Init();
+    Supervisor_Init();
 
     /* ---- 1. NVIC priority grouping: 4 bits preemption, 0 sub-priority ---- */
     SCB_AIRCR = AIRCR_VECTKEY | (3U << 8);
@@ -278,6 +277,7 @@ int main(void) {
      * entry (which is extremely common inside WIZnet ioLibrary functions like
      * high-level socket APIs calling low-level register writes) does not deadlock the task. */
     spiMutex = xSemaphoreCreateRecursiveMutex();
+    Supervisor_RegisterMutex(spiMutex, 1);
     if (!spiMutex) {
         printf("[SPI] FATAL: spiMutex creation failed!\r\n");
         while (1);  /* halt — SPI bus would be unprotected */
