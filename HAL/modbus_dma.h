@@ -15,7 +15,7 @@
 
 /* Firmware version — single source of truth for /api/status "fw" and the QR.
  * Keep this in sync with the actual release. */
-#define FW_VERSION "2.2.1"
+#define FW_VERSION "2.2.2"
 
 /* Sensor types: 1=pH, 2=ORP, 3=EC, 4=DO, 5=Ammonia, 6=Ultrasonic, 7=Multi-US */
 typedef struct {
@@ -59,12 +59,13 @@ typedef struct {
     WaterFlow_Channel_t flow[3];        /* 3 Water flow sensors - Offsets 0x30, 0x40, 0x50 */
     float               temp[2];        /* 2 DS18B20 temp sensors (°C) - Offsets 0x60, 0x70 */
     uint16_t            summary[10];    /* FC04 Input Registers summary (Start 0, Qty 10) */
+    uint8_t             summary_ok;     /* 1 once summary[] holds a real FC04 reply */
     uint8_t             mode;           /* 0=Normal Mode, 1=Simulation Mode (FC06 Reg 165) */
     uint8_t             valid;
 
     /* Legacy / Compatibility fields */
-    float               avg;            /* Average distance of valid US sensors */
-    float               comp;           /* Status / comp */
+    float               avg;            /* Average distance (FC04 reg 0, else local mean of valid US) */
+    float               comp;           /* Temperature-compensated distance (FC04 reg 2) */
     float               legacy_temp;    /* Primary temp */
 } MultiSensorBoard_t;
 

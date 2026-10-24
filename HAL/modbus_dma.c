@@ -490,22 +490,25 @@ void Modbus_DMA_PollSensors(void) {
                         mu->temp[1] = -1000.0f;
                         mu->mode = 0;
                         mu->avg = -1000.0f;
+                        mu->comp = -1000.0f;
                         mu->legacy_temp = -1000.0f;
+                        for (uint8_t k = 0; k < 10; k++) mu->summary[k] = 0;
+                        mu->summary_ok = 0;
                     }
 
                     uint8_t target_sid = sid;
+                    uint8_t summary_now = 0;
 
-                    /* 1. Try FC04 Summary (Start 0, Quantity 10) with 60ms timeout */
+                    /* 1. FC04 Summary (Start 0, Quantity 10). Slave input-register map:
+                     *    0 dist avg (mm), 1 temp avg (x10 degC), 2 dist temp-compensated (mm),
+                     *    3 total flow rate (x10 L/min), 4-5 combined volume H/L (L),
+                     *    6 total pulse freq (Hz), 7 health bitmask, 8 uptime (s), 9 error code.
+                     *    Only aggregate fields come from here; per-channel values are
+                     *    read from the FC03 blocks below. */
                     if (Modbus_Safe_Transaction_T(target_sid, 0x04, 0x0000, 10, rs, 60)) {
                         for (uint8_t k = 0; k < 10; k++) mu->summary[k] = rs[k];
-                        mu->dist[0] = (float)rs[0];
-                        mu->dist[1] = (float)rs[1];
-                        mu->dist[2] = (float)rs[2];
-                        mu->flow[0].rate = (float)rs[3] / 10.0f;
-                        mu->flow[1].rate = (float)rs[4] / 10.0f;
-                        mu->flow[2].rate = (float)rs[5] / 10.0f;
-                        mu->temp[0] = ((int16_t)rs[6]) / 10.0f;
-                        mu->temp[1] = ((int16_t)rs[7]) / 10.0f;
+                        mu->summary_ok = 1;
+                        summary_now = 1;
                         ok = 1;
                     }
 
@@ -515,9 +518,9 @@ void Modbus_DMA_PollSensors(void) {
                         uint16_t reg_addr = ch * 0x10;
 
                         if (ch <= 2) {
-                            /* Ultrasonic 1..3 */
+                            /* Ultrasonic 1..3: distance (mm), signal quality, status (1 = valid) */
                             if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 60)) {
-                                mu->dist[ch] = (float)rs[0];
+                                mu->dist[ch] = (rs[2] == 1U) ? (float)rs[0] : -1000.0f;
                                 ok = 1;
                             }
                         } else if (ch >= 3 && ch <= 5) {
@@ -531,31 +534,41 @@ void Modbus_DMA_PollSensors(void) {
                                 ok = 1;
                             }
                         } else if (ch == 6 || ch == 7) {
-                            /* Temp 1..2 */
-                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 2, rs, 60)) {
+                            /* Temp 1..2: value (x10 degC), quality, status (1 = valid) */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 60)) {
                                 uint8_t t = ch - 6;
-                                mu->temp[t] = ((int16_t)rs[0]) / 10.0f;
+                                mu->temp[t] = (rs[2] == 1U) ? ((int16_t)rs[0]) / 10.0f : -1000.0f;
                                 ok = 1;
                             }
                         }
                         osDelay(10);
                     }
 
-                    /* Calculate average distance from valid US channels */
-                    uint32_t sum = 0; uint8_t valid_us = 0;
-                    for (uint8_t i = 0; i < 3; i++) {
-                        if (mu->dist[i] > 0.0f && mu->dist[i] < 10000.0f) {
-                            sum += (uint32_t)mu->dist[i];
-                            valid_us++;
+                    if (summary_now) {
+                        /* Aggregates computed by the slave over all of its channels */
+                        mu->avg  = (mu->summary[0] > 0U) ? (float)mu->summary[0] : -1000.0f;
+                        mu->comp = (mu->summary[2] > 0U) ? (float)mu->summary[2] : -1000.0f;
+                    } else {
+                        /* FC04 missed this cycle: average the valid US channels locally */
+                        uint32_t sum = 0; uint8_t valid_us = 0;
+                        for (uint8_t i = 0; i < 3; i++) {
+                            if (mu->dist[i] > 0.0f && mu->dist[i] < 10000.0f) {
+                                sum += (uint32_t)mu->dist[i];
+                                valid_us++;
+                            }
                         }
+                        mu->avg = (valid_us > 0) ? (float)(sum / valid_us) : -1000.0f;
                     }
-                    mu->avg = (valid_us > 0) ? (float)(sum / valid_us) : -1000.0f;
 
                     if (mu_idx >= local.multi_us_count) local.multi_us_count = mu_idx + 1;
                     mu_idx++;
-                    
+
                     rd->value = (mu->avg > 0.0f) ? mu->avg : mu->flow[0].rate;
-                    rd->temp  = (mu->temp[0] > -50.0f) ? mu->temp[0] : ((mu->temp[1] > -50.0f) ? mu->temp[1] : 0.0f);
+                    if (summary_now) {
+                        rd->temp = ((int16_t)mu->summary[1]) / 10.0f;
+                    } else {
+                        rd->temp = (mu->temp[0] > -50.0f) ? mu->temp[0] : ((mu->temp[1] > -50.0f) ? mu->temp[1] : 0.0f);
+                    }
                     mu->legacy_temp = rd->temp;
 
                     /* Periodically log diagnostic event */
