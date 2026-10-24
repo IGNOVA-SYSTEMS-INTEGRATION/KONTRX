@@ -70,4 +70,8 @@ Run it in the background; `http://localhost:18080`, Modbus TCP on `localhost:150
 - `scripts/ota_upload.ps1` — user-run uploader (login, OTP, prepare, `/update`, reboot wait).
 - `scripts/wait_reboot.sh` — background watcher; prints `REBOOTED` or `TIMEOUT`.
 - `scripts/lat_test.ps1` — Modbus TCP FC03 idle and under log-page load, HTTP status, log pages.
+- `scripts/smoke_get.ps1` — every GET route once: status, size, time, JSON validity (read-only).
+- `scripts/health.ps1` — status, sensors, MQTT and recent logs (read-only).
+- `scripts/relay_test.ps1` — toggles ONE coil via Modbus TCP FC05 (test mode only) and times it.
+  It switches a real output: the user runs it, or Claude only with explicit approval for that output.
 - `baseline.md` — last accepted measurements.
