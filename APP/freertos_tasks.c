@@ -61,6 +61,7 @@ static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay ta
 #include "spi_stm32.h"
 #include "gpio_stm32.h"
 #include "cJSON.h"
+#include "safe_fmt.h"
 
 RuleConfig_t activeRules;
 RuleConfig_t pendingRules;
@@ -77,6 +78,10 @@ volatile uint8_t rulesTesting = 0;
  *   as-is for DDATA publishes. For NBIRTH/NDEATH, append "/msg_type".
  * - If base_topic is empty, fall back to standard Sparkplug B format.
  */
+/* Built topics are the configured base (up to 127 chars) plus "/" and a
+ * message type such as "NBIRTH": size their buffers so that is never cut. */
+#define MQTT_TOPIC_MAX 144
+
 static void get_sparkplug_topic(const char *base_topic, const char *msg_type, char *out_topic, size_t max_len) {
     /* Empty topic → standard Sparkplug B fallback using configured edge/device IDs */
     if (base_topic[0] == '\0') {
@@ -1085,7 +1090,7 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
     RTC_GetTimeString(ts_str, sizeof(ts_str));
 
     int pos = 0;
-    pos += snprintf(json_buf + pos, max_len - pos, "{\"timestamp\":\"%s\"", ts_str);
+    pos = sfmt_append(json_buf, max_len, pos, "{\"timestamp\":\"%s\"", ts_str);
 
     if (cfg->mqtt_mapping_count > 0) {
         for (int m = 0; m < cfg->mqtt_mapping_count; m++) {
@@ -1101,14 +1106,14 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
                     }
                 }
                 if (sensor_valid) {
-                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":%.2f", cfg->mqtt_mappings[m].json_key, val);
+                    pos = sfmt_append(json_buf, max_len, pos, ",\"%s\":%.2f", cfg->mqtt_mappings[m].json_key, val);
                 } else if (!cfg->mqtt_skip_offline) {
-                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":0.00", cfg->mqtt_mappings[m].json_key);
+                    pos = sfmt_append(json_buf, max_len, pos, ",\"%s\":0.00", cfg->mqtt_mappings[m].json_key);
                 }
             } else if (cfg->mqtt_mappings[m].source_type == MAP_SOURCE_ACTUATOR) {
                 uint8_t r_id = cfg->mqtt_mappings[m].source_id;
                 uint8_t st = (r_id < MAX_RELAYS) ? relayStates[r_id] : 0;
-                pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":%u", cfg->mqtt_mappings[m].json_key, st);
+                pos = sfmt_append(json_buf, max_len, pos, ",\"%s\":%u", cfg->mqtt_mappings[m].json_key, st);
             }
         }
     } else {
@@ -1130,13 +1135,13 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
                 }
 
                 if (b_idx >= 0 && batch->records[b_idx].valid) {
-                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_%u\":%.2f", tname, sid, batch->records[b_idx].avg_value);
+                    pos = sfmt_append(json_buf, max_len, pos, ",\"%s_%u\":%.2f", tname, sid, batch->records[b_idx].avg_value);
                     if (batch->records[b_idx].avg_temp > -50.0f && batch->records[b_idx].avg_temp < 150.0f) {
-                        pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_%u_temp\":%.2f", tname, sid, batch->records[b_idx].avg_temp);
+                        pos = sfmt_append(json_buf, max_len, pos, ",\"%s_%u_temp\":%.2f", tname, sid, batch->records[b_idx].avg_temp);
                     }
                     sens_emitted = 1;
                 } else if (!cfg->mqtt_skip_offline) {
-                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_%u\":0.00", tname, sid);
+                    pos = sfmt_append(json_buf, max_len, pos, ",\"%s_%u\":0.00", tname, sid);
                     sens_emitted = 1;
                 }
             }
@@ -1145,20 +1150,20 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
             for (int s = 0; s < batch->count; s++) {
                 if (cfg->mqtt_skip_offline && !batch->records[s].valid) continue;
                 const char *tname = SensorTypeName(batch->records[s].type);
-                pos += snprintf(json_buf + pos, max_len - pos, ",\"%s\":%.2f", tname, batch->records[s].avg_value);
+                pos = sfmt_append(json_buf, max_len, pos, ",\"%s\":%.2f", tname, batch->records[s].avg_value);
                 if (batch->records[s].avg_temp > -50.0f && batch->records[s].avg_temp < 150.0f) {
-                    pos += snprintf(json_buf + pos, max_len - pos, ",\"%s_temp\":%.2f", tname, batch->records[s].avg_temp);
+                    pos = sfmt_append(json_buf, max_len, pos, ",\"%s_temp\":%.2f", tname, batch->records[s].avg_temp);
                 }
             }
         }
         
         uint8_t relay_count = (cfg->actuator_count > 0) ? cfg->actuator_count : 2;
         for (int r = 0; r < relay_count && r < MAX_RELAYS; r++) {
-            pos += snprintf(json_buf + pos, max_len - pos, ",\"relay_%d\":%u", r + 1, relayStates[r]);
+            pos = sfmt_append(json_buf, max_len, pos, ",\"relay_%d\":%u", r + 1, relayStates[r]);
         }
     }
 
-    pos += snprintf(json_buf + pos, max_len - pos, "}");
+    pos = sfmt_append(json_buf, max_len, pos, "}");
 }
 
 static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, const TelemetryBatch_t *batch, const Gateway_Config_t *cfg) {
@@ -1177,8 +1182,7 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
     RTC_GetTimeString(ts_str, sizeof(ts_str));
 
     int pos = 0;
-    pos += snprintf(json_buf + pos, max_len - pos,
-                    "{\"deviceId\":\"%s\","
+    pos = sfmt_append(json_buf, max_len, pos, "{\"deviceId\":\"%s\","
                     "\"timestamp\":\"%s\","
                     "\"status\":\"Online\","
                     "\"test_mode\":%u,"
@@ -1202,15 +1206,13 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         }
 
         if (b_idx >= 0 && batch->records[b_idx].valid) {
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
                             sens_emitted ? "," : "",
                             sname, sid,
                             batch->records[b_idx].avg_value, batch->records[b_idx].avg_temp);
             sens_emitted = 1;
         } else if (!cfg->mqtt_skip_offline) {
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s_%u\":{\"value\":0.00,\"temp\":0.00,\"status\":\"offline\"}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":0.00,\"temp\":0.00,\"status\":\"offline\"}",
                             sens_emitted ? "," : "",
                             sname, sid);
             sens_emitted = 1;
@@ -1221,8 +1223,7 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         for (int s = 0; s < batch->count; s++) {
             if (cfg->mqtt_skip_offline && !batch->records[s].valid) continue;
             const char *sname = SensorTypeName(batch->records[s].type);
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"%s\"}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"%s\"}",
                             sens_emitted ? "," : "",
                             sname, batch->records[s].id,
                             batch->records[s].avg_value, batch->records[s].avg_temp,
@@ -1231,7 +1232,7 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         }
     }
 
-    pos += snprintf(json_buf + pos, max_len - pos, "},\"actuators\":{");
+    pos = sfmt_append(json_buf, max_len, pos, "},\"actuators\":{");
 
     uint8_t act_emitted = 0;
     uint8_t act_cnt = (cfg->actuator_count > 0) ? cfg->actuator_count : 2;
@@ -1250,9 +1251,8 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         if (atype == ACTUATOR_TYPE_PWM) {
             const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
             const char *ppin = pw ? pw->pin_name : (ch == 0 ? "PD12" : "PD13");
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"PWM\",\"channel\":%u,\"pin\":\"%s\",\"duty\":%d,\"freq\":%u}",
-                            act_emitted ? "," : "", aname, ch + 1, ppin,
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"PWM\",\"channel\":%u,\"pin\":\"%s\",\"duty\":%d,\"freq\":%u}",
+                            act_emitted ? "," : "", aname, (unsigned)(ch + 1), ppin,
                             pw ? (int)pw->duty_pct : 0, pw ? (unsigned)pw->freq_hz : 1000);
         } else if (atype == ACTUATOR_TYPE_PTO) {
             const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
@@ -1260,33 +1260,28 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
             int32_t pto_pos = pt ? pt->position : 0;
             const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
             const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"PTO\",\"axis\":%u,\"pin\":\"PUL:%s,DIR:%s\",\"pul_pin\":\"%s\",\"dir_pin\":\"%s\",\"frequency\":%lu,\"location\":%ld,\"steps\":%ld,\"moving\":%u}",
-                            act_emitted ? "," : "", aname, ch + 1, pul, dir, pul, dir,
-                            (unsigned long)freq, (long)pto_pos, (long)pto_pos, pt ? pt->moving : 0);
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"PTO\",\"axis\":%u,\"pin\":\"PUL:%s,DIR:%s\",\"pul_pin\":\"%s\",\"dir_pin\":\"%s\",\"frequency\":%lu,\"location\":%ld,\"steps\":%ld,\"moving\":%u}",
+                            act_emitted ? "," : "", aname, (unsigned)(ch + 1), pul, dir, pul, dir,
+                            (unsigned long)freq, (long)pto_pos, (long)pto_pos, (unsigned)(pt ? pt->moving : 0));
         } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
             float ma = DAC_420MA_GetCurrent(ch < MAX_420MA_CHANNELS ? ch : 0);
             const char *apin = (ch == 0 ? "PA4" : ch == 1 ? "PA5" : "PA4");
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"4-20mA\",\"channel\":%u,\"pin\":\"%s\",\"current_ma\":%.2f}",
-                            act_emitted ? "," : "", aname, ch + 1, apin, ma);
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"4-20mA\",\"channel\":%u,\"pin\":\"%s\",\"current_ma\":%.2f}",
+                            act_emitted ? "," : "", aname, (unsigned)(ch + 1), apin, ma);
         } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
             float v = Analog_010V_GetVoltage(ch < MAX_010V_CHANNELS ? ch : 0);
             const char *vpin = (ch == 0 ? "PD14" : ch == 1 ? "PD15" : "PD14");
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"0-10V\",\"channel\":%u,\"pin\":\"%s\",\"voltage_v\":%.2f}",
-                            act_emitted ? "," : "", aname, ch + 1, vpin, v);
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"0-10V\",\"channel\":%u,\"pin\":\"%s\",\"voltage_v\":%.2f}",
+                            act_emitted ? "," : "", aname, (unsigned)(ch + 1), vpin, v);
         } else if (atype == ACTUATOR_TYPE_MODBUS_TCP) {
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"Modbus\",\"ip\":\"%s\",\"slave_id\":%u,\"reg_addr\":%u,\"state\":%u}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"Modbus\",\"ip\":\"%s\",\"slave_id\":%u,\"reg_addr\":%u,\"state\":%u}",
                             act_emitted ? "," : "", aname,
                             cfg->actuators[i].port_or_ip,
                             cfg->actuators[i].pin_or_slave,
                             cfg->actuators[i].reg_addr,
                             relayStates[i]);
         } else if (atype == ACTUATOR_TYPE_OPC_UA_CLIENT) {
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"OPC UA\",\"ip\":\"%s\",\"node_id\":\"%s\",\"state\":%u}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"OPC UA\",\"ip\":\"%s\",\"node_id\":\"%s\",\"state\":%u}",
                             act_emitted ? "," : "", aname,
                             cfg->actuators[i].port_or_ip,
                             cfg->actuators[i].opc_node_id,
@@ -1295,8 +1290,7 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
             const char *tname = (atype == ACTUATOR_TYPE_DIGITAL_OUT) ? "DO" : "Relay";
             char rpin[16];
             snprintf(rpin, sizeof(rpin), "%s%u", cfg->actuators[i].port_or_ip, cfg->actuators[i].pin_or_slave);
-            pos += snprintf(json_buf + pos, max_len - pos,
-                            "%s\"%s\":{\"type\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"mode\":\"%s\"}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s\":{\"type\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"mode\":\"%s\"}",
                             act_emitted ? "," : "", aname, tname,
                             relayStates[i],
                             rpin,
@@ -1305,8 +1299,7 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         act_emitted = 1;
     }
 
-    pos += snprintf(json_buf + pos, max_len - pos,
-                    "},\"diagnostics\":{\"uptime_s\":%lu}}",
+    pos = sfmt_append(json_buf, max_len, pos, "},\"diagnostics\":{\"uptime_s\":%lu}}",
                     (unsigned long)g_uptime_seconds);
 }
 
@@ -1636,7 +1629,7 @@ static void Task_MQTTClient(void *arg) {
          * In Sparkplug B, the Node Death (NDEATH) payload is a binary protobuf message
          * configured as the LWT topic: spBv1.0/{group_id}/NDEATH/{node_id}
          * ───────────────────────────────────────────────────────────────── */
-        char lwt_topic[128];
+        char lwt_topic[MQTT_TOPIC_MAX];
         get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "NDEATH", lwt_topic, sizeof(lwt_topic));
         
         static uint8_t lwt_payload[256];
@@ -1702,7 +1695,7 @@ static void Task_MQTTClient(void *arg) {
                  * Immediately after connecting, announce online state and all metric
                  * definitions/initial values as a binary protobuf NBIRTH payload.
                  * ───────────────────────────────────────────────────────────── */
-                char nbirth_topic[128];
+                char nbirth_topic[MQTT_TOPIC_MAX];
                 get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "NBIRTH", nbirth_topic, sizeof(nbirth_topic));
                 
                 static uint8_t nbirth_buf[2560];
@@ -2052,7 +2045,7 @@ static void Task_MQTTClient(void *arg) {
                                         msg.qos = QOS1;
                                         msg.retained = 0;   /* historical data must not replace the retained live value */
                                         msg.dup = 0;
-                                        char q_topic[128];
+                                        char q_topic[MQTT_TOPIC_MAX];
                                         if (q_is_spb) {
                                             static uint8_t q_buf[2560];
                                             cov_seq = (cov_seq + 1) & 0xFF;
@@ -2150,7 +2143,7 @@ static void Task_MQTTClient(void *arg) {
                             size_t ddata_len = sparkplug_encode_ddata(ddata_buf, sizeof(ddata_buf), ts_ms, cov_seq,
                                                                       &batch, &s_tasks_cfg, relayStates);
                                                                       
-                            char ddata_topic[128];
+                            char ddata_topic[MQTT_TOPIC_MAX];
                             get_sparkplug_topic(s_tasks_cfg.sparkplug_topic, "DDATA", ddata_topic, sizeof(ddata_topic));
 
                             MQTTMessage message;
@@ -2182,15 +2175,13 @@ static void Task_MQTTClient(void *arg) {
                                     }
 
                                     if (b_idx >= 0 && batch.records[b_idx].valid) {
-                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                            "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
                                                             sens_logged ? "," : "",
                                                             sname, sid,
                                                             batch.records[b_idx].avg_value, batch.records[b_idx].avg_temp);
                                         sens_logged = 1;
                                     } else if (!s_tasks_cfg.mqtt_skip_offline) {
-                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                            "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
                                                             sens_logged ? "," : "",
                                                             sname, sid);
                                         sens_logged = 1;
@@ -2201,14 +2192,12 @@ static void Task_MQTTClient(void *arg) {
                                     if (s_tasks_cfg.mqtt_skip_offline && !batch.records[si].valid) continue;
                                     const char *sname = SensorTypeName(batch.records[si].type);
                                     if (batch.records[si].valid) {
-                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                            "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
                                                             sens_logged ? "," : "",
                                                             sname, batch.records[si].id,
                                                             batch.records[si].avg_value, batch.records[si].avg_temp);
                                     } else {
-                                        log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                            "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
                                                             sens_logged ? "," : "",
                                                             sname, batch.records[si].id);
                                     }
@@ -2216,7 +2205,7 @@ static void Task_MQTTClient(void *arg) {
                                 }
                             }
 
-                            log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos, "},\"actuators\":{");
+                            log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "},\"actuators\":{");
 
                             uint8_t act_logged = 0;
                             for (int i = 0; i < act_cnt && log_pos < (int)sizeof(pub_payload_str) - 60; i++) {
@@ -2233,42 +2222,36 @@ static void Task_MQTTClient(void *arg) {
                                     const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
                                     uint32_t pw_freq = s_tasks_cfg.actuators[i].reg_addr ? s_tasks_cfg.actuators[i].reg_addr : 1000;
                                     const char *ppin = pw ? pw->pin_name : (ch == 0 ? "PD12" : "PD13");
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"PWM\",\"channel\":%u,\"pin\":\"%s\",\"duty\":%d,\"freq\":%lu}",
-                                                        act_logged ? "," : "", aname, ch + 1, ppin, pw ? (int)pw->duty_pct : 0, (unsigned long)pw_freq);
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"PWM\",\"channel\":%u,\"pin\":\"%s\",\"duty\":%d,\"freq\":%lu}",
+                                                        act_logged ? "," : "", aname, (unsigned)(ch + 1), ppin, pw ? (int)pw->duty_pct : 0, (unsigned long)pw_freq);
                                 } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
                                     float ma = DAC_420MA_GetCurrent(ch < MAX_420MA_CHANNELS ? ch : 0);
                                     const char *apin = (ch == 0 ? "PA4" : ch == 1 ? "PA5" : "PA4");
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"4-20mA\",\"channel\":%u,\"pin\":\"%s\",\"current_ma\":%.2f}",
-                                                        act_logged ? "," : "", aname, ch + 1, apin, ma);
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"4-20mA\",\"channel\":%u,\"pin\":\"%s\",\"current_ma\":%.2f}",
+                                                        act_logged ? "," : "", aname, (unsigned)(ch + 1), apin, ma);
                                 } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
                                     float v = Analog_010V_GetVoltage(ch < MAX_010V_CHANNELS ? ch : 0);
                                     const char *vpin = (ch == 0 ? "PD14" : ch == 1 ? "PD15" : "PD14");
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"0-10V\",\"channel\":%u,\"pin\":\"%s\",\"voltage_v\":%.2f}",
-                                                        act_logged ? "," : "", aname, ch + 1, vpin, v);
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"0-10V\",\"channel\":%u,\"pin\":\"%s\",\"voltage_v\":%.2f}",
+                                                        act_logged ? "," : "", aname, (unsigned)(ch + 1), vpin, v);
                                 } else if (atype == ACTUATOR_TYPE_PTO) {
                                     const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
                                     uint32_t freq = (pt && pt->speed_pps > 0) ? pt->speed_pps : (s_tasks_cfg.actuators[i].reg_addr ? s_tasks_cfg.actuators[i].reg_addr : 5000);
                                     int32_t pto_pos = pt ? pt->position : 0;
                                     const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
                                     const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"PTO\",\"axis\":%u,\"pin\":\"PUL:%s,DIR:%s\",\"pul_pin\":\"%s\",\"dir_pin\":\"%s\",\"frequency\":%lu,\"location\":%ld,\"steps\":%ld,\"moving\":%u}",
-                                                        act_logged ? "," : "", aname, ch + 1, pul, dir, pul, dir,
-                                                        (unsigned long)freq, (long)pto_pos, (long)pto_pos, pt ? pt->moving : 0);
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"PTO\",\"axis\":%u,\"pin\":\"PUL:%s,DIR:%s\",\"pul_pin\":\"%s\",\"dir_pin\":\"%s\",\"frequency\":%lu,\"location\":%ld,\"steps\":%ld,\"moving\":%u}",
+                                                        act_logged ? "," : "", aname, (unsigned)(ch + 1), pul, dir, pul, dir,
+                                                        (unsigned long)freq, (long)pto_pos, (long)pto_pos, (unsigned)(pt ? pt->moving : 0));
                                 } else if (atype == ACTUATOR_TYPE_MODBUS_TCP) {
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"Modbus\",\"ip\":\"%s\",\"slave\":%u,\"reg\":%u,\"state\":%u}",
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"Modbus\",\"ip\":\"%s\",\"slave\":%u,\"reg\":%u,\"state\":%u}",
                                                         act_logged ? "," : "", aname,
                                                         s_tasks_cfg.actuators[i].port_or_ip,
                                                         s_tasks_cfg.actuators[i].pin_or_slave,
                                                         s_tasks_cfg.actuators[i].reg_addr,
                                                         relayStates[i]);
                                 } else if (atype == ACTUATOR_TYPE_OPC_UA_CLIENT) {
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"OPC UA\",\"ip\":\"%s\",\"node\":\"%s\",\"state\":%u}",
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"OPC UA\",\"ip\":\"%s\",\"node\":\"%s\",\"state\":%u}",
                                                         act_logged ? "," : "", aname,
                                                         s_tasks_cfg.actuators[i].port_or_ip,
                                                         s_tasks_cfg.actuators[i].opc_node_id,
@@ -2276,8 +2259,7 @@ static void Task_MQTTClient(void *arg) {
                                 } else {
                                     char rpin[16];
                                     snprintf(rpin, sizeof(rpin), "%s%u", s_tasks_cfg.actuators[i].port_or_ip, s_tasks_cfg.actuators[i].pin_or_slave);
-                                    log_pos += snprintf(pub_payload_str + log_pos, sizeof(pub_payload_str) - log_pos,
-                                                        "%s\"%s\":{\"type\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"mode\":\"%s\"}",
+                                    log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s\":{\"type\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"mode\":\"%s\"}",
                                                         act_logged ? "," : "", aname,
                                                         (atype == ACTUATOR_TYPE_DIGITAL_OUT) ? "DO" : "Relay",
                                                         relayStates[i],

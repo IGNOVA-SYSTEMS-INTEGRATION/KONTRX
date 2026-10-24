@@ -3,6 +3,7 @@
 #include "rtc_stm32.h"
 #include <stdio.h>
 #include <string.h>
+#include "safe_fmt.h"
 
 /* Initialisation guard — cleared until Partition_Init() completes */
 static volatile uint8_t g_partition_ready = 0;
@@ -595,7 +596,7 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
     if (limit > 50) limit = 50;
 
     int pos = 0;
-    pos += snprintf(buf + pos, max_len - pos, "{\"logs\":[");
+    pos = sfmt_append(buf, max_len, pos, "{\"logs\":[");
 
     /* Pass 1: Count total valid log entries across active sectors.
      * Sectors are visited oldest -> newest: start right after the sector
@@ -696,11 +697,10 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
         const char *cat_str = (hdr.category_id <= 6) ? cats[hdr.category_id] : "SYS";
 
         if (printed > 0) {
-            pos += snprintf(buf + pos, max_len - pos, ",");
+            pos = sfmt_append(buf, max_len, pos, ",");
         }
 
-        pos += snprintf(buf + pos, max_len - pos,
-                        "{\"time\":\"%04u-%02u-%02u %02lu:%02lu:%02lu\",\"uptime\":\"%02lu:%02lu:%02lu\",\"up_s\":%lu,\"cat\":\"%s\",\"msg\":\"%s\"}",
+        pos = sfmt_append(buf, max_len, pos, "{\"time\":\"%04u-%02u-%02u %02lu:%02lu:%02lu\",\"uptime\":\"%02lu:%02lu:%02lu\",\"up_s\":%lu,\"cat\":\"%s\",\"msg\":\"%s\"}",
                         (unsigned int)yr, (unsigned int)mo, (unsigned int)dy,
                         (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
                         (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
@@ -711,8 +711,7 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
         if (pos >= max_len - 128) break;
     }
 
-    pos += snprintf(buf + pos, max_len - pos,
-                    "],\"offset\":%lu,\"limit\":%lu,\"count\":%lu,\"total_count\":%lu}",
+    pos = sfmt_append(buf, max_len, pos, "],\"offset\":%lu,\"limit\":%lu,\"count\":%lu,\"total_count\":%lu}",
                     (unsigned long)offset, (unsigned long)limit,
                     (unsigned long)printed, (unsigned long)total_found);
     return pos;
@@ -750,8 +749,7 @@ uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const u
     uint8_t mo = 9, dy = 14, hr = 0, mn = 0, sc = 0;
     RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
 
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "# ==============================================================================\r\n"
+    pos = sfmt_append(buf, sizeof(buf), pos, "# ==============================================================================\r\n"
         "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
         "# System Event Audit Log Export\r\n"
         "# Date: %04u-%02u-%02u %02u:%02u:%02u\r\n"
@@ -919,8 +917,7 @@ uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const
     int pos = 0;
     uint32_t count = Partition_Queue_Count();
 
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "# ==============================================================================\r\n"
+    pos = sfmt_append(buf, sizeof(buf), pos, "# ==============================================================================\r\n"
         "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
         "# Offline Telemetry Queue Export\r\n"
         "# Status: %s | Total Buffered Records: %lu\r\n"
@@ -930,8 +927,7 @@ uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const
         (unsigned long)count);
 
     if (count == 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "# Offline telemetry queue is currently empty. All data published to broker.\r\n");
+        pos = sfmt_append(buf, sizeof(buf), pos, "# Offline telemetry queue is currently empty. All data published to broker.\r\n");
         send_fn(sn, (const uint8_t *)buf, (uint32_t)pos);
         return 0;
     }
@@ -1108,15 +1104,14 @@ int Partition_FormatRulesHistoryJSON(char *buf, int max_len, const char *active_
             W25Q_Read(slot_addr + 76, (uint8_t *)&r_cnt, 4);
 
             uint8_t is_act = (active_version && strcmp(ver, active_version) == 0) ? 1 : 0;
-            pos += snprintf(buf + pos, max_len - pos,
-                "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%lu,\"is_active\":%s}",
+            pos = sfmt_append(buf, max_len, pos, "%s{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_count\":%lu,\"is_active\":%s}",
                 emitted ? "," : "",
                 ver, ts, (unsigned long)r_cnt, is_act ? "true" : "false");
             emitted = 1;
         }
     }
 
-    pos += snprintf(buf + pos, max_len - pos, "]");
+    pos = sfmt_append(buf, max_len, pos, "]");
     return pos;
 }
 

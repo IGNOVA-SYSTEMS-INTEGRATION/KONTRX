@@ -7,6 +7,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "rtc_stm32.h"
+#include "safe_fmt.h"
 
 static SDCard_Status_t s_sd_status = {
     .mounted = 1,
@@ -173,7 +174,7 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     SD_Lock();
     int pos = 0;
     const char *curr_path = (path && path[0] != '\0') ? path : "/";
-    pos += snprintf(out_json + pos, max_len - pos, "{\"path\":\"%s\",\"files\":[", curr_path);
+    pos = sfmt_append(out_json, max_len, pos, "{\"path\":\"%s\",\"files\":[", curr_path);
 
     /* Dynamic live timestamp for SD files */
     uint16_t yr = 2026;
@@ -187,8 +188,7 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     uint32_t total_used_bytes = log_sz + q_sz;
 
     if (strcmp(curr_path, "/") == 0 || strcmp(curr_path, "%2F") == 0 || strcmp(curr_path, "%2f") == 0) {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"telemetry_queue.dat\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"LOGS\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
             "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
@@ -208,37 +208,31 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
                 char ts[36] = {0};
                 W25Q_Read(slot_addr + 4,  (uint8_t *)ver, sizeof(ver));
                 W25Q_Read(slot_addr + 40, (uint8_t *)ts,  sizeof(ts));
-                pos += snprintf(out_json + pos, max_len - pos,
-                    "%s{\"name\":\"rules_%s.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}",
+                pos = sfmt_append(out_json, max_len, pos, "%s{\"name\":\"rules_%s.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}",
                     arch_emitted ? "," : "", ver, ts[0] ? ts : cur_dt);
                 arch_emitted = 1;
             }
         }
         if (!arch_emitted) {
-            pos += snprintf(out_json + pos, max_len - pos,
-                "{\"name\":\"rules_active.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}", cur_dt);
+            pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"rules_active.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}", cur_dt);
         }
     } else if (strstr(curr_path, "LOGS") != NULL || strstr(curr_path, "logs") != NULL) {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"boot_history.log\",\"is_dir\":false,\"size\":1024,\"date\":\"%s\"}",
             (unsigned long)log_sz, cur_dt,
             cur_dt
         );
     } else if (strstr(curr_path, "QUEUE") != NULL || strstr(curr_path, "queue") != NULL) {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
             (unsigned long)q_sz, cur_dt
         );
     } else {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
             (unsigned long)log_sz, cur_dt
         );
     }
 
-    pos += snprintf(out_json + pos, max_len - pos,
-        "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
+    pos = sfmt_append(out_json, max_len, pos, "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
         s_sd_status.mounted, s_sd_status.card_type,
         (unsigned long)s_sd_status.total_capacity_mb,
         (unsigned long)s_sd_status.free_capacity_mb,
