@@ -2,6 +2,11 @@
 #include "stm32f407_regs.h"
 #include "rcc_stm32.h"
 
+/* Debug console speed; the RTOS image builds with 115200 (CMakeLists.txt). */
+#ifndef DEBUG_UART_BAUD
+#define DEBUG_UART_BAUD 9600U
+#endif
+
 static uint32_t UART_ComputeBRR(uint32_t pclk, uint32_t baud) {
     uint32_t div_x16 = (2U * pclk + baud) / (2U * baud);
     uint32_t mantissa = div_x16 / 16U;
@@ -78,8 +83,8 @@ void UART_Debug_Init(void) {
     // 5. Configure USART6
     USART6->CR1 &= ~(1U << 13);   // Disable while configuring
 
-    // BRR for 9600 baud using exact APB2 clock (84 MHz @ 168 MHz SYSCLK -> BRR = 0x222E)
-    USART6->BRR = UART_ComputeBRR(RCC_GetPCLK2Freq(), 9600);
+    // BRR from the exact APB2 clock (84 MHz @ 168 MHz SYSCLK)
+    USART6->BRR = UART_ComputeBRR(RCC_GetPCLK2Freq(), DEBUG_UART_BAUD);
 
     USART6->CR1 &= ~(1U << 12);   // 8 data bits
     USART6->CR1 &= ~(1U << 10);   // No parity

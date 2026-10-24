@@ -81,6 +81,7 @@ set(RTOS_APP_SOURCES
     MCAL/STM32F4/uart_debug_tx.c
     APP/freertos_tasks.c
     APP/fault_supervisor.c
+    APP/timekeeper.c
     APP/sparkplug_b_enc.c
     APP/http_server_task.c
     APP/ota_task.c
@@ -163,6 +164,9 @@ target_compile_options(KontrxRTOS PRIVATE -flto)
 # Test images only: adds POST /api/debug/fault (login required) to prove the
 # fault supervisor recovers tasks on the real board. Never ship with it ON.
 option(KONTRX_FAULT_TEST "Build the fault-injection endpoint (test images only)" OFF)
+
+# Debug console (USART6). The bootloader and test images keep 9600.
+target_compile_definitions(KontrxRTOS PRIVATE DEBUG_UART_BAUD=115200)
 if(KONTRX_FAULT_TEST)
     target_compile_definitions(KontrxRTOS PRIVATE KONTRX_FAULT_TEST=1)
 endif()
