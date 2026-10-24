@@ -85,7 +85,17 @@ static void SPI_CritExit(void) {
  * ====================================================================== */
 int _write(int file, char *ptr, int len) {
     (void)file;
-    for (int i = 0; i < len; i++) UART_Debug_SendByte((uint8_t)ptr[i]);
+    if (len <= 0) return 0;
+    uint32_t ipsr;
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+    /* Tasks queue the text for the TXE interrupt and never wait on the UART.
+     * Before the scheduler runs, or from an exception handler (fault hooks),
+     * send by polling so the message is not lost. */
+    if (ipsr == 0U && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+        UART_Debug_WriteAsync((const uint8_t *)ptr, (uint32_t)len);
+    } else {
+        UART_Debug_WriteBlocking((const uint8_t *)ptr, (uint32_t)len);
+    }
     return len;
 }
 
@@ -112,6 +122,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
 
 void vApplicationMallocFailedHook(void) {
     printf("\r\n!!! FreeRTOS MALLOC FAILED -> Auto-resetting !!!\r\n");
+    UART_Debug_WriteBlocking(NULL, 0);  /* drain queued text before the reset */
     SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;
     while (1);
 }

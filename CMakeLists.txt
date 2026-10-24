@@ -78,6 +78,7 @@ set(UNIVERSAL_CTRL_SOURCES
 # -------------------------------------------------------------------
 set(RTOS_APP_SOURCES
     APP/cmsis_os2.c
+    MCAL/STM32F4/uart_debug_tx.c
     APP/freertos_tasks.c
     APP/sparkplug_b_enc.c
     APP/http_server_task.c

@@ -140,21 +140,158 @@ volatile uint8_t  g_sys_log_full = 0;
 
 static void Do_Offline_Telemetry_Queueing(void);
 
+/* ======================================================================
+ *  Deferred flash writes (Task_LogWriter)
+ *
+ *  Log_Event() used to write straight to the SPI flash: it waited on
+ *  sdMutex (held for seconds while the web UI pages through the log) and on
+ *  4 KB sector erases, inside the Control Engine and the MQTT publish path.
+ *  Callers now copy the entry into a small RAM queue and return; the
+ *  low-priority LogWriter task does the flash work. Relay offline records
+ *  and the "rules verified stable" save are deferred the same way.
+ *  A full queue drops the new entry and counts it (g_log_dropped).
+ * ====================================================================== */
+#define LOG_Q_DEPTH      16U   /* power of two */
+#define LOG_Q_MSG_MAX    60U   /* Partition_Log_Append() stores at most 60 chars */
+#define OFFLINE_Q_DEPTH  8U    /* power of two */
+
+typedef struct {
+    uint32_t ts;
+    uint8_t  cat_id;
+    char     msg[LOG_Q_MSG_MAX + 1U];
+} LogQueueEntry_t;
+
+/* Queue storage lives in CCM RAM (CPU-only, no DMA); main RAM is nearly full. */
+static LogQueueEntry_t  s_log_q[LOG_Q_DEPTH] __attribute__((section(".ccmram")));
+static volatile uint32_t s_log_q_head;
+static volatile uint32_t s_log_q_tail;
+volatile uint32_t        g_log_dropped = 0;
+
+static OfflineRecord_t   s_offline_q[OFFLINE_Q_DEPTH] __attribute__((section(".ccmram")));
+static volatile uint32_t s_offline_q_head;
+static volatile uint32_t s_offline_q_tail;
+static volatile uint8_t  s_rules_save_pending;
+
+static TaskHandle_t s_log_writer_task;
+static TaskHandle_t s_io_worker_task;
+
+static void LogWriter_Wake(void) {
+    if (s_log_writer_task) xTaskNotifyGive(s_log_writer_task);
+}
+
+static uint8_t Log_Category_Id(const char *category) {
+    if (strcmp(category, "MQTT") == 0) return 1;
+    if (strcmp(category, "MODBUS") == 0) return 2;
+    if (strcmp(category, "RELAY") == 0) return 3;
+    if (strcmp(category, "OTA") == 0) return 4;
+    if (strcmp(category, "SD") == 0) return 5;
+    if (strcmp(category, "AUTH") == 0) return 6;
+    return 0; // SYS
+}
+
 void Log_Event(const char *category, const char *message) {
     if (!category || !message) return;
 
-    uint8_t cat_id = 0;
-    if (strcmp(category, "MQTT") == 0) cat_id = 1;
-    else if (strcmp(category, "MODBUS") == 0) cat_id = 2;
-    else if (strcmp(category, "RELAY") == 0) cat_id = 3;
-    else if (strcmp(category, "OTA") == 0) cat_id = 4;
-    else if (strcmp(category, "SD") == 0) cat_id = 5;
-    else if (strcmp(category, "AUTH") == 0) cat_id = 6;
-    else cat_id = 0; // SYS
-
+    uint8_t cat_id = Log_Category_Id(category);
     uint32_t ts = RTC_GetUptimeSeconds();
     if (ts == 0) ts = g_uptime_seconds;
-    SDCard_Log_Append(ts, cat_id, message);
+
+    if (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING || s_log_writer_task == NULL) {
+        SDCard_Log_Append(ts, cat_id, message);
+        return;
+    }
+
+    uint8_t queued = 0;
+    taskENTER_CRITICAL();
+    if ((s_log_q_head - s_log_q_tail) < LOG_Q_DEPTH) {
+        LogQueueEntry_t *e = &s_log_q[s_log_q_head & (LOG_Q_DEPTH - 1U)];
+        e->ts = ts;
+        e->cat_id = cat_id;
+        strncpy(e->msg, message, LOG_Q_MSG_MAX);
+        e->msg[LOG_Q_MSG_MAX] = '\0';
+        s_log_q_head++;
+        queued = 1;
+    } else {
+        g_log_dropped++;
+    }
+    taskEXIT_CRITICAL();
+
+    if (queued) LogWriter_Wake();
+}
+
+/* Pops one entry; returns 0 when the queue is empty. */
+static uint8_t Log_Queue_Pop(LogQueueEntry_t *out) {
+    uint8_t got = 0;
+    taskENTER_CRITICAL();
+    if (s_log_q_tail != s_log_q_head) {
+        *out = s_log_q[s_log_q_tail & (LOG_Q_DEPTH - 1U)];
+        s_log_q_tail++;
+        got = 1;
+    }
+    taskEXIT_CRITICAL();
+    return got;
+}
+
+void Log_Flush(void) {
+    LogQueueEntry_t e;
+    while (Log_Queue_Pop(&e)) {
+        SDCard_Log_Append(e.ts, e.cat_id, e.msg);
+    }
+}
+
+/* Queues an offline-telemetry record for the flash queue without waiting on
+ * sdMutex. A full queue drops the record and counts it as a dropped log. */
+static void Offline_Record_Defer(const OfflineRecord_t *rec) {
+    uint8_t queued = 0;
+    taskENTER_CRITICAL();
+    if ((s_offline_q_head - s_offline_q_tail) < OFFLINE_Q_DEPTH) {
+        s_offline_q[s_offline_q_head & (OFFLINE_Q_DEPTH - 1U)] = *rec;
+        s_offline_q_head++;
+        queued = 1;
+    } else {
+        g_log_dropped++;
+    }
+    taskEXIT_CRITICAL();
+
+    if (queued) LogWriter_Wake();
+}
+
+static uint8_t Offline_Queue_Pop(OfflineRecord_t *out) {
+    uint8_t got = 0;
+    taskENTER_CRITICAL();
+    if (s_offline_q_tail != s_offline_q_head) {
+        *out = s_offline_q[s_offline_q_tail & (OFFLINE_Q_DEPTH - 1U)];
+        s_offline_q_tail++;
+        got = 1;
+    }
+    taskEXIT_CRITICAL();
+    return got;
+}
+
+/* Priority BelowNormal: flash erases (up to ~400 ms on the W25Q16) delay only
+ * this task. W25Q_WaitBusy() sleeps, so the CPU is free meanwhile. */
+static void Task_LogWriter(void *arg) {
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+
+        Log_Flush();
+
+        OfflineRecord_t rec;
+        while (Offline_Queue_Pop(&rec)) {
+            SDCard_Queue_Push(&rec);
+        }
+
+        if (s_rules_save_pending) {
+            s_rules_save_pending = 0;
+            /* Same lock the HTTP rule handlers hold while they save, so
+             * Partition_SaveRules()' static scratch copy is never shared. */
+            if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                Partition_SaveRules(&activeRules);
+                osMutexRelease(rulesMutex);
+            }
+        }
+    }
 }
 
 /* ======================================================================
@@ -309,78 +446,158 @@ void Relay_Init(void) {
     }
 }
 
+/* Remote actuator writes (Modbus TCP coil, OPC UA) open a TCP connection and
+ * can take up to ~2 s, so Relay_SetState() only records the request here and
+ * Task_IOWorker performs it. One pending bit per actuator: a newer request
+ * for the same actuator replaces an older one that has not run yet. */
+static volatile uint32_t s_remote_pending_mask;
+static volatile uint8_t  s_remote_target[MAX_RELAYS];
+
+/* Copies one actuator's config. Waits at most 2 ms for configMutex (holders
+ * only memcpy the struct); on timeout it reads unlocked, as before. */
+static uint8_t Actuator_Config_Snapshot(uint8_t idx, Actuator_Config_t *out, char *broker0) {
+    uint8_t ok = 0;
+    uint8_t locked = (configMutex && osMutexAcquire(configMutex, 2) == osOK);
+    if (idx < sharedConfig.actuator_count) {
+        *out = sharedConfig.actuators[idx];
+        if (broker0) *broker0 = sharedConfig.mqtt_broker[0];
+        ok = 1;
+    }
+    if (locked) osMutexRelease(configMutex);
+    return ok;
+}
+
+/* Callable from any task (Control Engine, MQTT, HTTP, Modbus TCP server).
+ * Local outputs switch immediately; nothing here waits on network, flash
+ * or the debug UART. */
 void Relay_SetState(uint8_t idx, uint8_t state) {
     if (idx >= MAX_RELAYS) return;
-    
-    // Safety guard: return immediately if state is already in target state.
-    // This prevents endless blocking SPI flash writes inside the Control Engine loop.
+    state = state ? 1U : 0U;
+
+    // Fast path: already in the target state (called every Control Engine cycle).
     if (relayStates[idx] == state) {
         return;
     }
 
-    Get_Shared_Config(&s_tasks_cfg);
+    Actuator_Config_t act;
+    char broker0 = '\0';
+    if (!Actuator_Config_Snapshot(idx, &act, &broker0)) return;
 
-    if (idx >= s_tasks_cfg.actuator_count) return;
-
-    if (s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_LOCAL_GPIO ||
-        s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_DIGITAL_OUT) {
-        int port = Get_Port_Id(s_tasks_cfg.actuators[idx].port_or_ip);
-        uint8_t pin = s_tasks_cfg.actuators[idx].pin_or_slave;
-        uint8_t is_nc = s_tasks_cfg.actuators[idx].is_active_low;
-
+    uint8_t is_gpio = (act.type == ACTUATOR_TYPE_LOCAL_GPIO || act.type == ACTUATOR_TYPE_DIGITAL_OUT);
+    int port = -1;
+    uint8_t pin = act.pin_or_slave;
+    if (is_gpio) {
+        port = Get_Port_Id(act.port_or_ip);
         if (port < 0 || port > 4) return;
         if (Relay_Pin_Is_Reserved(port, pin)) return;
+    }
 
+    /* Claim the transition atomically so two tasks switching the same
+     * actuator cannot both act on it. */
+    uint8_t changed = 0;
+    taskENTER_CRITICAL();
+    if (relayStates[idx] != state) {
+        relayStates[idx] = state;
+        changed = 1;
+    }
+    taskEXIT_CRITICAL();
+    if (!changed) return;
+
+    if (is_gpio) {
         GPIO_TypeDef *gpio = GPIO_Ports[port];
-        uint8_t drive = (is_nc ? !state : state);
-
+        uint8_t drive = (act.is_active_low ? !state : state);
         if (drive) {
             gpio->BSRR = (1U << pin);            /* Set pin HIGH */
         } else {
             gpio->BSRR = (1U << (pin + 16));     /* Set pin LOW */
         }
-    } else if (s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_MODBUS_TCP) {
-        extern uint8_t Modbus_TCP_WriteCoil(const char *ip, uint16_t port, uint8_t slave_id, uint16_t coil_addr, uint8_t state);
-        Modbus_TCP_WriteCoil(s_tasks_cfg.actuators[idx].port_or_ip,
-                             s_tasks_cfg.actuators[idx].port,
-                             s_tasks_cfg.actuators[idx].pin_or_slave,
-                             s_tasks_cfg.actuators[idx].reg_addr,
-                             state);
-    } else if (s_tasks_cfg.actuators[idx].type == ACTUATOR_TYPE_OPC_UA_CLIENT) {
-        extern uint8_t OPC_UA_Client_WriteNode(const char *endpoint, uint16_t ns, const char *node_id, uint8_t state);
-        OPC_UA_Client_WriteNode(s_tasks_cfg.actuators[idx].port_or_ip,
-                                s_tasks_cfg.actuators[idx].port,
-                                s_tasks_cfg.actuators[idx].opc_node_id,
-                                state);
+    } else if (act.type == ACTUATOR_TYPE_MODBUS_TCP || act.type == ACTUATOR_TYPE_OPC_UA_CLIENT) {
+        taskENTER_CRITICAL();
+        s_remote_target[idx] = state;
+        s_remote_pending_mask |= (1UL << idx);
+        taskEXIT_CRITICAL();
+        if (s_io_worker_task) xTaskNotifyGive(s_io_worker_task);
     }
 
-    uint8_t old_state = relayStates[idx];
-    relayStates[idx] = state;
+    char r_log[64];
+    const char *act_name = act.name[0] ? act.name : "Unnamed";
+    snprintf(r_log, sizeof(r_log), "Actuator %u (%.16s) set to %s.",
+             (unsigned)(idx + 1), act_name, state ? "ON" : "OFF");
+    printf("[RELAY] State Change: Actuator %u (%.16s) set to %s\r\n",
+           (unsigned)(idx + 1), act_name, state ? "ON" : "OFF");
+    Log_Event("RELAY", r_log);
 
-    if (old_state != state) {
-        char r_log[64];
-        const char *act_name = s_tasks_cfg.actuators[idx].name[0] ? s_tasks_cfg.actuators[idx].name : "Unnamed";
-        snprintf(r_log, sizeof(r_log), "Actuator %d (%s) set to %s.",
-                 idx + 1, act_name,
-                 state ? "ON" : "OFF");
-        printf("[RELAY] State Change: Actuator %d (%s) set to %s\r\n", idx + 1, act_name, state ? "ON" : "OFF");
-        Log_Event("RELAY", r_log);
+    /* Cache relay event to offline queue when MQTT broker is disconnected */
+    if (broker0 != '\0' && !g_mqtt_status.connected) {
+        OfflineRecord_t evt_rec;
+        memset(&evt_rec, 0, sizeof(evt_rec));
+        evt_rec.timestamp = g_uptime_seconds;
+        evt_rec.source_type = MAP_SOURCE_ACTUATOR;
+        evt_rec.source_id = idx;
+        evt_rec.valid = 1;
+        evt_rec.value = (float)state;
+        evt_rec.temp = 0.0f;
+        Offline_Record_Defer(&evt_rec);
+    }
 
-        /* Cache relay event to offline queue when MQTT broker is disconnected */
-        if (s_tasks_cfg.mqtt_broker[0] != '\0' && !g_mqtt_status.connected) {
-            OfflineRecord_t evt_rec;
-            evt_rec.timestamp = g_uptime_seconds;
-            evt_rec.source_type = MAP_SOURCE_ACTUATOR;
-            evt_rec.source_id = idx;
-            evt_rec.valid = 1;
-            evt_rec.value = (float)state;
-            evt_rec.temp = 0.0f;
-            SDCard_Queue_Push(&evt_rec);
+    /* Persist only this actuator's state field. Writing back a whole config
+     * copy (as before) could undo a concurrent change made from the web UI. */
+    if (configMutex && osMutexAcquire(configMutex, 2) == osOK) {
+        if (idx < sharedConfig.actuator_count) {
+            sharedConfig.actuators[idx].state = state;
+            g_config_version++;
+        }
+        osMutexRelease(configMutex);
+    }
+}
+
+/* Runs in Task_IOWorker: performs the pending remote actuator writes. */
+static void Remote_Actuator_Service(void) {
+    extern uint8_t Modbus_TCP_WriteCoil(const char *ip, uint16_t port, uint8_t slave_id, uint16_t coil_addr, uint8_t state);
+    extern uint8_t OPC_UA_Client_WriteNode(const char *endpoint, uint16_t ns, const char *node_id, uint8_t state);
+
+    for (;;) {
+        uint8_t idx = MAX_RELAYS;
+        uint8_t state = 0;
+        taskENTER_CRITICAL();
+        uint32_t mask = s_remote_pending_mask;
+        if (mask) {
+            idx = (uint8_t)__builtin_ctz(mask);
+            state = s_remote_target[idx];
+            s_remote_pending_mask = mask & ~(1UL << idx);
+        }
+        taskEXIT_CRITICAL();
+        if (idx >= MAX_RELAYS) return;
+
+        Actuator_Config_t act;
+        if (!Actuator_Config_Snapshot(idx, &act, NULL)) continue;
+
+        if (act.type == ACTUATOR_TYPE_MODBUS_TCP) {
+            Modbus_TCP_WriteCoil(act.port_or_ip, act.port, act.pin_or_slave, act.reg_addr, state);
+        } else if (act.type == ACTUATOR_TYPE_OPC_UA_CLIENT) {
+            OPC_UA_Client_WriteNode(act.port_or_ip, act.port, act.opc_node_id, state);
         }
     }
+}
 
-    s_tasks_cfg.actuators[idx].state = state;
-    Update_Shared_Config(&s_tasks_cfg);
+/* Network I/O that must not run inside the Control Engine: the Modbus TCP
+ * server (port 502) and remote actuator writes. Woken at once by
+ * Relay_SetState(); otherwise polls every IO_WORKER_PERIOD_MS. */
+#define IO_WORKER_PERIOD_MS 10U
+
+static void Task_IOWorker(void *arg) {
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(IO_WORKER_PERIOD_MS));
+        if (g_ota_in_progress) continue;
+
+        Remote_Actuator_Service();
+
+        const Hardware_Interface_Desc_t *if10 = Interface_GetDesc(10);
+        if (!if10 || if10->enabled) {
+            Modbus_TCP_Server_Poll();
+        }
+    }
 }
 
 extern osMutexId_t configMutex;
@@ -715,16 +932,8 @@ static void Task_ControlEngine(void *arg) {
             continue;
         }
 
-        /* Poll Modbus TCP Server periodically (50ms) so it does not hog spiMutex and starve HTTP server */
-        static uint32_t last_mb_tcp_poll = 0;
-        uint32_t now_tick = osKernelGetTickCount();
-        if (now_tick - last_mb_tcp_poll >= 50) {
-            const Hardware_Interface_Desc_t *if10 = Interface_GetDesc(10);
-            if (!if10 || if10->enabled) {
-                Modbus_TCP_Server_Poll();
-            }
-            last_mb_tcp_poll = now_tick;
-        }
+        /* The Modbus TCP server is polled by Task_IOWorker: its W5500 traffic
+         * waits on spiMutex, which must never stall this task. */
 
         /* --- Read latest sensor snapshot (mutex-protected, non-blocking) --- */
         if (osMutexAcquire(sensorMutex, 0) == osOK) {
@@ -750,23 +959,26 @@ static void Task_ControlEngine(void *arg) {
                 if (osMutexAcquire(rulesMutex, 0) == osOK) {
                     rulesTesting = 0;
                     activeRules.rules_valid = 1;
-                    Partition_SaveRules(&activeRules);
                     char stable_log[64];
                     snprintf(stable_log, sizeof(stable_log), "Rules version %s verified stable.", activeRules.version_id);
-                    Log_Event("SYS", stable_log);
                     osMutexRelease(rulesMutex);
+                    /* The flash save (two sector erases) runs in Task_LogWriter. */
+                    s_rules_save_pending = 1;
+                    LogWriter_Wake();
+                    Log_Event("SYS", stable_log);
                 }
             }
         }
 
         /* 2. Execute active rules */
         static RuleConfig_t localRules __attribute__((section(".ccmram")));
-        uint8_t has_rules = 0;
+        /* If rulesMutex is busy (a rules save is in progress), keep running
+         * the previous copy rather than skipping this cycle. */
         if (osMutexAcquire(rulesMutex, 0) == osOK) {
             localRules = activeRules;
-            has_rules = (localRules.rule_count > 0);
             osMutexRelease(rulesMutex);
         }
+        uint8_t has_rules = (localRules.rule_count > 0);
 
         if (has_rules) {
             // Non-blocking snapshot of current config to map names
@@ -2417,13 +2629,14 @@ void RTOS_Tasks_Init(void) {
 
     /* Task 1 — Control Engine */
     attr.name       = "ControlEng";
-    attr.stack_size = 6144; // Increased to 6KB to guarantee stack safety for string resolution and printfs
+    attr.stack_size = 4096; /* Worst case 2064 B + libc printf (GCC -fstack-usage) now that
+                             * Modbus TCP, remote writes and flash work run elsewhere. */
     attr.priority   = osPriorityRealtime;
     g_tid_control   = osThreadNew(Task_ControlEngine, NULL, &attr);
 
     /* Task 2 — Modbus Sensor Poll */
     attr.name       = "ModbusPoll";
-    attr.stack_size = 4096; 
+    attr.stack_size = 3072; /* worst case 496 B + libc printf */
     attr.priority   = osPriorityNormal;
     g_tid_modbus    = osThreadNew(Task_ModbusSensorPoll, NULL, &attr);
 
@@ -2446,6 +2659,18 @@ void RTOS_Tasks_Init(void) {
                               * + deep MQTTConnect/MQTTPublish call frames. */
     attr.priority   = osPriorityAboveNormal;
     g_tid_mqtt      = osThreadNew(Task_MQTTClient, NULL, &attr);
+
+    /* Task 6 — IO Worker: Modbus TCP server + remote actuator writes */
+    attr.name       = "IOWorker";
+    attr.stack_size = 2048;  /* worst case 640 B + libc printf */
+    attr.priority   = osPriorityAboveNormal;
+    s_io_worker_task = (TaskHandle_t)osThreadNew(Task_IOWorker, NULL, &attr);
+
+    /* Task 7 — Log Writer: deferred SPI-flash writes (logs, offline queue, rules) */
+    attr.name       = "LogWriter";
+    attr.stack_size = 1536;  /* worst case 384 B + libc printf */
+    attr.priority   = osPriorityBelowNormal;
+    s_log_writer_task = (TaskHandle_t)osThreadNew(Task_LogWriter, NULL, &attr);
 
     osKernelStart();
 }
