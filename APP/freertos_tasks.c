@@ -63,6 +63,7 @@ static Gateway_Config_t s_tasks_cfg;  /* Shared config scratch for MQTT/Relay ta
 #include "cJSON.h"
 #include "safe_fmt.h"
 #include "fault_supervisor.h"
+#include "timekeeper.h"
 
 RuleConfig_t activeRules;
 RuleConfig_t pendingRules;
@@ -194,8 +195,7 @@ void Log_Event(const char *category, const char *message) {
     if (!category || !message) return;
 
     uint8_t cat_id = Log_Category_Id(category);
-    uint32_t ts = RTC_GetUptimeSeconds();
-    if (ts == 0) ts = g_uptime_seconds;
+    uint32_t ts = Time_LogStamp();
 
     if (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING || s_log_writer_task == NULL) {
         SDCard_Log_Append(ts, cat_id, message);
@@ -605,6 +605,7 @@ static void Task_IOWorker(void *arg) {
 
         if (g_ota_in_progress) continue;
 
+        Time_Service();
         Remote_Actuator_Service();
 
         const Hardware_Interface_Desc_t *if10 = Interface_GetDesc(10);

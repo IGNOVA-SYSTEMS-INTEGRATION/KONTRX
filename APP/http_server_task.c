@@ -45,6 +45,8 @@
 #include "interface_discovery.h"
 #include "safe_fmt.h"
 #include "fault_supervisor.h"
+#include "timekeeper.h"
+#include "rcc_stm32.h"
 #include "sdcard.h"
 #include <string.h>
 #include <stdio.h>
@@ -1073,6 +1075,13 @@ static int JSON_StatusResponse(char *buf, int buflen) {
     pos = sfmt_advance(buflen, pos, Supervisor_FormatHealthJSON(buf + pos, buflen - (int)pos));
     pos = sfmt_append(buf, buflen, pos, ",");
 
+    /* source: 0 not set, 1 browser, 2 SNTP. clock: crystal (HSE) or internal RC (HSI). */
+    pos = sfmt_append(buf, buflen, pos,
+        "\"time\":{\"epoch\":%lu,\"source\":%u,\"synced_ago_s\":%lu,\"clock\":\"%s\"},",
+        (unsigned long)Time_Now(), (unsigned)Time_Source(),
+        (unsigned long)(Time_Source() ? (g_uptime_seconds - Time_LastSyncUptime()) : 0UL),
+        RCC_IsHSEUsed() ? "HSE" : "HSI");
+
     pos = sfmt_append(buf, buflen, pos, "\"interfaces\":");
     pos = sfmt_advance(buflen, pos, Interface_BuildArrayJSON(buf + pos, buflen - pos));
     pos = sfmt_append(buf, buflen, pos, ",");
@@ -1655,11 +1664,26 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         strncmp(line, "POST /api/provision/delete", 26) == 0 ||
         strncmp(line, "POST /api/provision/manual", 26) == 0 ||
         strncmp(line, "POST /api/queue/clear", 21) == 0 ||
+        strncmp(line, "POST /api/time", 14) == 0 ||
         strncmp(line, "POST /api/debug/", 16) == 0) {
         if (!Is_Session_Valid(line)) {
             Send_Response(sn, HTTP_401, NULL);
             return;
         }
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/time {"epoch":N}  (login required) -> browser time, used
+     * until SNTP succeeds. Ignored once SNTP has set a fresh time.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/time", 14) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        long epoch = body ? JSON_ReadInt(body + 4, "epoch") : -1;
+        int applied = (epoch > 0) ? Time_Set((uint32_t)epoch, TIME_SRC_BROWSER) : 0;
+        char resp[80];
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"applied\":%d,\"source\":%u}", applied, (unsigned)Time_Source());
+        Send_Response(sn, HTTP_200_JSON, resp);
+        return;
     }
 
 #ifdef KONTRX_FAULT_TEST

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "safe_fmt.h"
+#include "timekeeper.h"
 
 /* Initialisation guard — cleared until Partition_Init() completes */
 static volatile uint8_t g_partition_ready = 0;
@@ -590,6 +591,38 @@ uint32_t Partition_Log_Count(uint32_t *out_bytes) {
     return s_log_entry_count;
 }
 
+/* Formats a log timestamp. Three kinds exist in flash: a UTC epoch (clock
+ * set), TIME_UPTIME_FLAG | uptime (clock not set yet), and older entries
+ * that hold the RTC time of day. */
+static void Log_FormatStamp(uint32_t stamp, char *when, size_t n,
+                            uint32_t *ts, uint32_t *up_s, uint8_t *is_up) {
+    *ts = 0; *up_s = 0; *is_up = 0;
+    if (stamp & TIME_UPTIME_FLAG) {
+        uint32_t u = stamp & ~TIME_UPTIME_FLAG;
+        *is_up = 1;
+        *up_s = u;
+        snprintf(when, n, "up %02lu:%02lu:%02lu", (unsigned long)(u / 3600U),
+                 (unsigned long)((u % 3600U) / 60U), (unsigned long)(u % 60U));
+    } else if (stamp >= 1000000000UL) {
+        *ts = stamp;
+        uint32_t days = stamp / 86400U, rem = stamp % 86400U;
+        /* civil-from-days, UTC */
+        uint32_t z = days + 719468U, era = z / 146097U, doe = z - era * 146097U;
+        uint32_t yoe = (doe - doe / 1460U + doe / 36524U - doe / 146096U) / 365U;
+        uint32_t doy = doe - (365U * yoe + yoe / 4U - yoe / 100U);
+        uint32_t mp = (5U * doy + 2U) / 153U;
+        uint32_t d = doy - (153U * mp + 2U) / 5U + 1U;
+        uint32_t m = (mp < 10U) ? mp + 3U : mp - 9U;
+        uint32_t y = yoe + era * 400U + ((m <= 2U) ? 1U : 0U);
+        snprintf(when, n, "%04lu-%02lu-%02lu %02lu:%02lu:%02luZ", (unsigned long)y,
+                 (unsigned long)m, (unsigned long)d, (unsigned long)(rem / 3600U),
+                 (unsigned long)((rem % 3600U) / 60U), (unsigned long)(rem % 60U));
+    } else {
+        snprintf(when, n, "%02lu:%02lu:%02lu", (unsigned long)((stamp / 3600U) % 24U),
+                 (unsigned long)((stamp % 3600U) / 60U), (unsigned long)(stamp % 60U));
+    }
+}
+
 int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit) {
     if (!buf || max_len <= 0) return 0;
     if (limit == 0) limit = 40;
@@ -664,9 +697,6 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
     }
 
     /* Print target_addrs from newest (target_count - 1) down to 0 */
-    uint16_t yr = 2026;
-    uint8_t mo = 9, dy = 14;
-    RTC_GetDateTime(&yr, &mo, &dy, NULL, NULL, NULL);
 
     static const char * const cats[] = {"SYS", "MQTT", "MODBUS", "RELAY", "OTA", "SD", "AUTH"};
     uint32_t printed = 0;
@@ -690,21 +720,19 @@ int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint
             }
         }
 
-        uint32_t s = hdr.timestamp;
-        uint32_t hrs = (s / 3600) % 24;
-        uint32_t mins = (s % 3600) / 60;
-        uint32_t secs = s % 60;
+        uint32_t ts = 0, up_s = 0;
+        uint8_t is_up = 0;
+        char when[32];
+        Log_FormatStamp(hdr.timestamp, when, sizeof(when), &ts, &up_s, &is_up);
         const char *cat_str = (hdr.category_id <= 6) ? cats[hdr.category_id] : "SYS";
 
         if (printed > 0) {
             pos = sfmt_append(buf, max_len, pos, ",");
         }
 
-        pos = sfmt_append(buf, max_len, pos, "{\"time\":\"%04u-%02u-%02u %02lu:%02lu:%02lu\",\"uptime\":\"%02lu:%02lu:%02lu\",\"up_s\":%lu,\"cat\":\"%s\",\"msg\":\"%s\"}",
-                        (unsigned int)yr, (unsigned int)mo, (unsigned int)dy,
-                        (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
-                        (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
-                        (unsigned long)s,
+        /* ts: UTC epoch (0 if unknown); up=1: up_s is seconds since that boot. */
+        pos = sfmt_append(buf, max_len, pos, "{\"time\":\"%s\",\"ts\":%lu,\"up\":%u,\"up_s\":%lu,\"cat\":\"%s\",\"msg\":\"%s\"}",
+                        when, (unsigned long)ts, (unsigned)is_up, (unsigned long)up_s,
                         cat_str, msg_temp);
 
         printed++;
@@ -745,16 +773,17 @@ uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const u
     int pos = 0;
     uint32_t total_sent = 0;
 
-    uint16_t yr = 2026;
-    uint8_t mo = 9, dy = 14, hr = 0, mn = 0, sc = 0;
-    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+    char export_when[32];
+    uint32_t e_ts, e_up;
+    uint8_t e_isup;
+    Log_FormatStamp(Time_LogStamp(), export_when, sizeof(export_when), &e_ts, &e_up, &e_isup);
 
     pos = sfmt_append(buf, sizeof(buf), pos, "# ==============================================================================\r\n"
         "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
         "# System Event Audit Log Export\r\n"
-        "# Date: %04u-%02u-%02u %02u:%02u:%02u\r\n"
+        "# Date: %s (Z = UTC)\r\n"
         "# ==============================================================================\r\n",
-        yr, mo, dy, hr, mn, sc);
+        export_when);
 
     static const char * const cats[] = {"SYS", "MQTT", "MODBUS", "RELAY", "OTA", "SD", "AUTH"};
 
@@ -783,18 +812,15 @@ uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const u
                 }
             }
 
-            uint32_t s = hdr.timestamp;
-            uint32_t hrs = (s / 3600) % 24;
-            uint32_t mins = (s % 3600) / 60;
-            uint32_t secs = s % 60;
+            char when[32];
+            uint32_t l_ts, l_up;
+            uint8_t l_isup;
+            Log_FormatStamp(hdr.timestamp, when, sizeof(when), &l_ts, &l_up, &l_isup);
             const char *cat_str = (hdr.category_id <= 6) ? cats[hdr.category_id] : "SYS";
 
             char line_buf[128];
-            int line_len = snprintf(line_buf, sizeof(line_buf),
-                "%04u-%02u-%02u %02lu:%02lu:%02lu [%s] %s\r\n",
-                (unsigned int)yr, (unsigned int)mo, (unsigned int)dy,
-                (unsigned long)hrs, (unsigned long)mins, (unsigned long)secs,
-                cat_str, msg_temp);
+            int line_len = snprintf(line_buf, sizeof(line_buf), "%s [%s] %s\r\n",
+                                    when, cat_str, msg_temp);
 
             if (line_len > 0) {
                 if (pos + line_len >= (int)sizeof(buf)) {
@@ -819,23 +845,24 @@ uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const u
     return total_sent;
 }
 
+/* Must match Partition_Log_Stream() byte for byte: it is the Content-Length. */
 uint32_t Partition_Log_StreamSize(void) {
     static const uint8_t cat_lens[] = {3, 4, 6, 5, 3, 2, 4};
-
-    uint16_t yr = 2026;
-    uint8_t mo = 9, dy = 14, hr = 0, mn = 0, sc = 0;
-    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+    char when[32];
+    uint32_t w_ts, w_up;
+    uint8_t w_isup;
 
     uint32_t total = 0;
 
     /* Header block size — same format as Partition_Log_Stream */
+    Log_FormatStamp(Time_LogStamp(), when, sizeof(when), &w_ts, &w_up, &w_isup);
     total += (uint32_t)snprintf(NULL, 0,
         "# ==============================================================================\r\n"
         "# Kontrx Universal Edge Gateway (Model: KX-F407)\r\n"
         "# System Event Audit Log Export\r\n"
-        "# Date: %04u-%02u-%02u %02u:%02u:%02u\r\n"
+        "# Date: %s (Z = UTC)\r\n"
         "# ==============================================================================\r\n",
-        yr, mo, dy, hr, mn, sc);
+        when);
 
     /* Each log entry formatted line */
     for (uint32_t sec = 0; sec < 252; sec++) {
@@ -851,8 +878,9 @@ uint32_t Partition_Log_StreamSize(void) {
             if (hdr.timestamp == 0xFFFFFFFF || hdr.msg_len == 0 || hdr.msg_len > 60) break;
 
             uint8_t clen = (hdr.category_id <= 6) ? cat_lens[hdr.category_id] : 3;
-            /* "YYYY-MM-DD HH:MM:SS [CAT] msg\r\n" = 19 + 2 + clen + 2 + msg_len + 2 */
-            total += 25 + clen + hdr.msg_len;
+            Log_FormatStamp(hdr.timestamp, when, sizeof(when), &w_ts, &w_up, &w_isup);
+            /* "<when> [CAT] msg\r\n" */
+            total += (uint32_t)strlen(when) + 2U + clen + 2U + hdr.msg_len + 2U;
 
             off += sizeof(PartitionLogHeader_t) + hdr.msg_len;
         }
@@ -1081,7 +1109,7 @@ uint8_t Partition_RollbackRules(const char *target_version_id, RuleConfig_t *out
 
     char r_msg[96];
     snprintf(r_msg, sizeof(r_msg), "Rules rolled back to version %s", target_version_id);
-    Partition_Log_Append(RTC_GetUptimeSeconds(), 0, r_msg);
+    Partition_Log_Append(Time_LogStamp(), 0, r_msg);
     printf("[Rollback] Successfully restored rules & layout for version '%s'\r\n", target_version_id);
     return 1;
 }
