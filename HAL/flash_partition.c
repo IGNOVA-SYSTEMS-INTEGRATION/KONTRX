@@ -594,7 +594,7 @@ uint32_t Partition_Log_Count(uint32_t *out_bytes) {
 /* Formats a log timestamp. Three kinds exist in flash: a UTC epoch (clock
  * set), TIME_UPTIME_FLAG | uptime (clock not set yet), and older entries
  * that hold the RTC time of day. */
-static void Log_FormatStamp(uint32_t stamp, char *when, size_t n,
+void Log_FormatStamp(uint32_t stamp, char *when, size_t n,
                             uint32_t *ts, uint32_t *up_s, uint8_t *is_up) {
     *ts = 0; *up_s = 0; *is_up = 0;
     if (stamp & TIME_UPTIME_FLAG) {
@@ -921,13 +921,17 @@ uint32_t Partition_Queue_StreamSize(void) {
         OfflineRecord_t rec;
         W25Q_Read(addr, (uint8_t *)&rec, sizeof(OfflineRecord_t));
 
+        const char *type_str = (rec.source_type == MAP_SOURCE_SENSOR) ? "SENSOR" :
+                               (rec.source_type == MAP_SOURCE_ACTUATOR) ? "ACTUATOR" : "MULTI";
+        const char *st_str = rec.padding ? "VALID" : "INVALID";
+
         total += (uint32_t)snprintf(NULL, 0,
-            "%lu\t%lu\t%s\t%u\t0x%02X\t%.2f\t%.2f\r\n",
+            "%lu\t%lu\t%s\t%u\t%s\t%.2f\t%.2f\r\n",
             (unsigned long)idx,
             (unsigned long)rec.timestamp,
-            (rec.source_type == 1) ? "SENSOR" : "ACTUATOR",
+            type_str,
             rec.source_id,
-            rec.valid,
+            st_str,
             rec.value,
             rec.temp);
 
@@ -967,14 +971,18 @@ uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const
         OfflineRecord_t rec;
         W25Q_Read(addr, (uint8_t *)&rec, sizeof(OfflineRecord_t));
 
+        const char *type_str = (rec.source_type == MAP_SOURCE_SENSOR) ? "SENSOR" :
+                               (rec.source_type == MAP_SOURCE_ACTUATOR) ? "ACTUATOR" : "MULTI";
+        const char *st_str = rec.padding ? "VALID" : "INVALID";
+
         char line_buf[128];
         int line_len = snprintf(line_buf, sizeof(line_buf),
-            "%lu\t%lu\t%s\t%u\t0x%02X\t%.2f\t%.2f\r\n",
+            "%lu\t%lu\t%s\t%u\t%s\t%.2f\t%.2f\r\n",
             (unsigned long)idx,
             (unsigned long)rec.timestamp,
-            (rec.source_type == 1) ? "SENSOR" : "ACTUATOR",
+            type_str,
             rec.source_id,
-            rec.valid,
+            st_str,
             rec.value,
             rec.temp);
 

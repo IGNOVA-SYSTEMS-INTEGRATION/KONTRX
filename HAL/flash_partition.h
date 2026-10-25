@@ -212,10 +212,13 @@ uint32_t Partition_Log_Count(uint32_t *out_bytes);
 int Partition_Log_FormatJSON(char *buf, int max_len, uint32_t max_items);
 int Partition_Log_FormatJSON_Paged(char *buf, int max_len, uint32_t offset, uint32_t limit);
 void Partition_Log_Clear(void);
+void Log_FormatStamp(uint32_t stamp, char *when, size_t n, uint32_t *ts, uint32_t *up_s, uint8_t *is_up);
 
 // Streaming functions for full file export over socket
 uint32_t Partition_Log_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total));
+uint32_t Partition_Log_StreamSize(void);
 uint32_t Partition_Queue_Stream(uint8_t sn, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total));
+uint32_t Partition_Queue_StreamSize(void);
 
 // Rules History Archives (Stored in persistent flash partitions / SD Card)
 #define PARTITION_RULES_HISTORY_ADDR  0x000EC000U // Sector 236 (96 KB = 24 sectors)
