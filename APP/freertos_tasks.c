@@ -1313,6 +1313,53 @@ static void Log_Mqtt_Topic(const char *topic, const char *payload, uint8_t succe
     }
 }
 
+/* Appends `<sep><value>` as %.2f, or null when the channel has no valid reading. */
+static int Append_Ch_Value(char *buf, size_t cap, int pos, const char *sep, float v) {
+    if (v > MULTI_CH_INVALID + 1.0f) return sfmt_append(buf, cap, pos, "%s%.2f", sep, v);
+    return sfmt_append(buf, cap, pos, "%snull", sep);
+}
+
+/* Multi-Sensor Board channels as fields of an open JSON object:
+ * ,"us":[..3],"flow":[..3],"temps":[..2],"us_avg":x,"flow_avg":y,"temp_avg":z */
+static int Append_Multi_Channels_JSON(char *buf, size_t cap, int pos, const MultiChRecord_t *mc) {
+    static const struct { const char *key; uint8_t first; uint8_t n; } groups[] = {
+        { "us", MULTI_CH_US, 3 }, { "flow", MULTI_CH_FLOW, 3 }, { "temps", MULTI_CH_TEMP, 2 }
+    };
+    uint8_t online = (mc && mc->valid);
+    for (uint8_t g = 0; g < 3; g++) {
+        pos = sfmt_append(buf, cap, pos, ",\"%s\":[", groups[g].key);
+        for (uint8_t c = 0; c < groups[g].n; c++) {
+            pos = Append_Ch_Value(buf, cap, pos, c ? "," : "",
+                                  online ? mc->ch[groups[g].first + c] : MULTI_CH_INVALID);
+        }
+        pos = sfmt_append(buf, cap, pos, "]");
+    }
+    pos = Append_Ch_Value(buf, cap, pos, ",\"us_avg\":",   online ? MultiCh_Avg(mc, MULTI_CH_US, 3)   : MULTI_CH_INVALID);
+    pos = Append_Ch_Value(buf, cap, pos, ",\"flow_avg\":", online ? MultiCh_Avg(mc, MULTI_CH_FLOW, 3) : MULTI_CH_INVALID);
+    pos = Append_Ch_Value(buf, cap, pos, ",\"temp_avg\":", online ? MultiCh_Avg(mc, MULTI_CH_TEMP, 2) : MULTI_CH_INVALID);
+    return pos;
+}
+
+/* Multi-Sensor Board channels as flat keys: ,"<prefix>_us1":v ... ,"<prefix>_temp_avg":v */
+static int Append_Multi_Channels_Flat(char *buf, size_t cap, int pos, const char *prefix, const MultiChRecord_t *mc) {
+    static const char *const ch_keys[MULTI_CH_COUNT] = {
+        "us1", "us2", "us3", "flow1", "flow2", "flow3", "temp1", "temp2"
+    };
+    char sep[48];
+    uint8_t online = (mc && mc->valid);
+    for (uint8_t c = 0; c < MULTI_CH_COUNT; c++) {
+        snprintf(sep, sizeof(sep), ",\"%s_%s\":", prefix, ch_keys[c]);
+        pos = Append_Ch_Value(buf, cap, pos, sep, online ? mc->ch[c] : MULTI_CH_INVALID);
+    }
+    snprintf(sep, sizeof(sep), ",\"%s_us_avg\":", prefix);
+    pos = Append_Ch_Value(buf, cap, pos, sep, online ? MultiCh_Avg(mc, MULTI_CH_US, 3) : MULTI_CH_INVALID);
+    snprintf(sep, sizeof(sep), ",\"%s_flow_avg\":", prefix);
+    pos = Append_Ch_Value(buf, cap, pos, sep, online ? MultiCh_Avg(mc, MULTI_CH_FLOW, 3) : MULTI_CH_INVALID);
+    snprintf(sep, sizeof(sep), ",\"%s_temp_avg\":", prefix);
+    pos = Append_Ch_Value(buf, cap, pos, sep, online ? MultiCh_Avg(mc, MULTI_CH_TEMP, 2) : MULTI_CH_INVALID);
+    return pos;
+}
+
 static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const TelemetryBatch_t *batch, const Gateway_Config_t *cfg) {
     char ts_str[32];
     RTC_GetTimeString(ts_str, sizeof(ts_str));
@@ -1367,6 +1414,11 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
                     if (batch->records[b_idx].avg_temp > -50.0f && batch->records[b_idx].avg_temp < 150.0f) {
                         pos = sfmt_append(json_buf, max_len, pos, ",\"%s_%u_temp\":%.2f", tname, sid, batch->records[b_idx].avg_temp);
                     }
+                    if (stype == SENSOR_TYPE_MULTI_US) {
+                        char prefix[32];
+                        snprintf(prefix, sizeof(prefix), "%s_%u", tname, sid);
+                        pos = Append_Multi_Channels_Flat(json_buf, max_len, pos, prefix, MultiCh_Find(batch, sid));
+                    }
                     sens_emitted = 1;
                 } else if (!cfg->mqtt_skip_offline) {
                     pos = sfmt_append(json_buf, max_len, pos, ",\"%s_%u\":0.00", tname, sid);
@@ -1381,6 +1433,9 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
                 pos = sfmt_append(json_buf, max_len, pos, ",\"%s\":%.2f", tname, batch->records[s].avg_value);
                 if (batch->records[s].avg_temp > -50.0f && batch->records[s].avg_temp < 150.0f) {
                     pos = sfmt_append(json_buf, max_len, pos, ",\"%s_temp\":%.2f", tname, batch->records[s].avg_temp);
+                }
+                if (batch->records[s].type == SENSOR_TYPE_MULTI_US && batch->records[s].valid) {
+                    pos = Append_Multi_Channels_Flat(json_buf, max_len, pos, tname, MultiCh_Find(batch, batch->records[s].id));
                 }
             }
         }
@@ -1434,10 +1489,14 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         }
 
         if (b_idx >= 0 && batch->records[b_idx].valid) {
-            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"online\"",
                             sens_emitted ? "," : "",
                             sname, sid,
                             batch->records[b_idx].avg_value, batch->records[b_idx].avg_temp);
+            if (stype == SENSOR_TYPE_MULTI_US) {
+                pos = Append_Multi_Channels_JSON(json_buf, max_len, pos, MultiCh_Find(batch, sid));
+            }
+            pos = sfmt_append(json_buf, max_len, pos, "}");
             sens_emitted = 1;
         } else if (!cfg->mqtt_skip_offline) {
             pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":0.00,\"temp\":0.00,\"status\":\"offline\"}",
@@ -1451,11 +1510,15 @@ static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, cons
         for (int s = 0; s < batch->count; s++) {
             if (cfg->mqtt_skip_offline && !batch->records[s].valid) continue;
             const char *sname = SensorTypeName(batch->records[s].type);
-            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"%s\"}",
+            pos = sfmt_append(json_buf, max_len, pos, "%s\"%s_%u\":{\"value\":%.2f,\"temp\":%.2f,\"status\":\"%s\"",
                             sens_emitted ? "," : "",
                             sname, batch->records[s].id,
                             batch->records[s].avg_value, batch->records[s].avg_temp,
                             batch->records[s].valid ? "online" : "offline");
+            if (batch->records[s].type == SENSOR_TYPE_MULTI_US && batch->records[s].valid) {
+                pos = Append_Multi_Channels_JSON(json_buf, max_len, pos, MultiCh_Find(batch, batch->records[s].id));
+            }
+            pos = sfmt_append(json_buf, max_len, pos, "}");
             sens_emitted = 1;
         }
     }
@@ -1655,6 +1718,26 @@ void Ensure_W5500_Network_Alive(void) {
     }
 }
 
+/* Queues the channels of every online multi-sensor board in `batch` as
+ * QUEUE_MULTI_CH_RECORDS packed records stamped `ts`, so a replayed snapshot
+ * carries them too. Call only after the snapshot's sensor records. */
+static void Queue_Multi_Channels(const TelemetryBatch_t *batch, uint32_t ts) {
+    for (uint8_t i = 0; i < batch->multi_count && i < MAX_MULTI_US; i++) {
+        const MultiChRecord_t *mc = &batch->multi[i];
+        if (!mc->valid) continue;
+        for (uint8_t p = 0; p < QUEUE_MULTI_CH_RECORDS; p++) {
+            OfflineRecord_t rec = {0};
+            rec.timestamp = ts;
+            rec.source_type = (uint8_t)(QUEUE_SOURCE_MULTI_CH + p);
+            rec.source_id = mc->id;
+            rec.valid = 1;
+            rec.value = mc->ch[2 * p];
+            rec.temp = mc->ch[2 * p + 1];
+            SDCard_Queue_Push(&rec);
+        }
+    }
+}
+
 static void Do_Offline_Telemetry_Queueing(void) {
     TelemetryBatch_t batch = {0};
     Modbus_DMA_ConsumeBatch(&batch);
@@ -1736,6 +1819,8 @@ static void Do_Offline_Telemetry_Queueing(void) {
     }
 
     if (cached_any) {
+        Queue_Multi_Channels(&batch, g_uptime_seconds);
+
         char cache_msg[64];
         snprintf(cache_msg, sizeof(cache_msg), "Broker offline. Telemetry cached. Queue: %lu",
                  (unsigned long)Partition_Queue_Count());
@@ -2049,6 +2134,7 @@ static void Task_MQTTClient(void *arg) {
                         static uint32_t cov_last_pub_tick            = 0;
                         static uint32_t cov_seq                      = 0;
                         static uint8_t  cov_actuators_init           = 0;
+                        static float    cov_last_mch[MAX_MULTI_US][MULTI_CH_COUNT] = {{0}};
 
                         TelemetryBatch_t batch = {0};
                         Modbus_DMA_ConsumeBatch(&batch);
@@ -2142,6 +2228,8 @@ static void Task_MQTTClient(void *arg) {
                             #define COV_DB_AMM     1.0f
                             #define COV_DB_US      5.0f
                             #define COV_DB_DEF     0.01f
+                            #define COV_DB_FLOW    0.2f    /* multi-sensor flow channel, L/min */
+                            #define COV_DB_MTEMP   1.5f    /* multi-sensor temp channel, degC */
 
                             #define COV_PCT_PH     0.5f
                             #define COV_PCT_ORP    0.5f
@@ -2213,6 +2301,17 @@ static void Task_MQTTClient(void *arg) {
                                 }
                             }
 
+                            /* Multi-sensor channels: any single channel past its deadband */
+                            for (uint8_t i = 0; !has_change && i < batch.multi_count && i < MAX_MULTI_US; i++) {
+                                if (!batch.multi[i].valid) continue;
+                                for (uint8_t c = 0; c < MULTI_CH_COUNT; c++) {
+                                    float db = (c < MULTI_CH_FLOW) ? COV_DB_US : (c < MULTI_CH_TEMP) ? COV_DB_FLOW : COV_DB_MTEMP;
+                                    float d = batch.multi[i].ch[c] - cov_last_mch[i][c];
+                                    if (d < 0.0f) d = -d;
+                                    if (d >= db) { has_change = 1; trigger = "cov_multi"; break; }
+                                }
+                            }
+
                             /* Rate limit: In CoV mode, throttle publications to at most once per 1000ms */
                             if (has_change && (osKernelGetTickCount() - last_publish) < pdMS_TO_TICKS(1000)) {
                                 has_change = 0;
@@ -2238,6 +2337,7 @@ static void Task_MQTTClient(void *arg) {
                                     static uint8_t q_relays[MAX_RELAYS];
                                     q_batch = batch;
                                     for (int i = 0; i < q_batch.count && i < MAX_SENSORS; i++) q_batch.records[i].valid = 0;
+                                    for (int i = 0; i < q_batch.multi_count && i < MAX_MULTI_US; i++) q_batch.multi[i].valid = 0;
                                     memcpy(q_relays, relayStates, sizeof(q_relays));
 
                                     OfflineRecord_t rec;
@@ -2262,6 +2362,21 @@ static void Task_MQTTClient(void *arg) {
                                         } else if (rec.source_type == MAP_SOURCE_ACTUATOR && rec.source_id < MAX_RELAYS) {
                                             q_relays[rec.source_id] = (uint8_t)rec.value;
                                             applied = 1;
+                                        } else if (rec.source_type >= QUEUE_SOURCE_MULTI_CH &&
+                                                   rec.source_type < QUEUE_SOURCE_MULTI_CH + QUEUE_MULTI_CH_RECORDS) {
+                                            uint8_t p = rec.source_type - QUEUE_SOURCE_MULTI_CH;
+                                            MultiChRecord_t *mc = (MultiChRecord_t *)MultiCh_Find(&q_batch, rec.source_id);
+                                            if (!mc && q_batch.multi_count < MAX_MULTI_US) {
+                                                /* Board no longer polled: restore it from the queue alone */
+                                                mc = &q_batch.multi[q_batch.multi_count++];
+                                                mc->id = rec.source_id;
+                                                for (uint8_t c = 0; c < MULTI_CH_COUNT; c++) mc->ch[c] = MULTI_CH_INVALID;
+                                            }
+                                            if (mc) {
+                                                mc->ch[2 * p]     = rec.value;
+                                                mc->ch[2 * p + 1] = rec.temp;
+                                                mc->valid         = was_valid;
+                                            }
                                         }
                                     }
 
@@ -2276,8 +2391,8 @@ static void Task_MQTTClient(void *arg) {
                                         msg.retained = 0;   /* historical data must not replace the retained live value */
                                         msg.dup = 0;
                                         char q_topic[MQTT_TOPIC_MAX];
+                                        static uint8_t q_buf[2560];   /* Sparkplug or JSON replay payload */
                                         if (q_is_spb) {
-                                            static uint8_t q_buf[2560];
                                             cov_seq = (cov_seq + 1) & 0xFF;
                                             if (cov_seq == 0) cov_seq = 1;
                                             size_t q_len = sparkplug_encode_ddata(q_buf, sizeof(q_buf),
@@ -2291,11 +2406,12 @@ static void Task_MQTTClient(void *arg) {
                                                      (unsigned long)cov_seq, (int)q_len, (unsigned long)snap_ts, (unsigned long)consumed);
                                             if (q_len > 0) q_rc = MQTTPublish(&client, q_topic, &msg);
                                         } else {
-                                            static char q_json[1024];
+                                            char *q_json = (char *)q_buf;
+                                            const size_t q_json_cap = sizeof(q_buf);
                                             if (s_tasks_cfg.mqtt_payload_shape == 1)
-                                                Build_Flat_Telemetry_JSON(q_json, sizeof(q_json), &q_batch, &s_tasks_cfg);
+                                                Build_Flat_Telemetry_JSON(q_json, q_json_cap, &q_batch, &s_tasks_cfg);
                                             else
-                                                Build_Structured_Telemetry_JSON(q_json, sizeof(q_json), &q_batch, &s_tasks_cfg);
+                                                Build_Structured_Telemetry_JSON(q_json, q_json_cap, &q_batch, &s_tasks_cfg);
                                             strncpy(q_topic, active_topic, sizeof(q_topic) - 1);
                                             q_topic[sizeof(q_topic) - 1] = '\0';
                                             msg.payload = (void*)q_json;
@@ -2334,7 +2450,12 @@ static void Task_MQTTClient(void *arg) {
                                 }
                             }
                         }
-                        
+                        for (int i = 0; i < batch.multi_count && i < MAX_MULTI_US; i++) {
+                            if (batch.multi[i].valid) {
+                                memcpy(cov_last_mch[i], batch.multi[i].ch, sizeof(cov_last_mch[i]));
+                            }
+                        }
+
                         /* Update actuator baselines */
                         for (int i = 0; i < act_cnt && i < MAX_RELAYS; i++) {
                             cov_last_relay[i] = relayStates[i];
@@ -2405,10 +2526,14 @@ static void Task_MQTTClient(void *arg) {
                                     }
 
                                     if (b_idx >= 0 && batch.records[b_idx].valid) {
-                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"",
                                                             sens_logged ? "," : "",
                                                             sname, sid,
                                                             batch.records[b_idx].avg_value, batch.records[b_idx].avg_temp);
+                                        if (stype == SENSOR_TYPE_MULTI_US) {
+                                            log_pos = Append_Multi_Channels_JSON(pub_payload_str, sizeof(pub_payload_str), log_pos, MultiCh_Find(&batch, sid));
+                                        }
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "}");
                                         sens_logged = 1;
                                     } else if (!s_tasks_cfg.mqtt_skip_offline) {
                                         log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
@@ -2422,10 +2547,14 @@ static void Task_MQTTClient(void *arg) {
                                     if (s_tasks_cfg.mqtt_skip_offline && !batch.records[si].valid) continue;
                                     const char *sname = SensorTypeName(batch.records[si].type);
                                     if (batch.records[si].valid) {
-                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"}",
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":%.2f,\"temp\":%.2f,\"status\":\"online\"",
                                                             sens_logged ? "," : "",
                                                             sname, batch.records[si].id,
                                                             batch.records[si].avg_value, batch.records[si].avg_temp);
+                                        if (batch.records[si].type == SENSOR_TYPE_MULTI_US) {
+                                            log_pos = Append_Multi_Channels_JSON(pub_payload_str, sizeof(pub_payload_str), log_pos, MultiCh_Find(&batch, batch.records[si].id));
+                                        }
+                                        log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "}");
                                     } else {
                                         log_pos = sfmt_append(pub_payload_str, sizeof(pub_payload_str), log_pos, "%s\"%s_%u\":{\"val\":0.0,\"temp\":0.0,\"status\":\"offline\"}",
                                                             sens_logged ? "," : "",
@@ -2505,24 +2634,23 @@ static void Task_MQTTClient(void *arg) {
                                    (int)ddata_len, (unsigned long)cov_seq, ddata_topic);
                             pub_rc = MQTTPublish(&client, ddata_topic, &message);
                         } else {
-                            static char json_buf[1024];
+                            /* Built straight into the log buffer: it is both the
+                             * published payload and the Transmission Log copy. */
                             if (s_tasks_cfg.mqtt_payload_shape == 1) {
-                                Build_Flat_Telemetry_JSON(json_buf, sizeof(json_buf), &batch, &s_tasks_cfg);
+                                Build_Flat_Telemetry_JSON(pub_payload_str, sizeof(pub_payload_str), &batch, &s_tasks_cfg);
                             } else {
-                                Build_Structured_Telemetry_JSON(json_buf, sizeof(json_buf), &batch, &s_tasks_cfg);
+                                Build_Structured_Telemetry_JSON(pub_payload_str, sizeof(pub_payload_str), &batch, &s_tasks_cfg);
                             }
-
-                            strncpy(pub_payload_str, json_buf, sizeof(pub_payload_str) - 1);
 
                             MQTTMessage message;
                             message.qos        = QOS1;
                             message.retained   = 1;
                             message.dup        = 0;
-                            message.payload    = (void*)json_buf;
-                            message.payloadlen = strlen(json_buf);
+                            message.payload    = (void*)pub_payload_str;
+                            message.payloadlen = strlen(pub_payload_str);
 
                             printf("[MQTT] Pub Telemetry JSON (shape=%u) size=%d: %s\r\n",
-                                   s_tasks_cfg.mqtt_payload_shape, (int)strlen(json_buf), ts_str);
+                                   s_tasks_cfg.mqtt_payload_shape, (int)strlen(pub_payload_str), ts_str);
                             pub_rc = MQTTPublish(&client, active_topic, &message);
                         }
 
@@ -2547,6 +2675,7 @@ static void Task_MQTTClient(void *arg) {
                         } else {
                             Log_Mqtt_Topic(active_topic, pub_payload_str, 0);
                             printf("[MQTT] Publish failed, caching telemetry...\r\n");
+                            uint8_t cached_fail = 0;
                             for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
                                 if (!s_tasks_cfg.mqtt_mappings[m].enabled) continue;
                                 
@@ -2574,7 +2703,11 @@ static void Task_MQTTClient(void *arg) {
                                 
                                 if (rec.valid) {
                                     SDCard_Queue_Push(&rec);
+                                    cached_fail = 1;
                                 }
+                            }
+                            if (cached_fail) {
+                                Queue_Multi_Channels(&batch, g_uptime_seconds);
                             }
                             break; // Trigger reconnect
                         }

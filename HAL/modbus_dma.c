@@ -655,37 +655,53 @@ void Modbus_DMA_PollSensors(void) {
     Update_Shared_Sensor_Data(&local);
 }
 
+/* Copies sharedSensorData into a batch. Caller holds sensorMutex (or the
+ * kernel is not running yet). */
+static void Fill_Batch(TelemetryBatch_t *dest) {
+    dest->count = sharedSensorData.readings_count;
+    for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
+        SensorReading_t *rd = &sharedSensorData.readings[i];
+        dest->records[i].type = rd->type;
+        dest->records[i].id   = rd->id;
+        dest->records[i].avg_value         = rd->value;
+        dest->records[i].avg_temp          = rd->temp;
+        dest->records[i].samples_collected = 1;
+        dest->records[i].valid             = rd->valid;
+    }
+
+    /* Multi-sensor boards: per-channel values, valid with the board's reading */
+    dest->multi_count = 0;
+    for (uint8_t i = 0; i < sharedSensorData.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *mu = &sharedSensorData.multi_us[i];
+        MultiChRecord_t *mc = &dest->multi[dest->multi_count++];
+        mc->id = mu->id;
+        mc->valid = 0;
+        for (uint8_t r = 0; r < dest->count; r++) {
+            if (dest->records[r].type == SENSOR_TYPE_MULTI_US && dest->records[r].id == mu->id) {
+                mc->valid = dest->records[r].valid;
+                break;
+            }
+        }
+        for (uint8_t c = 0; c < 3; c++) mc->ch[MULTI_CH_US + c]   = mu->dist[c];
+        for (uint8_t c = 0; c < 3; c++) mc->ch[MULTI_CH_FLOW + c] = mu->flow[c].rate;
+        for (uint8_t c = 0; c < 2; c++) mc->ch[MULTI_CH_TEMP + c] = mu->temp[c];
+    }
+}
+
 void Modbus_DMA_ConsumeBatch(TelemetryBatch_t *dest) {
     if (!dest) return;
 
     if (osKernelGetState() != osKernelRunning || sensorMutex == NULL) {
-        dest->count = sharedSensorData.readings_count;
-        for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
-            SensorReading_t *rd = &sharedSensorData.readings[i];
-            dest->records[i].type = rd->type;
-            dest->records[i].id   = rd->id;
-            dest->records[i].avg_value         = rd->value;
-            dest->records[i].avg_temp          = rd->temp;
-            dest->records[i].samples_collected = 1;
-            dest->records[i].valid             = rd->valid;
-        }
+        Fill_Batch(dest);
         return;
     }
 
     if (osMutexAcquire(sensorMutex, 50) == osOK) {
-        dest->count = sharedSensorData.readings_count;
-        for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
-            SensorReading_t *rd = &sharedSensorData.readings[i];
-            dest->records[i].type = rd->type;
-            dest->records[i].id   = rd->id;
-            dest->records[i].avg_value         = rd->value;
-            dest->records[i].avg_temp          = rd->temp;
-            dest->records[i].samples_collected = 1;
-            dest->records[i].valid             = rd->valid;
-        }
+        Fill_Batch(dest);
         osMutexRelease(sensorMutex);
     } else {
         dest->count = 0;
+        dest->multi_count = 0;
     }
 }
 
