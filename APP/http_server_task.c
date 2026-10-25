@@ -446,6 +446,71 @@ static int JSON_SerializeRule(char *buf, size_t buflen, const Rule_t *r, const R
 
 #include "sdcard.h"
 
+int Rules_ExportJSON_ForPath(const char *path, char *out_buf, size_t max_len) {
+    if (!out_buf || max_len == 0) return 0;
+
+    memset(&s_tempRules, 0, sizeof(RuleConfig_t));
+    uint8_t has_pending = 0;
+    char pending_ver[36] = {0};
+
+    char ver[36] = {0};
+    const char *p = (path) ? strstr(path, "rules_") : NULL;
+    if (p && strstr(path, "rules_active") == NULL) {
+        p += 6;
+        const char *dot = strstr(p, ".json");
+        if (dot && (size_t)(dot - p) < sizeof(ver)) {
+            strncpy(ver, p, (size_t)(dot - p));
+            ver[dot - p] = '\0';
+        }
+    }
+
+    if (ver[0] != '\0') {
+        if (!Partition_LoadArchivedRules(ver, &s_tempRules, NULL, 0)) {
+            if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                s_tempRules = activeRules;
+                has_pending = hasPendingRules;
+                strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+                osMutexRelease(rulesMutex);
+            }
+        }
+    } else {
+        if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            s_tempRules = activeRules;
+            has_pending = hasPendingRules;
+            strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+            osMutexRelease(rulesMutex);
+        }
+    }
+
+    int pos = 0;
+    pos = sfmt_append(out_buf, max_len, pos, "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"rules\":[",
+        s_tempRules.version_id, s_tempRules.timestamp, s_tempRules.rules_valid, s_tempRules.bypass_validation,
+        has_pending, pending_ver);
+
+    for (uint32_t i = 0; i < s_tempRules.rule_count; i++) {
+        const Rule_t *r = &s_tempRules.rules[i];
+        pos = sfmt_advance(max_len, pos, JSON_SerializeRule(out_buf + pos, max_len - pos, r, &s_tempRules, (i == 0)));
+    }
+    pos = sfmt_append(out_buf, max_len, pos, "],\"history\":");
+    pos = sfmt_advance(max_len, pos, Partition_FormatRulesHistoryJSON(out_buf + pos, max_len - pos, s_tempRules.version_id));
+
+    {
+        static const char layout_key[] = ",\"layout\":";
+        uint32_t key_len = sizeof(layout_key) - 1;
+        if (max_len > (size_t)pos + key_len + 2) {
+            uint32_t remaining = (uint32_t)(max_len - pos - key_len - 2);
+            uint32_t layout_len = Partition_LoadLayout(out_buf + pos + key_len, remaining);
+            if (layout_len > 0) {
+                memcpy(out_buf + pos, layout_key, key_len);
+                pos += key_len + layout_len;
+            }
+        }
+    }
+
+    pos = sfmt_append(out_buf, max_len, pos, "}");
+    return pos;
+}
+
 static uint8_t Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total);
 
 static void Send_JSON_Logs(uint8_t sn, const char *line) {
@@ -2530,6 +2595,42 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         const char *fname = strrchr(path_param, '/');
         fname = (fname && *(fname + 1) != '\0') ? fname + 1 : path_param;
         if (fname[0] == '\0') fname = "system_event.log";
+
+        if (strstr(fname, "rules") != NULL || strstr(fname, ".json") != NULL) {
+            int n = Rules_ExportJSON_ForPath(path_param, tx_buf, sizeof(tx_buf));
+            char sd_hdr[320];
+            snprintf(sd_hdr, sizeof(sd_hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json; charset=utf-8\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %d\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n",
+                fname, n);
+            send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+            if (n > 0) {
+                Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+            }
+            return;
+        }
+
+        if (strstr(fname, "boot") != NULL) {
+            int n = SDCard_FormatBootAudit(tx_buf, sizeof(tx_buf));
+            char sd_hdr[320];
+            snprintf(sd_hdr, sizeof(sd_hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %d\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n",
+                fname, n);
+            send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+            if (n > 0) {
+                Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+            }
+            return;
+        }
 
         uint32_t dl_size = SDCard_Stream_DownloadSize(path_param);
         char sd_hdr[320];

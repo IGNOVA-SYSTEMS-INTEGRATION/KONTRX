@@ -139,7 +139,7 @@ volatile uint8_t  g_sys_log_full = 0;
 
 #include "sdcard.h"
 
-static void Do_Offline_Telemetry_Queueing(void);
+static void Do_Offline_Telemetry_Queueing(const char *reason);
 
 /* ======================================================================
  *  Deferred flash writes (Task_LogWriter)
@@ -1738,7 +1738,10 @@ static void Queue_Multi_Channels(const TelemetryBatch_t *batch, uint32_t ts) {
     }
 }
 
-static void Do_Offline_Telemetry_Queueing(void) {
+/* Caches one telemetry snapshot that the broker has not confirmed (PUBACK).
+ * The replay discards it only after a confirmed publish. `reason` names why
+ * it was not delivered, for the event log. */
+static void Do_Offline_Telemetry_Queueing(const char *reason) {
     TelemetryBatch_t batch = {0};
     Modbus_DMA_ConsumeBatch(&batch);
     
@@ -1821,10 +1824,17 @@ static void Do_Offline_Telemetry_Queueing(void) {
     if (cached_any) {
         Queue_Multi_Channels(&batch, g_uptime_seconds);
 
-        char cache_msg[64];
-        snprintf(cache_msg, sizeof(cache_msg), "Broker offline. Telemetry cached. Queue: %lu",
-                 (unsigned long)Partition_Queue_Count());
-        Log_Event("MQTT", cache_msg);
+        /* One summary per minute: caching runs every publish interval */
+        static uint32_t s_cache_log_s = 0;
+        static uint8_t  s_cache_logged = 0;
+        if (!s_cache_logged || (g_uptime_seconds - s_cache_log_s) >= 60U) {
+            char cache_msg[80];
+            snprintf(cache_msg, sizeof(cache_msg), "%s. Telemetry cached. Queue: %lu",
+                     reason, (unsigned long)Partition_Queue_Count());
+            Log_Event("MQTT", cache_msg);
+            s_cache_log_s = g_uptime_seconds;
+            s_cache_logged = 1;
+        }
     }
 }
 
@@ -1915,7 +1925,7 @@ static void Task_MQTTClient(void *arg) {
 
                 uint32_t interval_sec = (s_tasks_cfg.mqtt_interval > 0) ? s_tasks_cfg.mqtt_interval : 5;
                 if ((osKernelGetTickCount() - last_publish) >= pdMS_TO_TICKS(interval_sec * 1000)) {
-                    Do_Offline_Telemetry_Queueing();
+                    Do_Offline_Telemetry_Queueing("DNS failed");
                     last_publish = osKernelGetTickCount();
                 }
                 osDelay(5000); /* 5-second backoff on DNS failure */
@@ -2200,7 +2210,14 @@ static void Task_MQTTClient(void *arg) {
 
 
                         if (s_tasks_cfg.mqtt_tx_enabled == 0) {
-                            /* Publishing paused by Master Transmission Switch */
+                            /* Publishing paused by Master Transmission Switch: keep the
+                             * telemetry on the offline queue at the publish interval; it
+                             * replays once publishing is re-enabled. */
+                            uint32_t interval_sec = (s_tasks_cfg.mqtt_interval > 0) ? s_tasks_cfg.mqtt_interval : 5;
+                            if ((osKernelGetTickCount() - last_publish) >= pdMS_TO_TICKS(interval_sec * 1000)) {
+                                Do_Offline_Telemetry_Queueing("MQTT publishing paused");
+                                last_publish = osKernelGetTickCount();
+                            }
                             osDelay(100);
                             continue;
                         }
@@ -2675,40 +2692,9 @@ static void Task_MQTTClient(void *arg) {
                         } else {
                             Log_Mqtt_Topic(active_topic, pub_payload_str, 0);
                             printf("[MQTT] Publish failed, caching telemetry...\r\n");
-                            uint8_t cached_fail = 0;
-                            for (int m = 0; m < s_tasks_cfg.mqtt_mapping_count; m++) {
-                                if (!s_tasks_cfg.mqtt_mappings[m].enabled) continue;
-                                
-                                OfflineRecord_t rec;
-                                rec.timestamp = g_uptime_seconds;
-                                rec.source_type = s_tasks_cfg.mqtt_mappings[m].source_type;
-                                rec.source_id = s_tasks_cfg.mqtt_mappings[m].source_id;
-                                rec.valid = 0;
-                                rec.value = 0.0f;
-                                rec.temp = 0.0f;
-                                
-                                if (rec.source_type == MAP_SOURCE_SENSOR) {
-                                    for (int s = 0; s < batch.count; s++) {
-                                        if (batch.records[s].id == rec.source_id && batch.records[s].valid) {
-                                            rec.value = batch.records[s].avg_value;
-                                            rec.temp = batch.records[s].avg_temp;
-                                            rec.valid = 1;
-                                            break;
-                                        }
-                                    }
-                                } else if (rec.source_type == MAP_SOURCE_ACTUATOR) {
-                                    rec.value = relayStates[rec.source_id];
-                                    rec.valid = 1;
-                                }
-                                
-                                if (rec.valid) {
-                                    SDCard_Queue_Push(&rec);
-                                    cached_fail = 1;
-                                }
-                            }
-                            if (cached_fail) {
-                                Queue_Multi_Channels(&batch, g_uptime_seconds);
-                            }
+                            /* Not acknowledged (no PUBACK): keep the same full snapshot the
+                             * offline path stores, so it replays after reconnect. */
+                            Do_Offline_Telemetry_Queueing("Publish not acknowledged");
                             break; // Trigger reconnect
                         }
                     }
@@ -2745,7 +2731,7 @@ static void Task_MQTTClient(void *arg) {
             uint32_t interval_sec = (s_tasks_cfg.mqtt_interval > 0) ? s_tasks_cfg.mqtt_interval : 5;
             while (osKernelGetTickCount() - start_retry_ms < pdMS_TO_TICKS(5000)) {
                 if ((osKernelGetTickCount() - last_publish) >= pdMS_TO_TICKS(interval_sec * 1000)) {
-                    Do_Offline_Telemetry_Queueing();
+                    Do_Offline_Telemetry_Queueing("Broker offline");
                     last_publish = osKernelGetTickCount();
                 }
                 osDelay(100);
