@@ -94,10 +94,49 @@ typedef struct {
     uint8_t  valid;
 } BatchRecord_t;
 
+/* Multi-Sensor Board per-channel values for MQTT transmission.
+ * ch[] order: US1..3 distance (mm), Flow1..3 rate (L/min), Temp1..2 (degC). */
+#define MULTI_CH_US       0
+#define MULTI_CH_FLOW     3
+#define MULTI_CH_TEMP     6
+#define MULTI_CH_COUNT    8
+#define MULTI_CH_INVALID  (-1000.0f)   /* channel has no valid reading */
+
+/* Offline queue (OfflineRecord_t.source_type): QUEUE_SOURCE_MULTI_CH + p holds
+ * channel pair p of a board, ch[2p] in value and ch[2p + 1] in temp. */
+#define QUEUE_SOURCE_MULTI_CH   0x10U
+#define QUEUE_MULTI_CH_RECORDS  (MULTI_CH_COUNT / 2)
+
+typedef struct {
+    uint8_t id;
+    uint8_t valid;                 /* board reading valid (same as its BatchRecord_t) */
+    float   ch[MULTI_CH_COUNT];
+} MultiChRecord_t;
+
+/* Mean of the valid channels in [first, first + n); MULTI_CH_INVALID if none. */
+static inline float MultiCh_Avg(const MultiChRecord_t *m, uint8_t first, uint8_t n) {
+    float sum = 0.0f;
+    uint8_t cnt = 0;
+    for (uint8_t i = first; i < first + n && i < MULTI_CH_COUNT; i++) {
+        if (m->ch[i] > MULTI_CH_INVALID + 1.0f) { sum += m->ch[i]; cnt++; }
+    }
+    return cnt ? (sum / cnt) : MULTI_CH_INVALID;
+}
+
 typedef struct {
     BatchRecord_t records[MAX_SENSORS];
     uint8_t       count;
+    MultiChRecord_t multi[MAX_MULTI_US];
+    uint8_t         multi_count;
 } TelemetryBatch_t;
+
+/* Returns the batch's channel record for multi-sensor board `id`, or NULL. */
+static inline const MultiChRecord_t *MultiCh_Find(const TelemetryBatch_t *b, uint8_t id) {
+    for (uint8_t i = 0; i < b->multi_count && i < MAX_MULTI_US; i++) {
+        if (b->multi[i].id == id) return &b->multi[i];
+    }
+    return NULL;
+}
 
 /* Actuator Protocol & State Configuration */
 typedef enum {
