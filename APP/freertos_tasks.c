@@ -947,6 +947,12 @@ static void Task_ControlEngine(void *arg) {
             continue;
         }
 
+        /* Physical SD Card hardware presence supervisor: freeze actuators if card removed */
+        if (SDCard_Hardware_Poll_Lockout()) {
+            osDelay(100);
+            continue;
+        }
+
         /* The Modbus TCP server is polled by Task_IOWorker: its W5500 traffic
          * waits on spiMutex, which must never stall this task. */
 

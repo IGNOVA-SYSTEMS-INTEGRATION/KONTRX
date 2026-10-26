@@ -1,3 +1,8 @@
+#include "stm32f407_regs.h"
+#include "modbus_dma.h"
+#include "pto_motion.h"
+#include "pwm_controller.h"
+#include "freertos_tasks.h"
 #include "sdcard.h"
 #include "flash_partition.h"
 #include "FreeRTOS.h"
@@ -188,15 +193,60 @@ void SDCard_SetCriticalLock(uint8_t locked) {
     s_sd_status.critical_locked = s_sd_critical_locked;
 }
 
+uint8_t SDCard_Hardware_Check_Present(void) {
+    RCC->AHB1ENR |= (1U << 2); // GPIOC clock
+    GPIOC->MODER &= ~(3U << (11 * 2)); // Input mode
+    GPIOC->PUPDR &= ~(3U << (11 * 2));
+    GPIOC->PUPDR |=  (2U << (11 * 2)); // Pull-down
+    for (volatile int d = 0; d < 120; d++);
+    return (GPIOC->IDR & (1U << 11)) ? 1U : 0U;
+}
+
+void SDCard_Emergency_Freeze(void) {
+    for (uint8_t i = 0; i < MAX_RELAYS; i++) {
+        Relay_SetState(i, 0);
+    }
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        PTO_Stop(ch);
+    }
+    for (uint8_t ch = 0; ch < 7; ch++) {
+        PWM_SetDuty(ch, 0.0f);
+    }
+}
+
+uint8_t SDCard_Hardware_Poll_Lockout(void) {
+    if (s_sd_critical_locked) {
+        return 1;
+    }
+    static uint8_t s_missing_count = 0;
+    if (SDCard_Hardware_Check_Present() == 0) {
+        s_missing_count++;
+        if (s_missing_count >= 3) {
+            s_sd_critical_locked = 1;
+            s_sd_status.critical_locked = 1;
+            SDCard_Emergency_Freeze();
+            Log_Event("SYS", "CRITICAL LOCKDOWN: SD Card physically removed! Actuators frozen.");
+            return 1;
+        }
+    } else {
+        s_missing_count = 0;
+    }
+    return 0;
+}
+
 uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd) {
     if (!pwd) return 0;
     const char *expected = (admin_pwd && admin_pwd[0]) ? admin_pwd : "adminkontrx";
-    if (strcmp(pwd, expected) == 0) {
-        s_sd_critical_locked = 0;
-        s_sd_status.critical_locked = 0;
-        return 1;
+    if (strcmp(pwd, expected) != 0) {
+        return 0; // Invalid password
     }
-    return 0;
+    if (SDCard_Hardware_Check_Present() == 0) {
+        return 2; // Password valid, but card still physically removed!
+    }
+    s_sd_critical_locked = 0;
+    s_sd_status.critical_locked = 0;
+    Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Admin authenticated, SD Card present.");
+    return 1;
 }
 
 void SDCard_GetStatus(SDCard_Status_t *status) {

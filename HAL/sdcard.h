@@ -27,6 +27,11 @@ uint8_t SDCard_IsCriticalLocked(void);
 void    SDCard_SetCriticalLock(uint8_t locked);
 uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd);
 
+/* Physical Hardware Detection & Emergency Freeze */
+uint8_t SDCard_Hardware_Check_Present(void);
+uint8_t SDCard_Hardware_Poll_Lockout(void);
+void    SDCard_Emergency_Freeze(void);
+
 /* Get live SD Card metrics */
 void SDCard_GetStatus(SDCard_Status_t *status);
 
