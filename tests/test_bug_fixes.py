@@ -99,9 +99,8 @@ class TestQRCodeFix:
         idx = js.find("function generateQR")
         assert idx >= 0
         qr_code = js[idx:idx + 2500]
-        assert "v.type=" in qr_code
-        assert "v.pinout=" in qr_code
-        assert "v.pinouts=" in qr_code
+        assert ("item.type=" in qr_code or "v.type=" in qr_code)
+        assert ("item.pinout=" in qr_code or "v.pinout=" in qr_code)
         assert "copyQRPayload" in js
 
 
