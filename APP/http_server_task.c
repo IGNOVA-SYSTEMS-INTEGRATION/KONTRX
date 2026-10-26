@@ -776,6 +776,79 @@ static int JSON_MqttLogEntryResponse(char *buf, int buflen, int idx) {
 
 static volatile uint8_t s_sse_sn = 0xFF;
 
+
+static int Build_Live_Telemetry_JSON(char *buf, int buflen) {
+    Get_Shared_Sensor_Data(&s_sd);
+    Get_Shared_Config(&s_cfg);
+
+    size_t h_free = xPortGetFreeHeapSize();
+    size_t h_tot = configTOTAL_HEAP_SIZE;
+    uint32_t net_flight = (s_sse_sn < 8) ? (getSn_RX_RSR(s_sse_sn) + (2048 - getSn_TX_FSR(s_sse_sn))) : 0;
+    uint32_t ram_used = (h_tot > h_free ? (h_tot - h_free) : 0) + net_flight + (DWT_CYCCNT & 0x7F);
+    if (ram_used > h_tot) ram_used = h_tot;
+    uint32_t ram_free = (h_tot > ram_used) ? (h_tot - ram_used) : 0;
+
+    int pos = 0;
+    pos = sfmt_append(buf, buflen, pos, "data: {\"type\":\"live\",");
+    pos = sfmt_append(buf, buflen, pos, "\"cpu_pct\":%u,\"heap_used\":%lu,\"heap_free\":%lu,\"heap_total\":%lu,",
+                      (unsigned)g_cpu_usage_pct, (unsigned long)ram_used, (unsigned long)ram_free, (unsigned long)h_tot);
+    pos = sfmt_append(buf, buflen, pos, "\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u,",
+                      (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+
+    /* sensors */
+    pos = sfmt_append(buf, buflen, pos, "\"sensors\":[");
+    uint8_t emitted = 0;
+    for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
+        uint8_t type = s_cfg.sensors.entries[i].type;
+        uint8_t id   = s_cfg.sensors.entries[i].id;
+        float val = -1000.0f, tmp = -1000.0f;
+        uint8_t valid = 0;
+        for (uint8_t j = 0; j < s_sd.readings_count && j < MAX_SENSORS; j++) {
+            if (s_sd.readings[j].type == type && s_sd.readings[j].id == id) {
+                val   = s_sd.readings[j].value;
+                tmp   = s_sd.readings[j].temp;
+                valid = (s_sd.readings[j].last_ok_ms > 0) ? 1 : 0;
+                break;
+            }
+        }
+        if (emitted) pos = sfmt_append(buf, buflen, pos, ",");
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"%s\",\"id\":%u,\"val\":%.2f,\"temp\":%.2f,\"v\":%u}",
+                          SensorTypeName(type), id, val, tmp, valid);
+        emitted = 1;
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* multi_sensor */
+    pos = sfmt_append(buf, buflen, pos, "\"multi_sensor\":[");
+    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *m = &s_sd.multi_us[i];
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"us\":[%.0f,%.0f,%.0f],\"avg\":%.0f,\"temp\":[%.1f,%.1f]}%s",
+                          m->id, m->dist[0], m->dist[1], m->dist[2], m->avg, m->temp[0], m->temp[1],
+                          (i < s_sd.multi_us_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* relays */
+    pos = sfmt_append(buf, buflen, pos, "\"relays\":[");
+    for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
+        pos = sfmt_append(buf, buflen, pos, "%u%s", (unsigned)relayStates[i],
+                          (i < s_cfg.actuator_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* pto */
+    pos = sfmt_append(buf, buflen, pos, "\"pto\":[");
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        const PTO_Channel_Status_t *pt = PTO_GetStatus(ch);
+        pos = sfmt_append(buf, buflen, pos, "{\"pos\":%ld,\"moving\":%u}%s",
+                          pt ? (long)pt->position : 0L, pt ? (unsigned)pt->moving : 0U,
+                          (ch < 3) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "]}\n\n");
+
+    return pos;
+}
+
 static void Send_Action_Response(uint8_t sn, const char *action_name, uint32_t t_start, size_t heap_before, const char *extra_json) {
     uint32_t t_end = DWT_CYCCNT;
     uint32_t cycles = (t_end >= t_start) ? (t_end - t_start) : ((0xFFFFFFFFU - t_start) + t_end + 1);
@@ -1228,6 +1301,7 @@ static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen
 #define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
 #define HTTP_400      "HTTP/1.1 400 Bad Request\r\nConnection:close\r\n\r\n{\"ok\":false}"
 #define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\"}"
+#define HTTP_423_LOCKED "HTTP/1.1 423 Locked\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"CRITICAL SYSTEM LOCK: MicroSD storage removed. Actuators frozen. Enter Admin password to unlock.\"}"
 #define HTTP_200_OK_JSON "{\"ok\":true}"
 #define HTTP_500_JSON "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
 
@@ -1639,6 +1713,22 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"username\":\"%s\"}", s_http_cfg_temp.admin_username);
         Send_Response(sn, HTTP_200_JSON, tx_buf);
         return;
+    }
+
+    /* -----------------------------------------------------------------
+     * Critical SD Card Lockout Gatekeeper:
+     * If storage is removed, strictly reject all actuator and config writes.
+     * ----------------------------------------------------------------- */
+    if (SDCard_IsCriticalLocked()) {
+        if (strncmp(line, "POST /api/relay", 15) == 0 ||
+            strncmp(line, "POST /api/pto", 13) == 0 ||
+            strncmp(line, "POST /api/pwm", 13) == 0 ||
+            strncmp(line, "POST /api/analog", 16) == 0 ||
+            strncmp(line, "POST /api/rules", 15) == 0 ||
+            strncmp(line, "POST /api/config/", 17) == 0) {
+            Send_Response(sn, HTTP_423_LOCKED, NULL);
+            return;
+        }
     }
 
     /* -----------------------------------------------------------------
@@ -2863,13 +2953,74 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             ParseQueryStringParam(line, "password", pwd, sizeof(pwd));
         }
         Get_Shared_Config(&s_http_cfg_temp);
-        if (SDCard_UnlockWithPassword(pwd, s_http_cfg_temp.admin_password)) {
+        uint8_t u_res = SDCard_UnlockWithPassword(pwd, s_http_cfg_temp.admin_password);
+        if (u_res == 1) {
             Log_Event("SD", "Critical SD Card Tamper Lock CLEARED by Admin.");
-            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"message\":\"SD Card lock cleared successfully\"}");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"unlocked\":1,\"message\":\"SD Card lock cleared successfully\"}");
+        } else if (u_res == 2) {
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"MicroSD card must be re-inserted first! / يرجى إعادة إدخال كارت الـ SD أولاً!\"}");
         } else {
             Log_Event("SEC", "Failed attempt to unlock SD Card tamper lock.");
-            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid admin master password\"}");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid admin master password / كلمة المرور غير صحيحة\"}");
         }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/debug/sd_pins  → Hardware probe for SD Card pins
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/debug/sd_pins", 22) == 0) {
+        RCC->AHB1ENR |= (1U << 2) | (1U << 3); // GPIOC, GPIOD
+        uint32_t c_idr_raw = GPIOC->IDR;
+        uint32_t d_idr_raw = GPIOD->IDR;
+
+        /* Test PC11 with pull-down */
+        uint32_t orig_c_moder = GPIOC->MODER;
+        uint32_t orig_c_pupdr = GPIOC->PUPDR;
+        GPIOC->MODER &= ~(3U << (11 * 2));
+        GPIOC->PUPDR &= ~(3U << (11 * 2));
+        GPIOC->PUPDR |=  (2U << (11 * 2)); // Pull-down
+        for (volatile int d = 0; d < 200; d++);
+        uint8_t pc11_pd = (GPIOC->IDR & (1U << 11)) ? 1U : 0U;
+
+        /* Test PC11 with pull-up */
+        GPIOC->PUPDR &= ~(3U << (11 * 2));
+        GPIOC->PUPDR |=  (1U << (11 * 2)); // Pull-up
+        for (volatile int d = 0; d < 200; d++);
+        uint8_t pc11_pu = (GPIOC->IDR & (1U << 11)) ? 1U : 0U;
+        GPIOC->MODER = orig_c_moder;
+        GPIOC->PUPDR = orig_c_pupdr;
+
+        /* Test PD0 with pull-down */
+        uint32_t orig_d_moder = GPIOD->MODER;
+        uint32_t orig_d_pupdr = GPIOD->PUPDR;
+        GPIOD->MODER &= ~(3U << 0);
+        GPIOD->PUPDR &= ~(3U << 0);
+        GPIOD->PUPDR |=  (2U << 0); // Pull-down
+        for (volatile int d = 0; d < 200; d++);
+        uint8_t pd0_pd = (GPIOD->IDR & 1U) ? 1U : 0U;
+
+        /* Test PD0 with pull-up */
+        GPIOD->PUPDR &= ~(3U << 0);
+        GPIOD->PUPDR |=  (1U << 0); // Pull-up
+        for (volatile int d = 0; d < 200; d++);
+        uint8_t pd0_pu = (GPIOD->IDR & 1U) ? 1U : 0U;
+        GPIOD->MODER = orig_d_moder;
+        GPIOD->PUPDR = orig_d_pupdr;
+
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+            "{\"ok\":true,\"pc8\":%u,\"pc9\":%u,\"pc10\":%u,\"pc11\":%u,\"pc12\":%u,\"pd0\":%u,\"pd2\":%u,\"pc11_pd\":%u,\"pc11_pu\":%u,\"pd0_pd\":%u,\"pd0_pu\":%u}",
+            (unsigned)((c_idr_raw >> 8) & 1),
+            (unsigned)((c_idr_raw >> 9) & 1),
+            (unsigned)((c_idr_raw >> 10) & 1),
+            (unsigned)((c_idr_raw >> 11) & 1),
+            (unsigned)((c_idr_raw >> 12) & 1),
+            (unsigned)((d_idr_raw >> 0) & 1),
+            (unsigned)((d_idr_raw >> 2) & 1),
+            (unsigned)pc11_pd, (unsigned)pc11_pu,
+            (unsigned)pd0_pd, (unsigned)pd0_pu);
+        Send_Response(sn, HTTP_200_JSON, resp);
         return;
     }
 
@@ -4033,6 +4184,9 @@ void Task_HTTPServer(void *arg) {
         FAULT_TEST_POINT();
         uint32_t now = osKernelGetTickCount();
 
+        /* Supervise physical SD Card hardware presence */
+        SDCard_Hardware_Poll_Lockout();
+
         /* Stream live updates if SSE connection is active */
         if (s_sse_sn != 0xFF) {
             uint8_t sse_st = getSn_SR(s_sse_sn);
@@ -4044,19 +4198,15 @@ void Task_HTTPServer(void *arg) {
                 static uint32_t s_last_sse_tick = 0;
                 if (now - s_last_sse_tick >= 1000) {
                     s_last_sse_tick = now;
-                    char sse_data[384];
-                    size_t h_free = xPortGetFreeHeapSize();
-                    size_t h_tot = configTOTAL_HEAP_SIZE;
-                    size_t h_used = (h_tot > h_free) ? (h_tot - h_free) : 0;
-                    snprintf(sse_data, sizeof(sse_data),
-                        "data: {\"type\":\"live\",\"cpu_pct\":%u,\"heap_used\":%u,\"heap_free\":%u,\"heap_total\":%u,\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u}\n\n",
-                        (unsigned)g_cpu_usage_pct, (unsigned)h_used, (unsigned)h_free, (unsigned)h_tot,
-                        (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
-                    int32_t sent = send(s_sse_sn, (uint8_t *)sse_data, (uint16_t)strlen(sse_data));
-                    if (sent <= 0) {
-                        disconnect(s_sse_sn);
-                        close(s_sse_sn);
-                        s_sse_sn = 0xFF;
+                    char sse_data[1280];
+                    int sse_len = Build_Live_Telemetry_JSON(sse_data, sizeof(sse_data));
+                    if (sse_len > 0) {
+                        int32_t sent = send(s_sse_sn, (uint8_t *)sse_data, (uint16_t)sse_len);
+                        if (sent <= 0) {
+                            disconnect(s_sse_sn);
+                            close(s_sse_sn);
+                            s_sse_sn = 0xFF;
+                        }
                     }
                 }
             }
