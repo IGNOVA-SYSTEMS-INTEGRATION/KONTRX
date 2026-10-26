@@ -2887,6 +2887,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * GET /api/events  → Server-Sent Events (SSE) Real-Time Data Push Stream
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/events", 15) == 0) {
+        if (s_sse_sn != 0xFF && s_sse_sn != sn) {
+            disconnect(s_sse_sn);
+            close(s_sse_sn);
+        }
+        s_sse_sn = sn;
         const char *sse_hdr =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
@@ -2894,7 +2899,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Connection: keep-alive\r\n"
             "Access-Control-Allow-Origin: *\r\n\r\n";
         send(sn, (uint8_t *)sse_hdr, (uint16_t)strlen(sse_hdr));
-        s_sse_sn = sn;
         char init_ev[256];
         snprintf(init_ev, sizeof(init_ev),
             "data: {\"type\":\"connected\",\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u}\n\n",
@@ -4033,6 +4037,7 @@ void Task_HTTPServer(void *arg) {
         if (s_sse_sn != 0xFF) {
             uint8_t sse_st = getSn_SR(s_sse_sn);
             if (sse_st != SOCK_ESTABLISHED) {
+                disconnect(s_sse_sn);
                 close(s_sse_sn);
                 s_sse_sn = 0xFF;
             } else {
@@ -4047,7 +4052,12 @@ void Task_HTTPServer(void *arg) {
                         "data: {\"type\":\"live\",\"cpu_pct\":%u,\"heap_used\":%u,\"heap_free\":%u,\"heap_total\":%u,\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u}\n\n",
                         (unsigned)g_cpu_usage_pct, (unsigned)h_used, (unsigned)h_free, (unsigned)h_tot,
                         (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
-                    send(s_sse_sn, (uint8_t *)sse_data, (uint16_t)strlen(sse_data));
+                    int32_t sent = send(s_sse_sn, (uint8_t *)sse_data, (uint16_t)strlen(sse_data));
+                    if (sent <= 0) {
+                        disconnect(s_sse_sn);
+                        close(s_sse_sn);
+                        s_sse_sn = 0xFF;
+                    }
                 }
             }
         }
@@ -4103,6 +4113,10 @@ void Task_HTTPServer(void *arg) {
              * ESTABLISHED → receive and dispatch an HTTP request
              * -------------------------------------------------------------- */
             case SOCK_ESTABLISHED:
+                /* If this socket is streaming SSE, do not process regular HTTP or timeout */
+                if (sn == s_sse_sn) {
+                    break;
+                }
                 /* If this socket was already commanded to disconnect, don't re-dispatch */
                 if (s_sock_teardown_tick[sn] != 0) {
                     if (now - s_sock_teardown_tick[sn] > 50) {
@@ -4194,6 +4208,11 @@ void Task_HTTPServer(void *arg) {
                         }
 
                         if (total > 0) Dispatch_Request(sn, rx_buf, total);
+
+                        if (sn == s_sse_sn) {
+                            /* Socket converted to persistent SSE stream; do not flush or disconnect */
+                            break;
+                        }
                         
                         /* Flush any leftover/overflow bytes in the socket RX buffer */
                         uint16_t rem_size;
