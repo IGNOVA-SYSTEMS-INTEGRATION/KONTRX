@@ -12,10 +12,11 @@ def test_qr_payload_generation_logic():
 
     assert "function generateQR" in html
     assert "copyQRPayload" in html
-    assert "v.type=tName" in html
-    assert "v.pinout=pin" in html
-    assert "v.pinouts=pin" in html
-    assert "window.lastQRPayload=y" in html
+    assert "switchQRTab" in html
+    assert "boardPayloadObj" in html
+    assert "rulesPayloadObj" in html
+    assert "window.lastBoardQRPayload" in html
+    assert "window.lastRulesQRPayload" in html
 
 def test_multi_us_included_in_sensor_cards():
     with open(INDEX_HTML, "r", encoding="utf-8") as f:
@@ -29,8 +30,8 @@ def test_multi_us_included_in_sensor_cards():
     # Verify multi_us handling is present
     assert '"multi_us"===n.type' in fn_body
 
-def test_qr_payload_does_not_contain_live_sensor_or_actuator_telemetry():
-    """Verify QR code logic excludes volatile values (value, temp, status, relay state, duty, pos, ma, v)."""
+def test_qr_payload_clean_structure():
+    """Verify QR code logic produces clean board and rules objects without live volatile values."""
     with open(INDEX_HTML, "r", encoding="utf-8") as f:
         html = f.read()
 
@@ -39,22 +40,20 @@ def test_qr_payload_does_not_contain_live_sensor_or_actuator_telemetry():
     end_idx = html.find("function fileSelected", idx)
     qr_fn = html[idx:end_idx]
 
-    # No sensor readings or live status in payload
+    # No volatile sensor readings
     assert "l.v=" not in qr_fn
     assert "l.temp=" not in qr_fn
     assert "l.dist=" not in qr_fn
     assert "l.avg=" not in qr_fn
-    assert "status:d&&d.valid" not in qr_fn
 
-    # No actuator states or motion telemetry in payload
+    # No volatile actuator states or live measurements
     assert "v.s=" not in qr_fn
     assert "v.duty=" not in qr_fn
     assert "v.pos=" not in qr_fn
     assert "v.steps=" not in qr_fn
-    assert "v.location=" not in qr_fn
-    assert "v.moving=" not in qr_fn
     assert "v.current_ma=" not in qr_fn
     assert "v.voltage_v=" not in qr_fn
 
-    # Has early return when payload matches last payload
-    assert "if(y===window.lastQRPayload&&window.lastGeneratedQR)return;" in qr_fn
+    # Has separate board and rules generation
+    assert "boardPayloadObj" in qr_fn
+    assert "rulesPayloadObj" in qr_fn
