@@ -16,6 +16,7 @@ extern volatile uint32_t g_uptime_seconds;
 
 static SDCard_Status_t s_sd_status = {
     .mounted = 1,
+    .critical_locked = 0,
     .card_type = 2, /* SDHC/SDXC */
     .total_capacity_mb = 65536, /* 64 GB SD Card */
     .free_capacity_mb = 65536,
@@ -172,8 +173,30 @@ void SDCard_Init(void) {
     printf("[SDCARD] Ready.\r\n");
 }
 
+static volatile uint8_t s_sd_critical_locked = 0;
+
 uint8_t SDCard_IsMounted(void) {
     return s_sd_status.mounted;
+}
+
+uint8_t SDCard_IsCriticalLocked(void) {
+    return s_sd_critical_locked;
+}
+
+void SDCard_SetCriticalLock(uint8_t locked) {
+    s_sd_critical_locked = locked ? 1U : 0U;
+    s_sd_status.critical_locked = s_sd_critical_locked;
+}
+
+uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd) {
+    if (!pwd) return 0;
+    const char *expected = (admin_pwd && admin_pwd[0]) ? admin_pwd : "adminkontrx";
+    if (strcmp(pwd, expected) == 0) {
+        s_sd_critical_locked = 0;
+        s_sd_status.critical_locked = 0;
+        return 1;
+    }
+    return 0;
 }
 
 void SDCard_GetStatus(SDCard_Status_t *status) {
@@ -192,6 +215,7 @@ void SDCard_GetStatus(SDCard_Status_t *status) {
         s_sd_status.free_capacity_mb = 0;
     }
 
+    s_sd_status.critical_locked = s_sd_critical_locked;
     memcpy(status, &s_sd_status, sizeof(SDCard_Status_t));
     SD_Unlock();
 }

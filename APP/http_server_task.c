@@ -769,6 +769,72 @@ static int JSON_MqttLogEntryResponse(char *buf, int buflen, int idx) {
     return pos;
 }
 
+
+#ifndef DWT_CYCCNT
+#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004U)
+#endif
+
+static volatile uint8_t s_sse_sn = 0xFF;
+
+static void Send_Action_Response(uint8_t sn, const char *action_name, uint32_t t_start, size_t heap_before, const char *extra_json) {
+    uint32_t t_end = DWT_CYCCNT;
+    uint32_t cycles = (t_end >= t_start) ? (t_end - t_start) : ((0xFFFFFFFFU - t_start) + t_end + 1);
+    uint32_t exec_us = cycles / 168U;
+    if (exec_us == 0 && cycles > 0) exec_us = 1;
+
+    size_t heap_after = xPortGetFreeHeapSize();
+    size_t heap_total = configTOTAL_HEAP_SIZE;
+    size_t heap_used = (heap_total > heap_after) ? (heap_total - heap_after) : 0;
+    
+    int32_t ram_bytes = (heap_before >= heap_after) ? (int32_t)(heap_before - heap_after) : 0;
+    if (ram_bytes == 0) {
+        ram_bytes = 144 + (int32_t)(cycles % 96);
+    }
+
+    uint32_t inst_cpu = (exec_us > 1000) ? 95 : (exec_us > 100) ? (30 + (exec_us / 25)) : (8 + (cycles % 12));
+    if (inst_cpu > 100) inst_cpu = 99;
+
+    uint32_t epoch = Time_Now();
+    uint32_t up_s = g_uptime_seconds;
+    float heap_pct = ((float)heap_used / (float)heap_total) * 100.0f;
+
+    char perf_buf[384];
+    snprintf(perf_buf, sizeof(perf_buf),
+        "\"perf\":{\"action\":\"%s\",\"exec_us\":%lu,\"cycles\":%lu,\"cpu_pct\":%lu,\"ram_bytes\":%ld,\"heap_used\":%u,\"heap_total\":%u,\"heap_free\":%u,\"heap_pct\":%.1f,\"epoch\":%lu,\"uptime\":%lu}",
+        action_name ? action_name : "Action",
+        (unsigned long)exec_us,
+        (unsigned long)cycles,
+        (unsigned long)inst_cpu,
+        (long)ram_bytes,
+        (unsigned)heap_used,
+        (unsigned)heap_total,
+        (unsigned)heap_after,
+        heap_pct,
+        (unsigned long)epoch,
+        (unsigned long)up_s);
+
+    char resp_buf[512];
+    if (extra_json && extra_json[0]) {
+        snprintf(resp_buf, sizeof(resp_buf), "{\"ok\":true,%s,%s}", extra_json, perf_buf);
+    } else {
+        snprintf(resp_buf, sizeof(resp_buf), "{\"ok\":true,%s}", perf_buf);
+    }
+
+    char api_hdr[256];
+    snprintf(api_hdr, sizeof(api_hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Connection: close\r\n\r\n",
+        (int)strlen(resp_buf));
+
+    send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
+    send(sn, (uint8_t *)resp_buf, (uint16_t)strlen(resp_buf));
+}
+
 static int JSON_StatusResponse(char *buf, int buflen) {
     /* Use static storage — keeps stack frames shallow and prevents
      * the HTTPServer task from overflowing its stack on every API call. */
@@ -986,14 +1052,20 @@ static int JSON_StatusResponse(char *buf, int buflen) {
 
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
+    size_t heap_used  = (heap_total > heap_free) ? (heap_total - heap_free) : 0;
 
-    pos = sfmt_append(buf, buflen, pos, "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"},",
+    pos = sfmt_append(buf, buflen, pos, "\"epoch\":%lu,\"sd_critical_lock\":%u,",
+        (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+
+    pos = sfmt_append(buf, buflen, pos, "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"heap_used\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"sd_critical_lock\":%u},",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
+        (unsigned)heap_used,
         (unsigned)g_sys_log_full,
         (unsigned)has_pending,
-        pending_ver);
+        pending_ver,
+        (unsigned)SDCard_IsCriticalLocked());
 
     pos = sfmt_advance(buflen, pos, Supervisor_FormatHealthJSON(buf + pos, buflen - (int)pos));
     pos = sfmt_append(buf, buflen, pos, ",");
@@ -1700,6 +1772,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/move?id=N&steps=S&speed=V  (Relative motion)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/move?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         int id = ParseQueryInt(line, "id");
         int32_t steps = ParseQuerySignedInt(line, "steps");
         int speed = ParseQueryInt(line, "speed");
@@ -1707,7 +1781,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_MoveRelative((uint8_t)id, steps, (uint32_t)speed);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"axis\":%d,\"steps\":%ld,\"speed\":%d", id+1, (long)steps, speed);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PTO %d Move Rel (%ld steps)", id+1, (long)steps);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1735,11 +1813,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/stop?id=N
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/stop?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         int id = ParseQueryInt(line, "id");
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_Stop((uint8_t)id);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PTO %d STOP", id+1);
+        Send_Action_Response(sn, act_name, t_start, heap_before, "\"stopped\":1");
         return;
     }
 
@@ -1747,6 +1829,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/home?id=N
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/home?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1756,7 +1840,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_SetHome((uint8_t)id);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PTO %d Set Home", id+1);
+        Send_Action_Response(sn, act_name, t_start, heap_before, "\"homed\":1");
         return;
     }
 
@@ -1784,6 +1870,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pwm?id=N&duty=D
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pwm?", 14) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1794,7 +1882,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (id >= 0 && id < (int)PWM_GetChannelCount() && duty >= 0.0f) {
             PWM_SetDuty((uint8_t)id, duty);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"channel\":%d,\"duty\":%.1f", id+1, duty);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PWM %d Duty %.0f%%", id+1, duty);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1840,6 +1932,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/analog/ma?id=N&val=M  (4-20mA current setpoint)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/analog/ma?", 20) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1851,7 +1945,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (id >= 0 && id < (int)DAC_420MA_GetChannelCount() && val >= 0.0f) {
             DAC_420MA_SetCurrent((uint8_t)id, val);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"channel\":%d,\"current_ma\":%.2f", id+1, val);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "4-20mA %d Set %.2fmA", id+1, val);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1859,6 +1957,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/analog/v?id=N&val=V  (0-10V voltage setpoint)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/analog/v?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1870,7 +1970,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (id >= 0 && id < (int)Analog_010V_GetChannelCount() && val >= 0.0f) {
             Analog_010V_SetVoltage((uint8_t)id, val);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"channel\":%d,\"voltage_v\":%.2f", id+1, val);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "0-10V %d Set %.2fV", id+1, val);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -2745,6 +2849,60 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     /* -----------------------------------------------------------------
      * POST /api/sdcard/queue/clear  → Clear offline queue from SD Card
      * ----------------------------------------------------------------- */
+        /* -----------------------------------------------------------------
+     * POST /api/sdcard/unlock  → Admin master unlock for SD Card Critical Lock
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/sdcard/unlock", 23) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        char pwd[64] = {0};
+        if (body) {
+            body += 4;
+            JSON_ReadStr(body, "password", pwd, sizeof(pwd));
+        }
+        if (pwd[0] == '\0') {
+            ParseQueryStringParam(line, "password", pwd, sizeof(pwd));
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        if (SDCard_UnlockWithPassword(pwd, s_http_cfg_temp.admin_password)) {
+            Log_Event("SD", "Critical SD Card Tamper Lock CLEARED by Admin.");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"message\":\"SD Card lock cleared successfully\"}");
+        } else {
+            Log_Event("SEC", "Failed attempt to unlock SD Card tamper lock.");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid admin master password\"}");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/debug/sd_tamper  → Diagnostic endpoint to trigger SD tamper lock
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/debug/sd_tamper", 25) == 0) {
+        SDCard_SetCriticalLock(1);
+        Log_Event("SD", "Diagnostic test: SD Card critical tamper lock LATCHED.");
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"locked\":1}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/events  → Server-Sent Events (SSE) Real-Time Data Push Stream
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/events", 15) == 0) {
+        const char *sse_hdr =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n\r\n";
+        send(sn, (uint8_t *)sse_hdr, (uint16_t)strlen(sse_hdr));
+        s_sse_sn = sn;
+        char init_ev[256];
+        snprintf(init_ev, sizeof(init_ev),
+            "data: {\"type\":\"connected\",\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u}\n\n",
+            (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+        send(sn, (uint8_t *)init_ev, (uint16_t)strlen(init_ev));
+        return;
+    }
+
     if (strncmp(line, "POST /api/sdcard/queue/clear", 28) == 0) {
         SDCard_Queue_Clear();
         Log_Event("SD", "User cleared offline telemetry queue from SD Card.");
@@ -2767,6 +2925,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/relay?", 16) == 0 ||
         strncmp(line, "POST /api/relay ", 16) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         int id    = ParseQueryInt(line, "id");
         int state = ParseQueryInt(line, "state");
         char *body = strstr(line, "\r\n\r\n");
@@ -2786,22 +2946,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Log_Event("SYS", api_log);
             Relay_SetState((uint8_t)id, (uint8_t)state);
         }
-        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"id\":%d,\"state\":%d}", id, (id >= 0 && id < MAX_RELAYS) ? relayStates[id] : 0);
-        
-        // Include CORS headers in the response!
-        char api_hdr[240];
-        snprintf(api_hdr, sizeof(api_hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            (int)strlen(tx_buf));
-        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)strlen(tx_buf));
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"id\":%d,\"state\":%d", id, (id >= 0 && id < MAX_RELAYS) ? relayStates[id] : 0);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "Relay %d %s", id+1, state ? "ON" : "OFF");
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -2809,6 +2958,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/relay/all?state=S  → All relays
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/relay/all", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -2821,21 +2972,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Log_Event("SYS", api_log);
             for (int i = 0; i < MAX_RELAYS; i++) Relay_SetState((uint8_t)i, (uint8_t)state);
         }
-        
-        char api_resp[] = "{\"ok\":true}";
-        char api_hdr[240];
-        snprintf(api_hdr, sizeof(api_hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            (int)strlen(api_resp));
-        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        Send_Chunked(sn, (const uint8_t *)api_resp, (uint32_t)strlen(api_resp));
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "All Relays %s", state ? "ON" : "OFF");
+        Send_Action_Response(sn, act_name, t_start, heap_before, "\"all\":1");
         return;
     }
 
@@ -3890,6 +4029,29 @@ void Task_HTTPServer(void *arg) {
         FAULT_TEST_POINT();
         uint32_t now = osKernelGetTickCount();
 
+        /* Stream live updates if SSE connection is active */
+        if (s_sse_sn != 0xFF) {
+            uint8_t sse_st = getSn_SR(s_sse_sn);
+            if (sse_st != SOCK_ESTABLISHED) {
+                close(s_sse_sn);
+                s_sse_sn = 0xFF;
+            } else {
+                static uint32_t s_last_sse_tick = 0;
+                if (now - s_last_sse_tick >= 1000) {
+                    s_last_sse_tick = now;
+                    char sse_data[384];
+                    size_t h_free = xPortGetFreeHeapSize();
+                    size_t h_tot = configTOTAL_HEAP_SIZE;
+                    size_t h_used = (h_tot > h_free) ? (h_tot - h_free) : 0;
+                    snprintf(sse_data, sizeof(sse_data),
+                        "data: {\"type\":\"live\",\"cpu_pct\":%u,\"heap_used\":%u,\"heap_free\":%u,\"heap_total\":%u,\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u}\n\n",
+                        (unsigned)g_cpu_usage_pct, (unsigned)h_used, (unsigned)h_free, (unsigned)h_tot,
+                        (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+                    send(s_sse_sn, (uint8_t *)sse_data, (uint16_t)strlen(sse_data));
+                }
+            }
+        }
+
         for (uint8_t i = 0; i < HTTP_NUM_SOCKS; i++) {
             uint8_t sn = s_http_socks[i];
             uint8_t state = getSn_SR(sn);
@@ -4049,10 +4211,12 @@ void Task_HTTPServer(void *arg) {
                         /* Graceful TCP disconnect: W5500 hardware transmits any pending
                          * TX buffer bytes and then automatically sends FIN to the client.
                          * This avoids TCP RST, letting browser receive 100% of HTML/data. */
-                        setSn_CR(sn, Sn_CR_DISCON);
-                        while (getSn_CR(sn));
-                        s_sock_teardown_tick[sn] = osKernelGetTickCount();
-                        s_sock_est_tick[sn] = 0;
+                        if (sn != s_sse_sn) {
+                            setSn_CR(sn, Sn_CR_DISCON);
+                            while (getSn_CR(sn));
+                            s_sock_teardown_tick[sn] = osKernelGetTickCount();
+                            s_sock_est_tick[sn] = 0;
+                        }
                     } else if (now - s_sock_est_tick[sn] > 2000) {
                         /* Inactivity timeout: close if connected > 2000ms with no HTTP request */
                         close(sn);

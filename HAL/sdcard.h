@@ -7,6 +7,7 @@
 
 typedef struct {
     uint8_t  mounted;
+    uint8_t  critical_locked; /* 1 if SD card disconnected/tampered and awaiting admin unlock */
     uint8_t  card_type; /* 0=None, 1=SDSC, 2=SDHC/SDXC */
     uint32_t total_capacity_mb;
     uint32_t free_capacity_mb;
@@ -20,6 +21,11 @@ void SDCard_Init(void);
 
 /* Check if SD Card is mounted & operational */
 uint8_t SDCard_IsMounted(void);
+
+/* Critical Security Lockdown for SD Card Disconnect / Tamper */
+uint8_t SDCard_IsCriticalLocked(void);
+void    SDCard_SetCriticalLock(uint8_t locked);
+uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd);
 
 /* Get live SD Card metrics */
 void SDCard_GetStatus(SDCard_Status_t *status);
