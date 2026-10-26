@@ -696,18 +696,76 @@ static int JSON_MqttLogResponse(char *buf, int buflen) {
         }
         clean_payload[cpos] = '\0';
 
-        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"size\":%u}",
             emitted_log ? "," : "",
             g_mqtt_status.log[i].topic,
             clean_payload,
             g_mqtt_status.log[i].success,
-            (unsigned long)g_mqtt_status.log[i].timestamp);
+            (unsigned long)g_mqtt_status.log[i].timestamp,
+            (unsigned int)strlen((const char *)g_mqtt_status.log[i].payload));
         emitted_log = 1;
     }
     if (locked) {
         osMutexRelease(sensorMutex);
     }
     pos = sfmt_append(buf, buflen, pos, "]}");
+    return pos;
+}
+
+/* Returns full detail of a single MQTT transmission log entry (idx 0..MQTT_LOG_MAX-1).
+ * The entire payload (up to 2048 bytes) is JSON-escaped directly into buf without truncation. */
+static int JSON_MqttLogEntryResponse(char *buf, int buflen, int idx) {
+    if (idx < 0 || idx >= MQTT_LOG_MAX) {
+        return snprintf(buf, buflen, "{\"ok\":false,\"error\":\"Invalid index\"}");
+    }
+
+    uint8_t locked = 0;
+    if (sensorMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        if (osMutexAcquire(sensorMutex, 10) == osOK) {
+            locked = 1;
+        }
+    }
+
+    if (g_mqtt_status.log[idx].topic[0] == '\0') {
+        if (locked) osMutexRelease(sensorMutex);
+        return snprintf(buf, buflen, "{\"ok\":false,\"error\":\"Entry not found\"}");
+    }
+
+    const char *raw = (const char *)g_mqtt_status.log[idx].payload;
+    size_t raw_len = strlen(raw);
+
+    int pos = 0;
+    pos = sfmt_append(buf, buflen, pos,
+        "{\"ok\":true,\"idx\":%d,\"topic\":\"%s\",\"success\":%u,\"time\":%lu,\"size\":%u,\"payload\":\"",
+        idx,
+        g_mqtt_status.log[idx].topic,
+        g_mqtt_status.log[idx].success,
+        (unsigned long)g_mqtt_status.log[idx].timestamp,
+        (unsigned int)raw_len);
+
+    /* Stream escape the full payload directly into buf (tx_buf has 12KB) */
+    while (*raw && pos < buflen - 16) {
+        char ch = *raw++;
+        if (ch == '"' || ch == '\\') {
+            if (pos < buflen - 16) buf[pos++] = '\\';
+            buf[pos++] = ch;
+        } else if (ch == '\r') {
+            if (pos < buflen - 16) { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+        } else if (ch == '\n') {
+            if (pos < buflen - 16) { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+        } else if (ch == '\t') {
+            if (pos < buflen - 16) { buf[pos++] = '\\'; buf[pos++] = 't'; }
+        } else {
+            buf[pos++] = ((unsigned char)ch < 32 || (unsigned char)ch > 126) ? ' ' : ch;
+        }
+    }
+    buf[pos] = '\0';
+
+    pos = sfmt_append(buf, buflen, pos, "\"}");
+
+    if (locked) {
+        osMutexRelease(sensorMutex);
+    }
     return pos;
 }
 
@@ -2446,9 +2504,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
     /* -----------------------------------------------------------------
      * GET /api/mqtt/log  → MQTT publish history (polled by the MQTT page)
+     * GET /api/mqtt/log?idx=N  → Single full transmission log entry
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/mqtt/log", 17) == 0) {
-        int n = JSON_MqttLogResponse(tx_buf, sizeof(tx_buf));
+        char idx_str[8] = "";
+        ParseQueryStringParam(line, "idx", idx_str, sizeof(idx_str));
+        int n;
+        if (idx_str[0] != '\0') {
+            int idx = atoi(idx_str);
+            n = JSON_MqttLogEntryResponse(tx_buf, sizeof(tx_buf), idx);
+        } else {
+            n = JSON_MqttLogResponse(tx_buf, sizeof(tx_buf));
+        }
         if (Reject_If_Truncated(sn, (size_t)n, "mqtt log")) return;
         char log_hdr[200];
         snprintf(log_hdr, sizeof(log_hdr),
