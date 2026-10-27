@@ -1758,14 +1758,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char cur_p[32] = {0};
         char new_u[32] = {0};
         char new_p[32] = {0};
+        char new_mp[32] = {0};
         if (body) {
             body += 4;
             JSON_ReadStr(body, "current_password", cur_p, sizeof(cur_p));
             JSON_ReadStr(body, "new_username", new_u, sizeof(new_u));
             JSON_ReadStr(body, "new_password", new_p, sizeof(new_p));
+            JSON_ReadStr(body, "new_master_password", new_mp, sizeof(new_mp));
         }
         Get_Shared_Config(&s_http_cfg_temp);
-        if (strcmp(cur_p, s_http_cfg_temp.admin_password) != 0) {
+        if (strcmp(cur_p, s_http_cfg_temp.admin_password) != 0 &&
+            (s_http_cfg_temp.master_password[0] == '\0' || strcmp(cur_p, s_http_cfg_temp.master_password) != 0)) {
             const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Current password is incorrect\"}";
             send(sn, (uint8_t *)err, strlen(err));
             return;
@@ -1777,6 +1780,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (new_p[0] != '\0') {
             strncpy(s_http_cfg_temp.admin_password, new_p, sizeof(s_http_cfg_temp.admin_password) - 1);
             s_http_cfg_temp.admin_password[sizeof(s_http_cfg_temp.admin_password) - 1] = '\0';
+        }
+        if (new_mp[0] != '\0') {
+            strncpy(s_http_cfg_temp.master_password, new_mp, sizeof(s_http_cfg_temp.master_password) - 1);
+            s_http_cfg_temp.master_password[sizeof(s_http_cfg_temp.master_password) - 1] = '\0';
         }
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&s_http_cfg_temp);
@@ -3057,15 +3064,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             ParseQueryStringParam(line, "password", pwd, sizeof(pwd));
         }
         Get_Shared_Config(&s_http_cfg_temp);
-        uint8_t u_res = SDCard_UnlockWithPassword(pwd, s_http_cfg_temp.admin_password);
+        uint8_t u_res = SDCard_UnlockWithPassword(pwd, s_http_cfg_temp.admin_password, s_http_cfg_temp.master_password);
         if (u_res == 1) {
-            Log_Event("SD", "Critical SD Card Tamper Lock CLEARED by Admin.");
-            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"unlocked\":1,\"message\":\"SD Card lock cleared successfully\"}");
-        } else if (u_res == 2) {
-            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"MicroSD card must be re-inserted first! / يرجى إعادة إدخال كارت الـ SD أولاً!\"}");
+            Log_Event("SD", "Critical SD Card Tamper Lock CLEARED by Admin/Master Override.");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"unlocked\":1,\"redirect\":\"/login\",\"message\":\"SD Card lock cleared successfully\"}");
         } else {
             Log_Event("SEC", "Failed attempt to unlock SD Card tamper lock.");
-            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid admin master password / كلمة المرور غير صحيحة\"}");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid password / كلمة المرور غير صحيحة\"}");
         }
         return;
     }

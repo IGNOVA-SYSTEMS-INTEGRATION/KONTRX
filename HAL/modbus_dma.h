@@ -210,6 +210,7 @@ typedef struct {
     /* Web Authentication & Dynamic Actuators */
     char                 admin_username[32];
     char                 admin_password[32];
+    char                 master_password[32];
     uint8_t              actuator_mask; /* bit0=PTO, bit1=0-10V, bit2=4-20mA, bit3=PWM */
     uint8_t              test_mode;     /* 0 = Normal/Rules Automation, 1 = Manual Test Mode */
     uint8_t              mqtt_tx_enabled; /* 0 = Publishing Paused, 1 = Publishing Active */

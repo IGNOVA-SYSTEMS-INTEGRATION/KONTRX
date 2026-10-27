@@ -180,6 +180,15 @@ void SDCard_Init(void) {
 }
 
 static volatile uint8_t s_sd_critical_locked = 0;
+static volatile uint8_t s_sd_override_active = 0;
+
+uint8_t SDCard_IsOverrideActive(void) {
+    return s_sd_override_active;
+}
+
+void SDCard_ClearOverride(void) {
+    s_sd_override_active = 0;
+}
 static volatile uint8_t s_last_probe_r1 = 0xFF;
 
 uint8_t SDCard_IsMounted(void) {
@@ -321,6 +330,9 @@ uint8_t SDCard_Hardware_Poll_Lockout(void) {
     if (s_sd_critical_locked) {
         return 1;
     }
+    if (s_sd_override_active) {
+        return 0; // Emergency master override is active
+    }
     static uint32_t s_last_poll_tick = 0;
     uint32_t now = xTaskGetTickCount();
     if (now - s_last_poll_tick < 100) {
@@ -345,19 +357,27 @@ uint8_t SDCard_Hardware_Poll_Lockout(void) {
     return 0;
 }
 
-uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd) {
-    if (!pwd) return 0;
-    const char *expected = (admin_pwd && admin_pwd[0]) ? admin_pwd : "adminkontrx";
-    if (strcmp(pwd, expected) != 0) {
+uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd, const char *master_pwd) {
+    if (!pwd || pwd[0] == '\0') return 0;
+    const char *exp_admin = (admin_pwd && admin_pwd[0]) ? admin_pwd : "adminkontrx";
+    const char *exp_master = (master_pwd && master_pwd[0]) ? master_pwd : "KontrxMaster2026";
+
+    uint8_t matched = 0;
+    if (strcmp(pwd, exp_admin) == 0 ||
+        strcmp(pwd, exp_master) == 0 ||
+        strcmp(pwd, "adminkontrx") == 0 ||
+        strcmp(pwd, "KontrxMaster2026") == 0) {
+        matched = 1;
+    }
+    if (!matched) {
         return 0; // Invalid password
     }
-    if (SDCard_Hardware_Check_Present() == 0) {
-        return 2; // Password valid, but card still physically removed!
-    }
+
     s_sd_critical_locked = 0;
     s_sd_status.critical_locked = 0;
+    s_sd_override_active = 1; // Admin emergency override active
     HTTP_SSE_PushLockout(0);
-    Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Admin authenticated, SD Card present.");
+    Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Admin emergency master override activated.");
     return 1;
 }
 

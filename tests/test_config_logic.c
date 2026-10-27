@@ -48,6 +48,7 @@ typedef struct {
     uint8_t mqtt_mapping_count;
     char admin_username[32];
     char admin_password[32];
+    char master_password[32];
     uint8_t actuator_mask;
     uint8_t test_mode;
     uint8_t mqtt_tx_enabled;

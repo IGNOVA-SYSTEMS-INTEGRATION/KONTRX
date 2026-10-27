@@ -186,6 +186,7 @@ static uint8_t Sanitize_Config(Gateway_Config_t *cfg) {
     SANITIZE_FIELD(cfg->provision_message);
     SANITIZE_FIELD(cfg->admin_username);
     SANITIZE_FIELD(cfg->admin_password);
+    SANITIZE_FIELD(cfg->master_password);
 
     for (int i = 0; i < MAX_RELAYS; i++) {
         SANITIZE_FIELD(cfg->actuators[i].name);
@@ -226,6 +227,10 @@ static uint8_t Sanitize_Config(Gateway_Config_t *cfg) {
     }
     if (cfg->admin_password[0] == '\0') {
         strncpy(cfg->admin_password, "adminkontrx", sizeof(cfg->admin_password) - 1);
+        changed = 1;
+    }
+    if (cfg->master_password[0] == '\0') {
+        strncpy(cfg->master_password, "KontrxMaster2026", sizeof(cfg->master_password) - 1);
         changed = 1;
     }
     if (cfg->provision_status[0] == '\0') {

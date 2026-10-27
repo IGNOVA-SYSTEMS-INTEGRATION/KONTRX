@@ -25,7 +25,9 @@ uint8_t SDCard_IsMounted(void);
 /* Critical Security Lockdown for SD Card Disconnect / Tamper */
 uint8_t SDCard_IsCriticalLocked(void);
 void    SDCard_SetCriticalLock(uint8_t locked);
-uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd);
+uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd, const char *master_pwd);
+uint8_t SDCard_IsOverrideActive(void);
+void    SDCard_ClearOverride(void);
 
 /* Physical Hardware Detection & Emergency Freeze */
 uint8_t SDCard_Hardware_Check_Present(void);
