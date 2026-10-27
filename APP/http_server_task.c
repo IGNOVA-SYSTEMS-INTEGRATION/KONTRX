@@ -696,12 +696,17 @@ static int JSON_MqttLogResponse(char *buf, int buflen) {
         }
         clean_payload[cpos] = '\0';
 
-        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"size\":%u}",
+        uint32_t now_epoch = Time_Now();
+        uint32_t log_uptime = g_mqtt_status.log[i].timestamp;
+        uint32_t entry_epoch = (now_epoch > 0 && g_uptime_seconds >= log_uptime) ?
+                               (now_epoch - (g_uptime_seconds - log_uptime)) : 0;
+        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"epoch\":%lu,\"size\":%u}",
             emitted_log ? "," : "",
             g_mqtt_status.log[i].topic,
             clean_payload,
             g_mqtt_status.log[i].success,
-            (unsigned long)g_mqtt_status.log[i].timestamp,
+            (unsigned long)log_uptime,
+            (unsigned long)entry_epoch,
             (unsigned int)strlen((const char *)g_mqtt_status.log[i].payload));
         emitted_log = 1;
     }
@@ -823,9 +828,11 @@ void HTTP_SSE_PushSysLog(const char *cat, const char *msg, uint32_t ts) {
     }
     clean_msg[cpos] = '\0';
 
+    uint32_t epoch = Time_Now();
+    uint32_t up_s = g_uptime_seconds;
     char buf[SSE_EVENT_MAX_LEN];
-    snprintf(buf, sizeof(buf), "{\"type\":\"sys_log\",\"cat\":\"%s\",\"msg\":\"%s\",\"ts\":%lu}",
-             cat, clean_msg, (unsigned long)ts);
+    snprintf(buf, sizeof(buf), "{\"type\":\"sys_log\",\"cat\":\"%s\",\"msg\":\"%s\",\"ts\":%lu,\"epoch\":%lu,\"up_s\":%lu}",
+             cat, clean_msg, (unsigned long)ts, (unsigned long)epoch, (unsigned long)up_s);
     SSE_Queue_Push(buf);
 }
 
@@ -841,10 +848,11 @@ void HTTP_SSE_PushMqttLog(const char *topic, const char *payload, uint8_t succes
     }
     clean_pl[cpos] = '\0';
 
+    uint32_t epoch = Time_Now();
     uint32_t sz = payload ? (uint32_t)strlen(payload) : 0;
     char buf[SSE_EVENT_MAX_LEN];
-    snprintf(buf, sizeof(buf), "{\"type\":\"mqtt_log\",\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"size\":%lu}",
-             topic, clean_pl, (unsigned)success, (unsigned long)ts, (unsigned long)sz);
+    snprintf(buf, sizeof(buf), "{\"type\":\"mqtt_log\",\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"epoch\":%lu,\"size\":%lu}",
+             topic, clean_pl, (unsigned)success, (unsigned long)ts, (unsigned long)epoch, (unsigned long)sz);
     SSE_Queue_Push(buf);
 }
 
@@ -1948,6 +1956,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (speed <= 0) speed = 1000;
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_MoveRelative((uint8_t)id, steps, (uint32_t)speed);
+            char pt_log[64];
+            snprintf(pt_log, sizeof(pt_log), "PTO Axis %d Move: %ld steps @ %d Hz (Manual Test)", id+1, (long)steps, speed);
+            Log_Event("PTO", pt_log);
         }
         char extra[64];
         snprintf(extra, sizeof(extra), "\"axis\":%d,\"steps\":%ld,\"speed\":%d", id+1, (long)steps, speed);
@@ -1986,6 +1997,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int id = ParseQueryInt(line, "id");
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_Stop((uint8_t)id);
+            char pt_log[48];
+            snprintf(pt_log, sizeof(pt_log), "PTO Axis %d Stopped (Manual Test)", id+1);
+            Log_Event("PTO", pt_log);
         }
         char act_name[48];
         snprintf(act_name, sizeof(act_name), "PTO %d STOP", id+1);
@@ -2049,6 +2063,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         float duty = ParseQueryFloat(line, "duty");
         if (id >= 0 && id < (int)PWM_GetChannelCount() && duty >= 0.0f) {
             PWM_SetDuty((uint8_t)id, duty);
+            char p_log[64];
+            snprintf(p_log, sizeof(p_log), "PWM Channel %d set to %.1f%% Duty (Manual Test)", id+1, duty);
+            Log_Event("PWM", p_log);
         }
         char extra[64];
         snprintf(extra, sizeof(extra), "\"channel\":%d,\"duty\":%.1f", id+1, duty);
@@ -2071,6 +2088,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int freq = ParseQueryInt(line, "freq");
         if (id >= 0 && id < (int)PWM_GetChannelCount() && freq > 0) {
             PWM_SetFrequency((uint8_t)id, (uint32_t)freq);
+            char p_log[64];
+            snprintf(p_log, sizeof(p_log), "PWM Channel %d Frequency set to %d Hz (Manual Test)", id+1, freq);
+            Log_Event("PWM", p_log);
         }
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         return;
@@ -2112,6 +2132,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (val < 0.0f) val = ParseQueryFloat(line, "ma");
         if (id >= 0 && id < (int)DAC_420MA_GetChannelCount() && val >= 0.0f) {
             DAC_420MA_SetCurrent((uint8_t)id, val);
+            char a_log[64];
+            snprintf(a_log, sizeof(a_log), "4-20mA Output %d set to %.2f mA (Manual Test)", id+1, val);
+            Log_Event("ANALOG", a_log);
         }
         char extra[64];
         snprintf(extra, sizeof(extra), "\"channel\":%d,\"current_ma\":%.2f", id+1, val);
@@ -2137,6 +2160,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (val < 0.0f) val = ParseQueryFloat(line, "v");
         if (id >= 0 && id < (int)Analog_010V_GetChannelCount() && val >= 0.0f) {
             Analog_010V_SetVoltage((uint8_t)id, val);
+            char a_log[64];
+            snprintf(a_log, sizeof(a_log), "0-10V Output %d set to %.2f V (Manual Test)", id+1, val);
+            Log_Event("ANALOG", a_log);
         }
         char extra[64];
         snprintf(extra, sizeof(extra), "\"channel\":%d,\"voltage_v\":%.2f", id+1, val);
@@ -3132,8 +3158,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         if (id >= 0 && id < (int)s_http_cfg_temp.actuator_count && id < MAX_RELAYS && state >= 0) {
             char api_log[64];
-            snprintf(api_log, sizeof(api_log), "HTTP API: Actuator %d set to %s", id+1, state ? "ON" : "OFF");
-            Log_Event("SYS", api_log);
+            snprintf(api_log, sizeof(api_log), "Relay %d (%s) set to %s (Manual Test)",
+                     id+1, s_http_cfg_temp.actuators[id].name[0] ? s_http_cfg_temp.actuators[id].name : "Relay", state ? "ON" : "OFF");
+            Log_Event("RELAY", api_log);
             Relay_SetState((uint8_t)id, (uint8_t)state);
         }
         char extra[64];
@@ -3158,8 +3185,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int state = ParseQueryInt(line, "state");
         if (state >= 0) {
             char api_log[64];
-            snprintf(api_log, sizeof(api_log), "HTTP API: All actuators set to %s", state ? "ON" : "OFF");
-            Log_Event("SYS", api_log);
+            snprintf(api_log, sizeof(api_log), "All Relays set to %s (Manual Test)", state ? "ON" : "OFF");
+            Log_Event("RELAY", api_log);
             for (int i = 0; i < MAX_RELAYS; i++) Relay_SetState((uint8_t)i, (uint8_t)state);
         }
         char act_name[48];

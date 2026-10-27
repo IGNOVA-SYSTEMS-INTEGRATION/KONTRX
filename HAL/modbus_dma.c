@@ -571,19 +571,24 @@ void Modbus_DMA_PollSensors(void) {
                     }
                     mu->legacy_temp = rd->temp;
 
-                    /* Periodically log diagnostic event */
-                    static uint32_t last_dbg_s = 0;
-                    if (g_uptime_seconds - last_dbg_s >= 5) {
-                        last_dbg_s = g_uptime_seconds;
-                        char dbg[64];
-                        snprintf(dbg, sizeof(dbg), "MultiSensor: target_sid=%u ok=%u (U1=%.0f, F1=%.1f, T1=%.1f)",
-                                 target_sid, ok, mu->dist[0], mu->flow[0].rate, mu->temp[0]);
+                    /* Log significant sensor change (COV: distance delta > 50mm, flow delta > 2.0 L/m, or temp delta > 1.0 C) */
+                    static float s_last_log_dist = -999.0f;
+                    static float s_last_log_flow = -999.0f;
+                    static float s_last_log_temp = -999.0f;
+                    static uint32_t s_last_sensor_log_s = 0;
+                    float d_dist = mu->dist[0] - s_last_log_dist; if (d_dist < 0) d_dist = -d_dist;
+                    float d_flow = mu->flow[0].rate - s_last_log_flow; if (d_flow < 0) d_flow = -d_flow;
+                    float d_temp = mu->temp[0] - s_last_log_temp; if (d_temp < 0) d_temp = -d_temp;
+                    if (s_last_sensor_log_s == 0 || d_dist >= 50.0f || d_flow >= 2.0f || d_temp >= 1.0f || (g_uptime_seconds - s_last_sensor_log_s >= 60)) {
+                        s_last_log_dist = mu->dist[0];
+                        s_last_log_flow = mu->flow[0].rate;
+                        s_last_log_temp = mu->temp[0];
+                        s_last_sensor_log_s = g_uptime_seconds;
+                        char s_log[96];
+                        snprintf(s_log, sizeof(s_log), "MultiSensor (ID %u): Dist=%.0fmm, Flow=%.1fL/m, Temp=%.1f C",
+                                 target_sid, mu->dist[0], mu->flow[0].rate, mu->temp[0]);
                         extern void Log_Event(const char *category, const char *message);
-                        Log_Event("MODBUS", dbg);
-                        snprintf(dbg, sizeof(dbg), "RS485 rx=%lu fe=%lu ore=%lu last=%02X %02X %02X %02X",
-                                 (unsigned long)s_rx_bytes, (unsigned long)s_rx_fe, (unsigned long)s_rx_ore,
-                                 s_rx_last[0], s_rx_last[1], s_rx_last[2], s_rx_last[3]);
-                        Log_Event("MODBUS", dbg);
+                        Log_Event("SENSOR", s_log);
                     }
                 }
                 break;
