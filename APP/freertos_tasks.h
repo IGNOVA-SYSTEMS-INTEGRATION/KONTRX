@@ -81,7 +81,16 @@ extern volatile uint32_t g_total_logs_written;
 extern volatile uint32_t g_sys_log_count;
 extern volatile uint8_t g_sys_log_full;
 
+/* Queues the entry for Task_LogWriter and returns at once (it never waits on
+ * the SPI flash). Before the scheduler runs it writes directly. */
 void Log_Event(const char *category, const char *message);
+
+/* Writes every queued log entry now, in the caller's task. Use before a
+ * deliberate reset so the last entries reach flash. */
+void Log_Flush(void);
+
+/* Entries dropped because the log queue was full. */
+extern volatile uint32_t g_log_dropped;
 
 #include "flash_partition.h"
 

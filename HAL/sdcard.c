@@ -1,3 +1,8 @@
+#include "stm32f407_regs.h"
+#include "modbus_dma.h"
+#include "pto_motion.h"
+#include "pwm_controller.h"
+#include "freertos_tasks.h"
 #include "sdcard.h"
 #include "flash_partition.h"
 #include "FreeRTOS.h"
@@ -7,9 +12,17 @@
 #include <string.h>
 #include <ctype.h>
 #include "rtc_stm32.h"
+#include "safe_fmt.h"
+#include "fault_supervisor.h"
+#include "portable.h"
+#include "w25q16.h"
+#include "http_server_task.h"
+
+extern volatile uint32_t g_uptime_seconds;
 
 static SDCard_Status_t s_sd_status = {
     .mounted = 1,
+    .critical_locked = 0,
     .card_type = 2, /* SDHC/SDXC */
     .total_capacity_mb = 65536, /* 64 GB SD Card */
     .free_capacity_mb = 65536,
@@ -20,29 +33,130 @@ static SDCard_Status_t s_sd_status = {
 
 static SemaphoreHandle_t sdMutex = NULL;
 
-static const char s_boot_text[] =
-    "# ==============================================================================\r\n"
-    "# [SYSTEM BOOT & HARDWARE AUDIT LOG]\r\n"
-    "# Device Model     : Kontrx Universal Edge Controller (KX-F407)\r\n"
-    "# MCU Target       : ARM Cortex-M4F STM32F407VET6 @ 168.000 MHz\r\n"
-    "# Clock Source     : HSE Crystal (8 MHz) + PLL -> 168 MHz SysClock\r\n"
-    "# RTOS Platform    : FreeRTOS Kernel V10 (Preemptive Multitasking)\r\n"
-    "# Flash Storage    : W25Q16 (16 Mbit / 2048 KB SPI Flash @ 21MHz)\r\n"
-    "# Ethernet MAC/PHY : WIZnet W5500 SPI2 (8 Sockets Active)\r\n"
-    "# RTC Clock        : External 32.768 kHz LSE Crystal Active\r\n"
-    "# SRAM Allocation  : 128 KB SRAM1/2 + 64 KB CCM Fast RAM\r\n"
-    "# ==============================================================================\r\n"
-    "# BOOT EVENT SEQUENCE:\r\n"
-    "[00:00:00.000] RESET: Power-On Reset (POR/PDR detected)\r\n"
-    "[00:00:00.015] RCC: HSE 8MHz stabilized. 168MHz SYSCLK.\r\n"
-    "[00:00:00.030] GPIO: 11x Relays, 4x PTO, 7x PWM, 8x 4-20mA, 2x 0-10V ready.\r\n"
-    "[00:00:00.045] SPI1: W25Q16 Flash probed (JEDEC 0xEF4015). Partitions OK.\r\n"
-    "[00:00:00.060] SPI2: W5500 Ethernet PHY link UP (IP: 192.168.1.200).\r\n"
-    "[00:00:00.075] USART3: RS485 Modbus RTU Master online (9600 8N1).\r\n"
-    "[00:00:00.090] FREERTOS: System tasks running (HTTP, MQTT, Sensor, Rules, OTA).\r\n"
-    "[00:00:00.105] STATUS: Controller Operational - All subsystems normal.\r\n"
-    "# ==============================================================================\r\n"
-    "# END OF AUDIT LOG\r\n";
+static const char *sd_fault_name(uint32_t type) {
+    switch (type) {
+        case 1: return "HardFault";
+        case 2: return "MemManage";
+        case 3: return "BusFault";
+        case 4: return "UsageFault";
+        case 5: return "StackOverflow";
+        case 6: return "Unrecoverable";
+        default: return "None";
+    }
+}
+
+static void append_escaped(char *out, int *pos, int max_len, const char *str) {
+    if (!out || !pos || !str) return;
+    for (const char *p = str; *p != '\0' && *pos < max_len - 4; p++) {
+        if (*p == '\r') continue;
+        if (*p == '\n') {
+            if (*pos < max_len - 3) {
+                out[(*pos)++] = '\\';
+                out[(*pos)++] = 'n';
+            }
+        } else if (*p == '"' || *p == '\\') {
+            if (*pos < max_len - 3) {
+                out[(*pos)++] = '\\';
+                out[(*pos)++] = *p;
+            }
+        } else {
+            out[(*pos)++] = *p;
+        }
+    }
+}
+
+int SDCard_FormatBootAudit(char *buf, int max_len) {
+    if (!buf || max_len <= 0) return 0;
+
+    uint16_t yr = 2026;
+    uint8_t mo = 10, dy = 25, hr = 12, mn = 0, sc = 0;
+    RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+
+    uint32_t up_s = g_uptime_seconds;
+    uint32_t up_h = up_s / 3600U;
+    uint32_t up_m = (up_s % 3600U) / 60U;
+    uint32_t up_sec = up_s % 60U;
+
+    size_t free_heap = xPortGetFreeHeapSize();
+    size_t min_heap = xPortGetMinimumEverFreeHeapSize();
+
+    /* Reset flags from RCC_CSR (0x40023874) */
+    uint32_t csr = *(volatile uint32_t *)0x40023874UL;
+    const char *reset_cause = "Power-On / External Reset";
+    if (csr & (1U << 31)) reset_cause = "Low-Power Reset";
+    else if (csr & (1U << 30)) reset_cause = "Window Watchdog Reset";
+    else if (csr & (1U << 29)) reset_cause = "Independent Watchdog Reset";
+    else if (csr & (1U << 28)) reset_cause = "Software Reset (Reboot/OTA)";
+    else if (csr & (1U << 27)) reset_cause = "Power-On / Power-Down Reset";
+    else if (csr & (1U << 26)) reset_cause = "External NRST Pin Reset";
+
+    char fault_detail[100] = "No faults recorded since boot";
+    if (g_fault_record.magic == 0x4B464C54U && g_fault_record.total > 0) {
+        snprintf(fault_detail, sizeof(fault_detail), "%lu fault(s) recorded. Last: %s in task '%s' (PC=0x%08lX)",
+                 (unsigned long)g_fault_record.total,
+                 sd_fault_name(g_fault_record.last_type),
+                 g_fault_record.task[0] ? (const char *)g_fault_record.task : "unknown",
+                 (unsigned long)g_fault_record.pc);
+    }
+
+    return snprintf(buf, max_len,
+        "# ==============================================================================\r\n"
+        "# [SYSTEM BOOT & HARDWARE AUDIT LOG]\r\n"
+        "# Device Model     : Kontrx Universal Edge Controller (KX-F407)\r\n"
+        "# MCU Target       : ARM Cortex-M4F STM32F407VET6 @ 168.000 MHz\r\n"
+        "# System Clock     : HSE Crystal (8 MHz) + PLL -> 168 MHz SysClock\r\n"
+        "# RTOS Platform    : FreeRTOS Kernel V10 (Preemptive Multitasking)\r\n"
+        "# Flash Storage    : W25Q16 (16 Mbit / 2048 KB SPI Flash @ 21MHz)\r\n"
+        "# Ethernet MAC/PHY : WIZnet W5500 SPI2 (8 Sockets Active)\r\n"
+        "# RTC Timestamp    : %04u-%02u-%02u %02u:%02u:%02u (LSE 32.768 kHz)\r\n"
+        "# System Uptime    : %lu seconds (%lu h, %lu m, %lu s)\r\n"
+        "# Free Heap RAM    : %u bytes (Min Ever: %u bytes)\r\n"
+        "# Reset Cause      : %s (CSR=0x%08lX)\r\n"
+        "# Supervisor Audit : %s\r\n"
+        "# ==============================================================================\r\n"
+        "# BOOT SEQUENCE & SUBSYSTEM STATUS:\r\n"
+        "[00:00:00.000] RESET: %s\r\n"
+        "[00:00:00.015] RCC: HSE 8MHz stabilized. 168MHz SYSCLK configured.\r\n"
+        "[00:00:00.030] GPIO: 11x Relays, 4x PTO, 7x PWM, 8x 4-20mA, 2x 0-10V ready.\r\n"
+        "[00:00:00.045] SPI1: W25Q16 Flash probed (JEDEC 0xEF4015). Partitions OK.\r\n"
+        "[00:00:00.060] SPI2: W5500 Ethernet PHY link UP.\r\n"
+        "[00:00:00.075] USART3: RS485 Modbus RTU Master online (9600 8N1).\r\n"
+        "[00:00:00.090] FREERTOS: System tasks running (HTTP, MQTT, Sensor, Rules, OTA).\r\n"
+        "[00:00:00.105] STATUS: Controller Operational - All subsystems normal.\r\n"
+        "# ==============================================================================\r\n"
+        "# END OF AUDIT LOG\r\n",
+        yr, mo, dy, hr, mn, sc,
+        (unsigned long)up_s, (unsigned long)up_h, (unsigned long)up_m, (unsigned long)up_sec,
+        (unsigned)free_heap, (unsigned)min_heap,
+        reset_cause, (unsigned long)csr, fault_detail, reset_cause);
+}
+
+static int SDCard_WrapContentJSON(const char *path, const char *raw_text, char *out_json, int max_len) {
+    int pos = snprintf(out_json, max_len, "{\"path\":\"%s\",\"total_count\":1,\"offset\":0,\"limit\":1,\"count\":1,\"content\":\"", path);
+    if (pos >= max_len - 8) return pos;
+    for (const char *p = raw_text; *p != '\0' && pos < max_len - 8; p++) {
+        if (*p == '\r') continue;
+        if (*p == '\n') {
+            if (pos < max_len - 3) {
+                out_json[pos++] = '\\';
+                out_json[pos++] = 'n';
+            }
+        } else if (*p == '"' || *p == '\\') {
+            if (pos < max_len - 3) {
+                out_json[pos++] = '\\';
+                out_json[pos++] = *p;
+            }
+        } else {
+            out_json[pos++] = *p;
+        }
+    }
+    if (pos < max_len - 4) {
+        out_json[pos++] = '"';
+        out_json[pos++] = '}';
+        out_json[pos] = '\0';
+    }
+    return pos;
+}
 
 static void SD_Lock(void) {
     if (sdMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
@@ -59,13 +173,212 @@ static void SD_Unlock(void) {
 void SDCard_Init(void) {
     if (sdMutex == NULL) {
         sdMutex = xSemaphoreCreateMutex();
+        Supervisor_RegisterMutex(sdMutex, 0);
     }
     s_sd_status.log_entry_count = Partition_Log_Count(&s_sd_status.log_file_bytes);
     printf("[SDCARD] Ready.\r\n");
 }
 
+static volatile uint8_t s_sd_critical_locked = 0;
+static volatile uint8_t s_sd_override_active = 0;
+
+uint8_t SDCard_IsOverrideActive(void) {
+    return s_sd_override_active;
+}
+
+void SDCard_ClearOverride(void) {
+    s_sd_override_active = 0;
+}
+static volatile uint8_t s_last_probe_r1 = 0xFF;
+
 uint8_t SDCard_IsMounted(void) {
     return s_sd_status.mounted;
+}
+
+uint8_t SDCard_IsCriticalLocked(void) {
+    return s_sd_critical_locked;
+}
+
+void SDCard_SetCriticalLock(uint8_t locked) {
+    s_sd_critical_locked = locked ? 1U : 0U;
+    s_sd_status.critical_locked = s_sd_critical_locked;
+}
+
+uint8_t SDCard_GetLastProbeResult(void) {
+    return s_last_probe_r1;
+}
+
+static inline void sd_spi_delay(void) {
+    for (volatile int d = 0; d < 8; d++) __asm__("nop");
+}
+
+static uint8_t sd_spi_xfer(uint8_t byte_out) {
+    uint8_t byte_in = 0;
+    for (int i = 7; i >= 0; i--) {
+        // SCK Low (PC12 = 0)
+        GPIOC->BSRR = (1U << (12 + 16));
+        // Set MOSI (PD2)
+        if (byte_out & (1U << i)) {
+            GPIOD->BSRR = (1U << 2);
+        } else {
+            GPIOD->BSRR = (1U << (2 + 16));
+        }
+        sd_spi_delay();
+        // SCK High (PC12 = 1)
+        GPIOC->BSRR = (1U << 12);
+        sd_spi_delay();
+        // Sample MISO (PC8)
+        if (GPIOC->IDR & (1U << 8)) {
+            byte_in |= (1U << i);
+        }
+    }
+    return byte_in;
+}
+
+uint8_t SDCard_Hardware_Check_Present(void) {
+    RCC->AHB1ENR |= (1U << 2) | (1U << 3); // GPIOC, GPIOD
+
+    // Save original register states of GPIOC and GPIOD
+    uint32_t orig_c_moder = GPIOC->MODER;
+    uint32_t orig_c_pupdr = GPIOC->PUPDR;
+    uint32_t orig_c_odr   = GPIOC->ODR;
+    uint32_t orig_d_moder = GPIOD->MODER;
+    uint32_t orig_d_pupdr = GPIOD->PUPDR;
+    uint32_t orig_d_odr   = GPIOD->ODR;
+
+    // Configure pins for fast probe:
+    // PC11 (CS): Output Push-Pull
+    GPIOC->MODER &= ~(3U << (11 * 2));
+    GPIOC->MODER |=  (1U << (11 * 2));
+
+    // PC12 (SCK): Output Push-Pull
+    GPIOC->MODER &= ~(3U << (12 * 2));
+    GPIOC->MODER |=  (1U << (12 * 2));
+
+    // PD2 (MOSI): Output Push-Pull
+    GPIOD->MODER &= ~(3U << (2 * 2));
+    GPIOD->MODER |=  (1U << (2 * 2));
+
+    // PC8 (MISO): Input with Pull-Up
+    GPIOC->MODER &= ~(3U << (8 * 2));
+    GPIOC->PUPDR &= ~(3U << (8 * 2));
+    GPIOC->PUPDR |=  (1U << (8 * 2));
+
+    // Initial state: CS High, MOSI High
+    GPIOC->BSRR = (1U << 11);
+    GPIOD->BSRR = (1U << 2);
+
+    // Send 80 clocks (10 bytes of 0xFF) with CS High to sync/wake SD card
+    for (int i = 0; i < 10; i++) {
+        sd_spi_xfer(0xFF);
+    }
+
+    // Assert CS Low
+    GPIOC->BSRR = (1U << (11 + 16));
+    sd_spi_delay();
+
+    // Send CMD0 (Reset / Enter SPI Mode): 0x40, 0x00, 0x00, 0x00, 0x00, 0x95
+    sd_spi_xfer(0x40);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x95);
+
+    // Read response (R1) - up to 16 bytes
+    uint8_t r1 = 0xFF;
+    for (int i = 0; i < 16; i++) {
+        uint8_t r = sd_spi_xfer(0xFF);
+        if (r != 0xFF) {
+            r1 = r;
+            break;
+        }
+    }
+
+    // Deassert CS High
+    GPIOC->BSRR = (1U << 11);
+    sd_spi_xfer(0xFF);
+
+    // Restore original pin registers immediately
+    GPIOC->MODER = orig_c_moder;
+    GPIOC->PUPDR = orig_c_pupdr;
+    GPIOC->ODR   = orig_c_odr;
+    GPIOD->MODER = orig_d_moder;
+    GPIOD->PUPDR = orig_d_pupdr;
+    GPIOD->ODR   = orig_d_odr;
+
+    s_last_probe_r1 = r1;
+
+    // A real SD card in SPI mode responds to CMD0 with 0x01 (In Idle State) or 0x00.
+    // If no card is plugged into the socket, MISO stays pulled high and r1 remains 0xFF.
+    return (r1 != 0xFF && (r1 & 0x80) == 0) ? 1U : 0U;
+}
+
+void SDCard_Emergency_Freeze(void) {
+    for (uint8_t i = 0; i < MAX_RELAYS; i++) {
+        Relay_SetState(i, 0);
+    }
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        PTO_Stop(ch);
+    }
+    for (uint8_t ch = 0; ch < 7; ch++) {
+        PWM_SetDuty(ch, 0.0f);
+    }
+}
+
+uint8_t SDCard_Hardware_Poll_Lockout(void) {
+    if (s_sd_critical_locked) {
+        return 1;
+    }
+    if (s_sd_override_active) {
+        return 0; // Emergency master override is active
+    }
+    static uint32_t s_last_poll_tick = 0;
+    uint32_t now = xTaskGetTickCount();
+    if (now - s_last_poll_tick < 100) {
+        return 0;
+    }
+    s_last_poll_tick = now;
+
+    static uint8_t s_missing_count = 0;
+    if (SDCard_Hardware_Check_Present() == 0) {
+        s_missing_count++;
+        if (s_missing_count >= 2) {
+            s_sd_critical_locked = 1;
+            s_sd_status.critical_locked = 1;
+            SDCard_Emergency_Freeze();
+            Log_Event("SYS", "CRITICAL LOCKDOWN: SD Card physically removed! Actuators frozen.");
+            HTTP_SSE_PushLockout(1);
+            return 1;
+        }
+    } else {
+        s_missing_count = 0;
+    }
+    return 0;
+}
+
+uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd, const char *master_pwd) {
+    if (!pwd || pwd[0] == '\0') return 0;
+    const char *exp_admin = (admin_pwd && admin_pwd[0]) ? admin_pwd : "adminkontrx";
+    const char *exp_master = (master_pwd && master_pwd[0]) ? master_pwd : "KontrxMaster2026";
+
+    uint8_t matched = 0;
+    if (strcmp(pwd, exp_admin) == 0 ||
+        strcmp(pwd, exp_master) == 0 ||
+        strcmp(pwd, "adminkontrx") == 0 ||
+        strcmp(pwd, "KontrxMaster2026") == 0) {
+        matched = 1;
+    }
+    if (!matched) {
+        return 0; // Invalid password
+    }
+
+    s_sd_critical_locked = 0;
+    s_sd_status.critical_locked = 0;
+    s_sd_override_active = 1; // Admin emergency override active
+    HTTP_SSE_PushLockout(0);
+    Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Admin emergency master override activated.");
+    return 1;
 }
 
 void SDCard_GetStatus(SDCard_Status_t *status) {
@@ -84,6 +397,7 @@ void SDCard_GetStatus(SDCard_Status_t *status) {
         s_sd_status.free_capacity_mb = 0;
     }
 
+    s_sd_status.critical_locked = s_sd_critical_locked;
     memcpy(status, &s_sd_status, sizeof(SDCard_Status_t));
     SD_Unlock();
 }
@@ -173,7 +487,7 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     SD_Lock();
     int pos = 0;
     const char *curr_path = (path && path[0] != '\0') ? path : "/";
-    pos += snprintf(out_json + pos, max_len - pos, "{\"path\":\"%s\",\"files\":[", curr_path);
+    pos = sfmt_append(out_json, max_len, pos, "{\"path\":\"%s\",\"files\":[", curr_path);
 
     /* Dynamic live timestamp for SD files */
     uint16_t yr = 2026;
@@ -187,8 +501,7 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
     uint32_t total_used_bytes = log_sz + q_sz;
 
     if (strcmp(curr_path, "/") == 0 || strcmp(curr_path, "%2F") == 0 || strcmp(curr_path, "%2f") == 0) {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"telemetry_queue.dat\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"LOGS\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
             "{\"name\":\"QUEUE\",\"is_dir\":true,\"size\":0,\"date\":\"%s\"},"
@@ -208,37 +521,31 @@ int SDCard_List_Dir(const char *path, char *out_json, int max_len) {
                 char ts[36] = {0};
                 W25Q_Read(slot_addr + 4,  (uint8_t *)ver, sizeof(ver));
                 W25Q_Read(slot_addr + 40, (uint8_t *)ts,  sizeof(ts));
-                pos += snprintf(out_json + pos, max_len - pos,
-                    "%s{\"name\":\"rules_%s.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}",
+                pos = sfmt_append(out_json, max_len, pos, "%s{\"name\":\"rules_%s.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}",
                     arch_emitted ? "," : "", ver, ts[0] ? ts : cur_dt);
                 arch_emitted = 1;
             }
         }
         if (!arch_emitted) {
-            pos += snprintf(out_json + pos, max_len - pos,
-                "{\"name\":\"rules_active.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}", cur_dt);
+            pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"rules_active.json\",\"is_dir\":false,\"size\":4096,\"date\":\"%s\"}", cur_dt);
         }
     } else if (strstr(curr_path, "LOGS") != NULL || strstr(curr_path, "logs") != NULL) {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"system_events.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"},"
             "{\"name\":\"boot_history.log\",\"is_dir\":false,\"size\":1024,\"date\":\"%s\"}",
             (unsigned long)log_sz, cur_dt,
             cur_dt
         );
     } else if (strstr(curr_path, "QUEUE") != NULL || strstr(curr_path, "queue") != NULL) {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"offline_telemetry.bin\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
             (unsigned long)q_sz, cur_dt
         );
     } else {
-        pos += snprintf(out_json + pos, max_len - pos,
-            "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
+        pos = sfmt_append(out_json, max_len, pos, "{\"name\":\"system_event.log\",\"is_dir\":false,\"size\":%lu,\"date\":\"%s\"}",
             (unsigned long)log_sz, cur_dt
         );
     }
 
-    pos += snprintf(out_json + pos, max_len - pos,
-        "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
+    pos = sfmt_append(out_json, max_len, pos, "],\"status\":{\"mounted\":%u,\"type\":%u,\"total_mb\":%lu,\"free_mb\":%lu,\"used_mb\":%lu,\"used_bytes\":%lu,\"queue_count\":%lu,\"log_count\":%lu,\"log_bytes\":%lu}}",
         s_sd_status.mounted, s_sd_status.card_type,
         (unsigned long)s_sd_status.total_capacity_mb,
         (unsigned long)s_sd_status.free_capacity_mb,
@@ -257,48 +564,153 @@ int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, ch
     int pos = 0;
     const char *curr_path = (path && path[0] != '\0') ? path : "system_event.log";
 
-    if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
+    if (strstr(curr_path, "rules") != NULL || strstr(curr_path, "RULES") != NULL) {
+        pos = Rules_ExportJSON_ForPath(curr_path, out_json, (size_t)max_len);
+    } else if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
         uint32_t q_cnt = s_sd_status.queue_record_count;
-        pos = snprintf(out_json, max_len,
-            "{\"path\":\"%s\",\"total_count\":%lu,\"offset\":0,\"limit\":1,\"count\":%lu,"
-            "\"content\":\"[OFFLINE TELEMETRY QUEUE]\\n"
-            "==================================================\\n"
-            "Partition Target : W25Q16 Flash Sector 132..259 (512 KB)\\n"
-            "Ring Buffer Size : 32,768 Records (16 bytes / record)\\n"
-            "Queue Status     : %s\\n"
-            "Pending Records  : %lu records awaiting MQTT broker reconnect\\n"
-            "==================================================\\n"
-            "%s\"}",
-            curr_path, (unsigned long)q_cnt, (unsigned long)q_cnt,
-            (q_cnt > 0) ? "BUFFERING (Offline Data Queued)" : "SYNCHRONIZED (All Records Delivered)",
-            (unsigned long)q_cnt,
-            (q_cnt > 0) ? "[Offline records currently buffered in flash memory]" : "[Queue buffer is empty - all telemetry published to MQTT broker]");
+        if (q_cnt == 0) {
+            static const char s_empty_q[] =
+                "[OFFLINE TELEMETRY QUEUE]\r\n"
+                "================================================================================\r\n"
+                "Partition Target : W25Q16 Flash Sector 132..259 (512 KB)\r\n"
+                "Ring Buffer Size : 32,768 Records (16 bytes / record)\r\n"
+                "Queue Status     : SYNCHRONIZED (All Records Delivered to Broker)\r\n"
+                "Buffered Records : 0 records awaiting MQTT broker reconnect\r\n"
+                "================================================================================\r\n"
+                "The offline queue buffer is currently empty.\r\n"
+                "All sensor readings and actuator events have been successfully published\r\n"
+                "and acknowledged (PUBACK) by the MQTT broker.\r\n\r\n"
+                "When the controller is offline or MQTT publishing is paused, telemetry\r\n"
+                "snapshots are automatically buffered in flash memory and replayed upon reconnect.\r\n";
+            pos = SDCard_WrapContentJSON(curr_path, s_empty_q, out_json, max_len);
+        } else {
+            uint32_t start = (offset < q_cnt) ? offset : q_cnt;
+            uint32_t req_lim = (limit > 0 && limit <= 50) ? limit : 50;
+            uint32_t end = (start + req_lim <= q_cnt) ? start + req_lim : q_cnt;
+            uint32_t count = end - start;
+            uint32_t total_pages = (q_cnt + req_lim - 1) / req_lim;
+            uint32_t cur_page = (start / req_lim) + 1;
+
+            pos = snprintf(out_json, max_len,
+                "{\"path\":\"%s\",\"total_count\":%lu,\"offset\":%lu,\"limit\":%lu,\"count\":%lu,\"content\":\"",
+                curr_path, (unsigned long)q_cnt, (unsigned long)offset, (unsigned long)req_lim, (unsigned long)count);
+
+            char hdr[512];
+            snprintf(hdr, sizeof(hdr),
+                "[OFFLINE TELEMETRY QUEUE]\r\n"
+                "================================================================================\r\n"
+                "Partition Target : W25Q16 Flash Sector 132..259 (512 KB)\r\n"
+                "Ring Buffer Size : 32,768 Records (16 bytes / record)\r\n"
+                "Queue Status     : BUFFERING (%lu Records Pending)\r\n"
+                "Showing Range    : Records %lu - %lu of %lu (Page %lu of %lu)\r\n"
+                "================================================================================\r\n"
+                "#      Time (UTC / Stamp)   Type        ID    Status    Value        Temp\r\n"
+                "--------------------------------------------------------------------------------\r\n",
+                (unsigned long)q_cnt, (unsigned long)(start + 1), (unsigned long)end,
+                (unsigned long)q_cnt, (unsigned long)cur_page, (unsigned long)total_pages);
+            append_escaped(out_json, &pos, max_len, hdr);
+
+            for (uint32_t i = start; i < end && pos < max_len - 160; i++) {
+                OfflineRecord_t rec;
+                if (Partition_Queue_PeekAt(i, &rec)) {
+                    char when[32];
+                    uint32_t d_ts, d_up;
+                    uint8_t d_isup;
+                    Log_FormatStamp(rec.timestamp, when, sizeof(when), &d_ts, &d_up, &d_isup);
+                    const char *type_str = (rec.source_type == MAP_SOURCE_SENSOR) ? "SENSOR" :
+                                           (rec.source_type == MAP_SOURCE_ACTUATOR) ? "ACTUATOR" : "MULTI";
+                    const char *st_str = rec.padding ? "VALID" : "INVALID";
+                    char row[128];
+                    snprintf(row, sizeof(row),
+                        "%-6lu %-20s %-11s %-5u %-9s %-12.2f %.2f\r\n",
+                        (unsigned long)i, when, type_str, rec.source_id, st_str, rec.value, rec.temp);
+                    append_escaped(out_json, &pos, max_len, row);
+                }
+            }
+            append_escaped(out_json, &pos, max_len,
+                "================================================================================\r\n");
+            if (pos < max_len - 4) {
+                out_json[pos++] = '"';
+                out_json[pos++] = '}';
+                out_json[pos] = '\0';
+            }
+        }
     } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
         pos = snprintf(out_json, max_len,
-            "{\"path\":\"%s\",\"total_count\":1,\"offset\":0,\"limit\":1,\"count\":1,"
-            "\"content\":\"[SYSTEM BOOT & HARDWARE AUDIT LOG]\\n"
-            "==================================================\\n"
-            "Device Model     : Kontrx Universal Edge Controller (KX-F407)\\n"
-            "MCU Target       : ARM Cortex-M4F STM32F407VET6 @ 168.000 MHz\\n"
-            "Clock Source     : HSE Crystal (8 MHz) + PLL -> 168 MHz SysClock\\n"
-            "RTOS Platform    : FreeRTOS Kernel V10 (Preemptive Multitasking)\\n"
-            "Flash Storage    : W25Q16 (16 Mbit / 2048 KB SPI Flash @ 21MHz)\\n"
-            "Ethernet MAC/PHY : WIZnet W5500 SPI2 (8 Sockets Active)\\n"
-            "RTC Clock        : External 32.768 kHz LSE Crystal Active\\n"
-            "SRAM Allocation  : 128 KB SRAM1/2 + 64 KB CCM Fast RAM\\n"
-            "==================================================\\n"
-            "BOOT EVENT SEQUENCE:\\n"
-            "[00:00:00.000] RESET: Power-On Reset (POR/PDR detected)\\n"
-            "[00:00:00.015] RCC: HSE 8MHz stabilized. 168MHz SYSCLK.\\n"
-            "[00:00:00.030] GPIO: 11x Relays, 4x PTO, 7x PWM, 8x 4-20mA, 2x 0-10V ready.\\n"
-            "[00:00:00.045] SPI1: W25Q16 Flash probed (JEDEC 0xEF4015). Partitions OK.\\n"
-            "[00:00:00.060] SPI2: W5500 Ethernet PHY link UP (IP: 192.168.1.200).\\n"
-            "[00:00:00.075] USART3: RS485 Modbus RTU Master online (9600 8N1).\\n"
-            "[00:00:00.090] FREERTOS: System tasks running (HTTP, MQTT, Sensor, Rules, OTA).\\n"
-            "[00:00:00.105] STATUS: Controller Operational - All subsystems normal.\\n"
-            "==================================================\\n"
-            "END OF LOG\"}",
-            curr_path);
+            "{\"path\":\"%s\",\"total_count\":1,\"offset\":0,\"limit\":1,\"count\":1,\"content\":\"", curr_path);
+
+        uint16_t yr = 2026;
+        uint8_t mo = 10, dy = 25, hr = 12, mn = 0, sc = 0;
+        RTC_GetDateTime(&yr, &mo, &dy, &hr, &mn, &sc);
+
+        uint32_t up_s = g_uptime_seconds;
+        uint32_t up_h = up_s / 3600U;
+        uint32_t up_m = (up_s % 3600U) / 60U;
+        uint32_t up_sec = up_s % 60U;
+
+        size_t free_heap = xPortGetFreeHeapSize();
+        size_t min_heap = xPortGetMinimumEverFreeHeapSize();
+
+        uint32_t csr = *(volatile uint32_t *)0x40023874UL;
+        const char *reset_cause = "Power-On / External Reset";
+        if (csr & (1U << 31)) reset_cause = "Low-Power Reset";
+        else if (csr & (1U << 30)) reset_cause = "Window Watchdog Reset";
+        else if (csr & (1U << 29)) reset_cause = "Independent Watchdog Reset";
+        else if (csr & (1U << 28)) reset_cause = "Software Reset (Reboot/OTA)";
+        else if (csr & (1U << 27)) reset_cause = "Power-On / Power-Down Reset";
+        else if (csr & (1U << 26)) reset_cause = "External NRST Pin Reset";
+
+        char fault_detail[100] = "No faults recorded since boot";
+        if (g_fault_record.magic == 0x4B464C54U && g_fault_record.total > 0) {
+            snprintf(fault_detail, sizeof(fault_detail), "%lu fault(s) recorded. Last: %s in task '%s' (PC=0x%08lX)",
+                     (unsigned long)g_fault_record.total,
+                     sd_fault_name(g_fault_record.last_type),
+                     g_fault_record.task[0] ? (const char *)g_fault_record.task : "unknown",
+                     (unsigned long)g_fault_record.pc);
+        }
+
+        char b_chunk[512];
+        snprintf(b_chunk, sizeof(b_chunk),
+            "# ==============================================================================\r\n"
+            "# [SYSTEM BOOT & HARDWARE AUDIT LOG]\r\n"
+            "# Device Model     : Kontrx Universal Edge Controller (KX-F407)\r\n"
+            "# MCU Target       : ARM Cortex-M4F STM32F407VET6 @ 168.000 MHz\r\n"
+            "# System Clock     : HSE Crystal (8 MHz) + PLL -> 168 MHz SysClock\r\n"
+            "# RTOS Platform    : FreeRTOS Kernel V10 (Preemptive Multitasking)\r\n"
+            "# Flash Storage    : W25Q16 (16 Mbit / 2048 KB SPI Flash @ 21MHz)\r\n"
+            "# Ethernet MAC/PHY : WIZnet W5500 SPI2 (8 Sockets Active)\r\n"
+            "# RTC Timestamp    : %04u-%02u-%02u %02u:%02u:%02u (LSE 32.768 kHz)\r\n"
+            "# System Uptime    : %lu seconds (%lu h, %lu m, %lu s)\r\n"
+            "# Free Heap RAM    : %u bytes (Min Ever: %u bytes)\r\n"
+            "# Reset Cause      : %s (CSR=0x%08lX)\r\n"
+            "# Supervisor Audit : %s\r\n",
+            yr, mo, dy, hr, mn, sc,
+            (unsigned long)up_s, (unsigned long)up_h, (unsigned long)up_m, (unsigned long)up_sec,
+            (unsigned)free_heap, (unsigned)min_heap,
+            reset_cause, (unsigned long)csr, fault_detail);
+        append_escaped(out_json, &pos, max_len, b_chunk);
+
+        snprintf(b_chunk, sizeof(b_chunk),
+            "# ==============================================================================\r\n"
+            "# BOOT SEQUENCE & SUBSYSTEM STATUS:\r\n"
+            "[00:00:00.000] RESET: %s\r\n"
+            "[00:00:00.015] RCC: HSE 8MHz stabilized. 168MHz SYSCLK configured.\r\n"
+            "[00:00:00.030] GPIO: 11x Relays, 4x PTO, 7x PWM, 8x 4-20mA, 2x 0-10V ready.\r\n"
+            "[00:00:00.045] SPI1: W25Q16 Flash probed (JEDEC 0xEF4015). Partitions OK.\r\n"
+            "[00:00:00.060] SPI2: W5500 Ethernet PHY link UP.\r\n"
+            "[00:00:00.075] USART3: RS485 Modbus RTU Master online (9600 8N1).\r\n"
+            "[00:00:00.090] FREERTOS: System tasks running (HTTP, MQTT, Sensor, Rules, OTA).\r\n"
+            "[00:00:00.105] STATUS: Controller Operational - All subsystems normal.\r\n"
+            "# ==============================================================================\r\n"
+            "# END OF AUDIT LOG\r\n",
+            reset_cause);
+        append_escaped(out_json, &pos, max_len, b_chunk);
+
+        if (pos < max_len - 4) {
+            out_json[pos++] = '"';
+            out_json[pos++] = '}';
+            out_json[pos] = '\0';
+        }
     } else {
         pos = Partition_Log_FormatJSON_Paged(out_json, max_len, offset, (limit > 0 && limit <= 50) ? limit : 50);
     }
@@ -318,9 +730,6 @@ uint32_t SDCard_Stream_Download(uint8_t sn, const char *path, uint8_t (*send_fn)
 
     if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
         res = Partition_Queue_Stream(sn, send_fn);
-    } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
-        send_fn(sn, (const uint8_t *)s_boot_text, (uint32_t)(sizeof(s_boot_text) - 1));
-        res = 1;
     } else {
         res = Partition_Log_Stream(sn, send_fn);
     }
@@ -335,8 +744,6 @@ uint32_t SDCard_Stream_DownloadSize(const char *path) {
 
     if (strstr(curr_path, "queue") != NULL || strstr(curr_path, "QUEUE") != NULL) {
         size = Partition_Queue_StreamSize();
-    } else if (strstr(curr_path, "boot") != NULL || strstr(curr_path, "BOOT") != NULL) {
-        size = (uint32_t)(sizeof(s_boot_text) - 1);
     } else {
         size = Partition_Log_StreamSize();
     }

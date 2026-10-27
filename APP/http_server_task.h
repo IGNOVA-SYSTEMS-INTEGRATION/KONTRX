@@ -45,4 +45,9 @@ void Task_HTTPServer(void *arg);
  */
 const char *SensorTypeName(uint8_t type);
 
+/* Real-Time SSE Event Streaming */
+void HTTP_SSE_PushSysLog(const char *cat, const char *msg, uint32_t ts);
+void HTTP_SSE_PushMqttLog(const char *topic, const char *payload, uint8_t success, uint32_t ts);
+void HTTP_SSE_PushLockout(uint8_t locked);
+
 #endif /* HTTP_SERVER_TASK_H */

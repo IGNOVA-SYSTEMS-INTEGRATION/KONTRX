@@ -3,6 +3,7 @@
 #include "stm32f407_regs.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
+#include "fault_supervisor.h"
 #include "task.h"
 #include <stdio.h>
 
@@ -70,6 +71,7 @@ void W25Q_Init(void) {
 
     if (flashMutex == NULL) {
         flashMutex = xSemaphoreCreateRecursiveMutex();
+        Supervisor_RegisterMutex(flashMutex, 1);
     }
     
     // Check JEDEC ID to confirm wiring

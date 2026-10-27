@@ -23,6 +23,7 @@
 
 #include "ota_task.h"
 #include "http_server_task.h"
+#include "freertos_tasks.h"
 #include "flash_stm32.h"
 #include "stm32f407_regs.h"
 #include "cmsis_os2.h"
@@ -146,6 +147,7 @@ void Task_OTAUpdate(void *arg) {
                            * over the W5500 socket BEFORE the reset. Rebooting
                            * early would cut off the browser's response and the
                            * update would appear to fail. OTA-only, one-shot. */
+            Log_Flush();  /* queued log entries would be lost by the reset */
             /* Software reset */
             SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;
             while (1);

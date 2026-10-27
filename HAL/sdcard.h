@@ -7,6 +7,7 @@
 
 typedef struct {
     uint8_t  mounted;
+    uint8_t  critical_locked; /* 1 if SD card disconnected/tampered and awaiting admin unlock */
     uint8_t  card_type; /* 0=None, 1=SDSC, 2=SDHC/SDXC */
     uint32_t total_capacity_mb;
     uint32_t free_capacity_mb;
@@ -20,6 +21,19 @@ void SDCard_Init(void);
 
 /* Check if SD Card is mounted & operational */
 uint8_t SDCard_IsMounted(void);
+
+/* Critical Security Lockdown for SD Card Disconnect / Tamper */
+uint8_t SDCard_IsCriticalLocked(void);
+void    SDCard_SetCriticalLock(uint8_t locked);
+uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd, const char *master_pwd);
+uint8_t SDCard_IsOverrideActive(void);
+void    SDCard_ClearOverride(void);
+
+/* Physical Hardware Detection & Emergency Freeze */
+uint8_t SDCard_Hardware_Check_Present(void);
+uint8_t SDCard_Hardware_Poll_Lockout(void);
+void    SDCard_Emergency_Freeze(void);
+uint8_t SDCard_GetLastProbeResult(void);
 
 /* Get live SD Card metrics */
 void SDCard_GetStatus(SDCard_Status_t *status);
@@ -44,5 +58,9 @@ int SDCard_Read_File(const char *path, char *out_json, int max_len);
 int SDCard_Read_File_Paged(const char *path, uint32_t offset, uint32_t limit, char *out_json, int max_len);
 uint32_t SDCard_Stream_Download(uint8_t sn, const char *path, uint8_t (*send_fn)(uint8_t sn, const uint8_t *data, uint32_t total));
 uint32_t SDCard_Stream_DownloadSize(const char *path);
+
+/* Boot Audit & Rules Export Helpers */
+int SDCard_FormatBootAudit(char *buf, int max_len);
+int Rules_ExportJSON_ForPath(const char *path, char *out_buf, size_t max_len);
 
 #endif // SDCARD_H

@@ -115,6 +115,58 @@ static int write_metric_string(uint8_t **p, uint8_t *end, const char *name, uint
     return 1;
 }
 
+/* Float metric, or a null-valued one (Metric.is_null, field 7) when the
+ * channel has no valid reading, so hosts keep a stable metric set. */
+static int write_metric_float_or_null(uint8_t **p, uint8_t *end, const char *name, uint64_t ts_ms,
+                                      float val, uint8_t is_valid) {
+    if (is_valid) return write_metric_float(p, end, name, ts_ms, val);
+
+    uint8_t temp[128];
+    uint8_t *tp = temp;
+    uint8_t *tend = temp + sizeof(temp);
+
+    if (!write_string(&tp, tend, 1, name)) return 0;
+    if (!write_key(&tp, tend, 3, 0) || !write_varint(&tp, tend, ts_ms)) return 0;
+    if (!write_key(&tp, tend, 4, 0) || !write_varint(&tp, tend, SPB_DATA_TYPE_FLOAT)) return 0;
+    if (!write_key(&tp, tend, 7, 0) || !write_varint(&tp, tend, 1)) return 0;
+
+    size_t metric_len = tp - temp;
+    if (!write_key(p, end, 2, 2)) return 0;
+    if (!write_varint(p, end, metric_len)) return 0;
+    if (*p + metric_len > end) return 0;
+    memcpy(*p, temp, metric_len);
+    *p += metric_len;
+    return 1;
+}
+
+/* Multi-Sensor Board channels: US1..3, Flow1..3, Temp1..2 and the average of
+ * each group, under Sensors/<type>_<id>/. */
+static int write_multi_channel_metrics(uint8_t **p, uint8_t *end, const char *tname, uint8_t sid,
+                                       uint64_t ts_ms, const MultiChRecord_t *mc) {
+    static const char *const ch_names[MULTI_CH_COUNT] = {
+        "US1", "US2", "US3", "Flow1", "Flow2", "Flow3", "Temp1", "Temp2"
+    };
+    char name_buf[64];
+    uint8_t online = (mc && mc->valid);
+
+    for (uint8_t c = 0; c < MULTI_CH_COUNT; c++) {
+        float v = online ? mc->ch[c] : MULTI_CH_INVALID;
+        snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/%s", tname, sid, ch_names[c]);
+        if (!write_metric_float_or_null(p, end, name_buf, ts_ms, v, v > MULTI_CH_INVALID + 1.0f)) return 0;
+    }
+
+    float avg_us   = online ? MultiCh_Avg(mc, MULTI_CH_US, 3)   : MULTI_CH_INVALID;
+    float avg_flow = online ? MultiCh_Avg(mc, MULTI_CH_FLOW, 3) : MULTI_CH_INVALID;
+    float avg_temp = online ? MultiCh_Avg(mc, MULTI_CH_TEMP, 2) : MULTI_CH_INVALID;
+    snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/US_Avg", tname, sid);
+    if (!write_metric_float_or_null(p, end, name_buf, ts_ms, avg_us, avg_us > MULTI_CH_INVALID + 1.0f)) return 0;
+    snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Flow_Avg", tname, sid);
+    if (!write_metric_float_or_null(p, end, name_buf, ts_ms, avg_flow, avg_flow > MULTI_CH_INVALID + 1.0f)) return 0;
+    snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Temp_Avg", tname, sid);
+    if (!write_metric_float_or_null(p, end, name_buf, ts_ms, avg_temp, avg_temp > MULTI_CH_INVALID + 1.0f)) return 0;
+    return 1;
+}
+
 static const char *get_sensor_type_name(uint8_t type) {
     switch (type) {
         case 1: return "pH";
@@ -123,7 +175,7 @@ static const char *get_sensor_type_name(uint8_t type) {
         case 4: return "DO";
         case 5: return "Ammonia";
         case 6: return "Ultrasonic";
-        case 7: return "Multi-US";
+        case 7: return "Multi-Sensor";
         default: return "Unknown";
     }
 }
@@ -158,6 +210,11 @@ size_t sparkplug_encode_nbirth(uint8_t *buf, size_t max_len, uint64_t timestamp_
         
         snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Temperature", tname, batch->records[i].id);
         if (!write_metric_float(&p, end, name_buf, timestamp_ms, batch->records[i].avg_temp)) return 0;
+
+        if (batch->records[i].type == SENSOR_TYPE_MULTI_US) {
+            if (!write_multi_channel_metrics(&p, end, tname, batch->records[i].id, timestamp_ms,
+                                             MultiCh_Find(batch, batch->records[i].id))) return 0;
+        }
     }
 
     /* Actuators status */
@@ -257,6 +314,12 @@ size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_m
 
             snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Online", tname, sid);
             if (!write_metric_bool(&p, end, name_buf, timestamp_ms, is_online)) return 0;
+
+            if (stype == SENSOR_TYPE_MULTI_US) {
+                const MultiChRecord_t *mc = batch ? MultiCh_Find(batch, sid) : NULL;
+                if (!write_multi_channel_metrics(&p, end, tname, sid, timestamp_ms,
+                                                 is_online ? mc : NULL)) return 0;
+            }
         }
     } else if (batch && batch->count > 0) {
         for (int i = 0; i < batch->count; i++) {
@@ -274,6 +337,12 @@ size_t sparkplug_encode_ddata(uint8_t *buf, size_t max_len, uint64_t timestamp_m
 
             snprintf(name_buf, sizeof(name_buf), "Sensors/%s_%u/Online", tname, batch->records[i].id);
             if (!write_metric_bool(&p, end, name_buf, timestamp_ms, batch->records[i].valid)) return 0;
+
+            if (batch->records[i].type == SENSOR_TYPE_MULTI_US) {
+                const MultiChRecord_t *mc = MultiCh_Find(batch, batch->records[i].id);
+                if (!write_multi_channel_metrics(&p, end, tname, batch->records[i].id, timestamp_ms,
+                                                 batch->records[i].valid ? mc : NULL)) return 0;
+            }
         }
     }
 

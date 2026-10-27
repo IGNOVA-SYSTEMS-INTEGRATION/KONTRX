@@ -8,6 +8,7 @@
 #include "w5500.h"
 #include <stdio.h>
 #include <string.h>
+#include "safe_fmt.h"
 
 static Hardware_Interface_Desc_t s_interfaces[TOTAL_SYSTEM_INTERFACES] = {
     {"Industrial Ethernet (W5500)", "Ethernet", "WIZnet W5500 (SPI2)", IF_STATUS_ACTIVE, "Online - 8 Hardware Sockets Active", 8, 3, 1},
@@ -79,7 +80,7 @@ void Interface_SetEnabled(uint8_t idx, uint8_t enabled) {
 
 uint32_t Interface_BuildArrayJSON(char *buffer, uint32_t max_len) {
     uint32_t len = 0;
-    len += snprintf(buffer + len, max_len - len, "[");
+    len = sfmt_append(buffer, max_len, len, "[");
 
     for (uint8_t i = 0; i < TOTAL_SYSTEM_INTERFACES; i++) {
         const char *st_str = "active";
@@ -89,8 +90,7 @@ uint32_t Interface_BuildArrayJSON(char *buffer, uint32_t max_len) {
 
         uint8_t can_disable = (i != 0 && s_interfaces[i].status != IF_STATUS_WAITING_ASIC) ? 1 : 0;
 
-        len += snprintf(buffer + len, max_len - len,
-            "%s{\"id\":%d,\"name\":\"%s\",\"type\":\"%s\",\"hardware\":\"%s\","
+        len = sfmt_append(buffer, max_len, len, "%s{\"id\":%d,\"name\":\"%s\",\"type\":\"%s\",\"hardware\":\"%s\","
             "\"status\":\"%s\",\"desc\":\"%s\",\"channels_total\":%d,"
             "\"channels_used\":%d,\"enabled\":%s,\"can_disable\":%s}",
             (i > 0) ? "," : "",
@@ -108,17 +108,16 @@ uint32_t Interface_BuildArrayJSON(char *buffer, uint32_t max_len) {
         if (len >= max_len - 32) break;
     }
 
-    len += snprintf(buffer + len, max_len - len, "]");
+    len = sfmt_append(buffer, max_len, len, "]");
     return len;
 }
 
 void Interface_BuildDiscoveryJSON(char *buffer, uint32_t max_len) {
     uint32_t len = 0;
-    len += snprintf(buffer + len, max_len - len,
-        "{\"cpu_clock_mhz\":%lu,\"clock_source\":\"%s\",\"interfaces\":",
+    len = sfmt_append(buffer, max_len, len, "{\"cpu_clock_mhz\":%lu,\"clock_source\":\"%s\",\"interfaces\":",
         (unsigned long)(RCC_GetSysClockFreq() / 1000000UL),
         RCC_IsHSEUsed() ? "HSE PLL 168MHz" : "HSI PLL 168MHz");
 
-    len += Interface_BuildArrayJSON(buffer + len, max_len - len);
+    len = sfmt_advance(max_len, len, Interface_BuildArrayJSON(buffer + len, max_len - len));
     snprintf(buffer + len, max_len - len, "}");
 }

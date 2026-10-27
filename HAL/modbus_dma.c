@@ -6,6 +6,7 @@
 #include "modbus_dma.h"
 #include "dsp_filter.h"
 #include "stm32f407_regs.h"
+#include "rcc_stm32.h"
 #include "cmsis_os2.h"
 #include <string.h>
 #include <stdio.h>
@@ -50,6 +51,60 @@ static float Decode_Float_DCBA(uint16_t r0, uint16_t r1) {
 static inline void MAX485_TX(void) { GPIOD->BSRR = (1U << 3) | (1U << 2); }
 static inline void MAX485_RX(void) { GPIOD->BSRR = (1U << (3+16)) | (1U << (2+16)); }
 
+/* USART3 RX ring buffer, filled by the RXNE interrupt. A single-byte DR
+ * with task polling loses bytes (overrun) whenever a higher-priority task
+ * runs for more than one character time (~1.04 ms at 9600 baud). */
+#define RS485_RX_BUF_SIZE 256U
+static volatile uint8_t  s_rx_buf[RS485_RX_BUF_SIZE];
+static volatile uint16_t s_rx_head = 0;
+static volatile uint16_t s_rx_tail = 0;
+
+/* Bus diagnostics: raw byte count, framing/noise and overrun errors, and the
+ * last 4 raw bytes seen. Zero bytes => wiring/slave silent; bytes with
+ * framing errors => baud/format mismatch. */
+static volatile uint32_t s_rx_bytes = 0;
+static volatile uint32_t s_rx_fe    = 0;
+static volatile uint32_t s_rx_ore   = 0;
+static volatile uint8_t  s_rx_last[4];
+
+void USART3_IRQHandler(void) {
+    uint32_t sr = USART3->SR;
+    if (sr & ((1U << 5) | 0x0FU)) {
+        uint8_t b = (uint8_t)USART3->DR; /* DR read also clears ORE/FE/NE/PE */
+        if (sr & ((1U << 1) | (1U << 2))) s_rx_fe++;
+        if (sr & (1U << 3)) s_rx_ore++;
+        if (sr & (1U << 5)) {
+            s_rx_bytes++;
+            s_rx_last[0] = s_rx_last[1];
+            s_rx_last[1] = s_rx_last[2];
+            s_rx_last[2] = s_rx_last[3];
+            s_rx_last[3] = b;
+            uint16_t next = (uint16_t)((s_rx_head + 1U) % RS485_RX_BUF_SIZE);
+            if (next != s_rx_tail) {
+                s_rx_buf[s_rx_head] = b;
+                s_rx_head = next;
+            }
+        }
+    }
+}
+
+static void RS485_RxFlush(void) {
+    s_rx_tail = s_rx_head;
+}
+
+static int RS485_RxGet(uint8_t *b) {
+    if (s_rx_tail == s_rx_head) return 0;
+    *b = s_rx_buf[s_rx_tail];
+    s_rx_tail = (uint16_t)((s_rx_tail + 1U) % RS485_RX_BUF_SIZE);
+    return 1;
+}
+
+/* Response window = slave turnaround allowance + wire time of the expected
+ * reply (~1.1 ms per byte at 9600 8N1, with margin). */
+static uint32_t RS485_ReplyTimeout(uint32_t turnaround_ms, uint32_t reply_bytes) {
+    return turnaround_ms + (reply_bytes * 11U + 9U) / 10U;
+}
+
 void Modbus_DMA_Init(void) {
     if (!sensorMutex) sensorMutex = osMutexNew(NULL);
     if (!configMutex) configMutex = osMutexNew(NULL);
@@ -64,9 +119,17 @@ void Modbus_DMA_Init(void) {
     GPIOD->MODER |= ((1U << 4) | (1U << 6));
     GPIOD->OSPEEDR |= ((2U << 4) | (2U << 6));
     MAX485_RX();
-    USART3->BRR = 0x0683;
+    /* Compute BRR from the live PCLK1 (42 MHz at 168 MHz SYSCLK). The old
+     * hardcoded 0x0683 assumed 16 MHz HSI and produced ~25.2 kbaud. */
+    {
+        uint32_t pclk1 = RCC_GetPCLK1Freq();
+        uint32_t div_x16 = (2U * pclk1 + 9600U) / (2U * 9600U);
+        USART3->BRR = ((div_x16 / 16U) << 4) | (div_x16 % 16U);
+    }
     USART3->CR2 = 0;
-    USART3->CR1 = (1U << 13) | (1U << 3) | (1U << 2);
+    USART3->CR1 = (1U << 13) | (1U << 5) | (1U << 3) | (1U << 2); /* UE | RXNEIE | TE | RE */
+    NVIC_IPR[39] = (uint8_t)(6U << 4);  /* USART3_IRQn = 39; no RTOS calls in ISR */
+    NVIC_ISER[1] |= (1U << (39 - 32));
 
     /* Default config: empty sensor list (user adds via Auto-Scan / UI) + default relays */
     Get_Shared_Config(&cfg);
@@ -81,6 +144,7 @@ void Modbus_DMA_Init(void) {
         cfg.mqtt_tx_enabled = 1;
         strncpy(cfg.admin_username, "admin", sizeof(cfg.admin_username));
         strncpy(cfg.admin_password, "adminkontrx", sizeof(cfg.admin_password));
+        strncpy(cfg.master_password, "KontrxMaster2026", sizeof(cfg.master_password));
         cfg.actuator_mask = 0x0F;
         snprintf(cfg.sparkplug_edge_node_id, sizeof(cfg.sparkplug_edge_node_id), "KX-%07lu", (unsigned long)cfg.serial);
         snprintf(cfg.sparkplug_device_id, sizeof(cfg.sparkplug_device_id), "KX-%07lu-dev", (unsigned long)cfg.serial);
@@ -99,7 +163,7 @@ void Modbus_DMA_Init(void) {
  * Modbus_Safe_Transaction — one blocking RS485 read (polling, no DMA).
  *
  * WHY THIS IS SLOW (> 1 ms per call, unavoidable):
- *   UART runs at 9600 baud (USART3 BRR=0x0683 => ~9598 baud), so one byte
+ *   UART runs at 9600 baud (USART3 BRR computed from PCLK1), so one byte
  *   takes ~1.04 ms on the wire. A single 8-byte request + 3.5-char gap +
  *   9-byte response is ~21 ms minimum, plus the slave's own reply delay.
  *   Modbus RTU protocol REQUIRES the 3.5-char silent gap between frames,
@@ -116,7 +180,9 @@ void Modbus_DMA_Init(void) {
 /*
  * Modbus_Safe_Transaction — one blocking RS485 read (polling, no DMA).
  *
- * timeout_ms: how long to wait for the slave's first byte.
+ * timeout_ms: slave turnaround allowance. The wire time of the expected
+ *   reply is added on top (see RS485_ReplyTimeout), so long frames such as
+ *   the Multi-Sensor FC04 summary (25 bytes) are not cut short.
  *   Fast sensors (pH/ORP/EC/Ammonia/Ultrasonic): 80ms  — respond in <50ms
  *   Slow sensors (DO KWS-630):                  300ms  — response can take >100ms
  *   Multi-US per channel:                        80ms  — each channel is fast
@@ -127,6 +193,10 @@ void Modbus_DMA_Init(void) {
  *   2 × 250ms = 500ms wasted per cycle, causing data to look stale and the
  *   MQTT payload to always be incomplete.
  */
+/* Set by the last Modbus_Safe_Transaction_T() when the slave answered with
+ * a valid exception frame (it is present but rejected the request). */
+static uint8_t s_last_exception = 0;
+
 static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
                                           uint16_t reg, uint8_t num,
                                           uint16_t *out, uint32_t timeout_ms) {
@@ -134,90 +204,145 @@ static uint8_t Modbus_Safe_Transaction_T(uint8_t slave, uint8_t fc,
     uint16_t crc = Modbus_CRC16(f, 6);
     f[6] = crc & 0xFF; f[7] = crc >> 8;
 
-    /* 1. Flush any stale bytes from UART RX buffer to guarantee a clean start */
-    while (USART3->SR & (1U << 5)) {
-        volatile uint32_t junk = USART3->DR;
-        (void)junk;
-    }
-    /* Clear error flags */
-    if (USART3->SR & 0x0F) {
-        volatile uint32_t junk_dr = USART3->DR;
-        (void)junk_dr;
-    }
+    /* 1. Drop any stale bytes so the reply starts from a clean buffer */
+    RS485_RxFlush();
 
     /* 2. Switch MAX485 to TX mode and settle without yielding the CPU */
     MAX485_TX();
     for (volatile int d = 0; d < 2000; d++); /* microsecond settle delay */
 
     /* 3. Send Modbus query */
+    USART3->SR &= ~(1U << 6); /* Clear TC flag before sending */
     for(int i=0; i<8; i++) {
-        uint32_t tx_timeout = 10000;
+        uint32_t tx_timeout = 100000;
         while(!(USART3->SR & (1U << 7)) && --tx_timeout);
         USART3->DR = f[i];
     }
-    uint32_t tc_timeout = 20000;
+    /* At 9600 baud, 1 byte takes ~1.04ms (175,000 cycles at 168MHz). 
+     * tc_timeout must be at least 500,000 cycles so the last byte is fully sent! */
+    uint32_t tc_timeout = 500000;
     while(!(USART3->SR & (1U << 6)) && --tc_timeout);
+
+    for (volatile int d = 0; d < 200; d++); /* STOP bit settle delay */
 
     /* 4. Switch back to RX mode immediately */
     MAX485_RX();
+    RS485_RxFlush(); /* discard any echo/glitch captured while DE was high */
 
-    /* 5. Read response with noise rejection state machine */
-    uint8_t rx[50]; int received = 0;
+    /* 5. Read response with noise rejection state machine. Bytes arrive via
+     *    the RXNE interrupt, so sleeping between checks cannot overrun. */
+    uint8_t rx[64]; int received = 0;
+    const int expected = 3 + num * 2 + 2;
+    uint8_t is_exception = 0;
+    uint32_t window = RS485_ReplyTimeout(timeout_ms, (uint32_t)expected);
     uint32_t start = osKernelGetTickCount();
-    
-    while((osKernelGetTickCount() - start) < timeout_ms) {
-        if(USART3->SR & (1U << 5)) {
-            uint8_t b = (uint8_t)USART3->DR;
 
-            /* Reject leading noise: first byte must be the target slave ID */
-            if (received == 0 && b != slave) {
-                osDelay(1);
-                continue;
-            }
-            
-            /* Reject frame shift: second byte must match function code */
-            if (received == 1 && b != fc) {
+    while ((osKernelGetTickCount() - start) < window) {
+        uint8_t b;
+        if (!RS485_RxGet(&b)) {
+            osDelay(1);
+            continue;
+        }
+
+        /* Reject leading noise: first byte must be the target slave ID */
+        if (received == 0 && b != slave) {
+            continue;
+        }
+
+        /* Second byte must be the function code or its exception (fc|0x80) */
+        if (received == 1 && b != fc) {
+            if (b == (uint8_t)(fc | 0x80U)) {
+                is_exception = 1;
+            } else {
                 received = 0;
                 if (b == slave) {
                     rx[received++] = b;
                 }
-                osDelay(1);
                 continue;
             }
-            
-            if(received < 50) {
-                rx[received++] = b;
-            }
-            
-            /* Check if we got the expected packet length */
-            if(received >= (3 + num*2 + 2)) {
-                break;
-            }
-        } else {
-            /* No byte yet — sleep for 1ms to allow lower-priority tasks
-             * (HTTP dashboard, MQTT client) to run. */
-            osDelay(1);
         }
-        
-        /* Clean any hardware errors (Overrun, Framing, Noise) on the fly */
-        if(USART3->SR & 0x0F) {
-            volatile uint32_t d = USART3->DR;
-            (void)d;
+
+        if (received < (int)sizeof(rx)) {
+            rx[received++] = b;
+        }
+
+        /* Exception reply: slave + (fc|0x80) + code + CRC = 5 bytes */
+        if (is_exception && received >= 5) {
+            break;
+        }
+        if (received >= expected) {
+            break;
         }
     }
-    
-    if(received < 5 || rx[0] != slave || rx[1] != fc) return 0;
+
+    s_last_exception = 0;
+    if (is_exception && received >= 5 &&
+        Modbus_CRC16(rx, 3) == (rx[3] | (rx[4] << 8))) {
+        s_last_exception = 1; /* device exists but rejected the request */
+        return 0;
+    }
+
+    if(received < expected || rx[0] != slave || rx[1] != fc) return 0;
     if(Modbus_CRC16(rx, received-2) != (rx[received-2]|(rx[received-1]<<8))) return 0;
     
     for(int i=0; i<num; i++) out[i] = (rx[3+i*2]<<8) | rx[4+i*2];
     return 1;
 }
 
-/* Backward-compatible wrapper with optimized 40ms default */
-static uint8_t Modbus_Safe_Transaction(uint8_t slave, uint8_t fc,
-                                        uint16_t reg, uint8_t num,
-                                        uint16_t *out) {
-    return Modbus_Safe_Transaction_T(slave, fc, reg, num, out, 40);
+/* FC06 — Write Single Register (e.g. Simulation Mode Switch at Address 165) */
+static uint8_t Modbus_Write_Register_FC06(uint8_t slave, uint16_t reg, uint16_t val, uint32_t timeout_ms) {
+    uint8_t f[8] = {slave, 0x06, (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF), (uint8_t)(val >> 8), (uint8_t)(val & 0xFF), 0, 0};
+    uint16_t crc = Modbus_CRC16(f, 6);
+    f[6] = (uint8_t)(crc & 0xFF); f[7] = (uint8_t)(crc >> 8);
+
+    RS485_RxFlush();
+
+    MAX485_TX();
+    for (volatile int d = 0; d < 2000; d++);
+
+    USART3->SR &= ~(1U << 6);
+    for (int i = 0; i < 8; i++) {
+        uint32_t tx_timeout = 100000;
+        while (!(USART3->SR & (1U << 7)) && --tx_timeout);
+        USART3->DR = f[i];
+    }
+    uint32_t tc_timeout = 500000;
+    while (!(USART3->SR & (1U << 6)) && --tc_timeout);
+
+    for (volatile int d = 0; d < 200; d++);
+    MAX485_RX();
+
+    uint8_t rx[16]; int received = 0;
+    uint32_t window = RS485_ReplyTimeout(timeout_ms, 8U);
+    uint32_t start = osKernelGetTickCount();
+    while ((osKernelGetTickCount() - start) < window) {
+        uint8_t b;
+        if (!RS485_RxGet(&b)) { osDelay(1); continue; }
+        if (received == 0 && b != slave) continue;
+        if (received == 1 && b != 0x06) { received = 0; if (b == slave) rx[received++] = b; continue; }
+        if (received < 16) rx[received++] = b;
+        if (received >= 8) break;
+    }
+    if (received < 8 || rx[0] != slave || rx[1] != 0x06) return 0;
+    if (Modbus_CRC16(rx, 6) != (rx[6] | (rx[7] << 8))) return 0;
+    return 1;
+}
+
+uint8_t Modbus_SetMultiSensorMode(uint8_t slave_id, uint8_t mode) {
+    uint8_t ok = Modbus_Write_Register_FC06(slave_id, 165, mode ? 1 : 0, 50);
+    if (ok) {
+        Modbus_SensorData_t local;
+        Get_Shared_Sensor_Data(&local);
+        for (uint8_t i = 0; i < local.multi_us_count && i < MAX_MULTI_US; i++) {
+            if (local.multi_us[i].id == slave_id) {
+                local.multi_us[i].mode = mode ? 1 : 0;
+                break;
+            }
+        }
+        Update_Shared_Sensor_Data(&local);
+        printf("[MODBUS] Multi-Sensor Board (ID %u) mode set to %s\r\n", slave_id, mode ? "SIMULATION" : "NORMAL");
+    }
+    return ok;
 }
 
 void Modbus_DMA_PollSensors(void) {
@@ -275,8 +400,9 @@ void Modbus_DMA_PollSensors(void) {
     extern volatile uint32_t g_uptime_seconds;
 
     for (uint8_t s = 0; s < cfg.sensors.count && s < MAX_SENSORS; s++) {
-        /* Smart Backoff: if sensor is offline/unresponsive, skip polling for 4 seconds */
-        if (fail_cnt[s] >= 2 && g_uptime_seconds < fail_until_s[s]) {
+        /* Smart Backoff: if sensor is offline/unresponsive, skip polling for 4 seconds (exempt type 7) */
+        uint8_t sensor_type_peek = cfg.sensors.entries[s].type;
+        if (sensor_type_peek != 7 && fail_cnt[s] >= 2 && g_uptime_seconds < fail_until_s[s]) {
             local.readings[s].valid = 0;
             continue;
         }
@@ -339,9 +465,9 @@ void Modbus_DMA_PollSensors(void) {
                 }
                 break;
 
-            case 7: /* Multi-US board — 8 channels */
+            case 7: /* Multi-Sensor Board (3 Ultrasonic, 3 Flow, 2 Temp) */
                 if (mu_idx < MAX_MULTI_US) {
-                    MultiUS_t *mu = &local.multi_us[mu_idx];
+                    MultiSensorBoard_t *mu = &local.multi_us[mu_idx];
                     
                     /* Restore previous board metadata */
                     uint8_t found_meta = 0;
@@ -354,52 +480,117 @@ void Modbus_DMA_PollSensors(void) {
                     }
                     if (!found_meta || mu->id != sid) {
                         mu->id = sid;
-                        for (uint8_t c = 0; c < 8; c++) mu->dist[c] = -1000.0f;
+                        for (uint8_t c = 0; c < 3; c++) mu->dist[c] = -1000.0f;
+                        for (uint8_t c = 0; c < 3; c++) {
+                            mu->flow[c].rate = 0.0f;
+                            mu->flow[c].total_l = 0;
+                            mu->flow[c].freq_hz = 0.0f;
+                            mu->flow[c].status = 0;
+                        }
+                        mu->temp[0] = -1000.0f;
+                        mu->temp[1] = -1000.0f;
+                        mu->mode = 0;
                         mu->avg = -1000.0f;
                         mu->comp = -1000.0f;
-                        mu->temp = -1000.0f;
+                        mu->legacy_temp = -1000.0f;
+                        for (uint8_t k = 0; k < 10; k++) mu->summary[k] = 0;
+                        mu->summary_ok = 0;
                     }
 
-                    /* Poll 2 channels of the 8 in this cycle to avoid blocking the bus */
+                    uint8_t target_sid = sid;
+                    uint8_t summary_now = 0;
+
+                    /* 1. FC04 Summary (Start 0, Quantity 10). Slave input-register map:
+                     *    0 dist avg (mm), 1 temp avg (x10 degC), 2 dist temp-compensated (mm),
+                     *    3 total flow rate (x10 L/min), 4-5 combined volume H/L (L),
+                     *    6 total pulse freq (Hz), 7 health bitmask, 8 uptime (s), 9 error code.
+                     *    Only aggregate fields come from here; per-channel values are
+                     *    read from the FC03 blocks below. */
+                    if (Modbus_Safe_Transaction_T(target_sid, 0x04, 0x0000, 10, rs, 60)) {
+                        for (uint8_t k = 0; k < 10; k++) mu->summary[k] = rs[k];
+                        mu->summary_ok = 1;
+                        summary_now = 1;
+                        ok = 1;
+                    }
+
+                    /* 2. Poll FC03 channel blocks for detailed registers (Offsets 0x00..0x70) */
                     for (uint8_t c = 0; c < 2; c++) {
                         uint8_t ch = (multi_us_channel_offset + c) % 8;
-                        if (Modbus_Safe_Transaction_T(sid, 0x03, ch * 0x10, 3, rs, 40)) {
-                            mu->dist[ch] = (float)rs[0];
-                        } else {
-                            mu->dist[ch] = -1000.0f;
+                        uint16_t reg_addr = ch * 0x10;
+
+                        if (ch <= 2) {
+                            /* Ultrasonic 1..3: distance (mm), signal quality, status (1 = valid) */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 60)) {
+                                mu->dist[ch] = (rs[2] == 1U) ? (float)rs[0] : -1000.0f;
+                                ok = 1;
+                            }
+                        } else if (ch >= 3 && ch <= 5) {
+                            /* Water Flow 1..3: 5 registers */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 5, rs, 60)) {
+                                uint8_t f = ch - 3;
+                                mu->flow[f].rate    = (float)rs[0] / 10.0f;
+                                mu->flow[f].total_l = ((uint32_t)rs[1] << 16) | (uint32_t)rs[2];
+                                mu->flow[f].freq_hz = (float)rs[3];
+                                mu->flow[f].status  = (uint8_t)rs[4];
+                                ok = 1;
+                            }
+                        } else if (ch == 6 || ch == 7) {
+                            /* Temp 1..2: value (x10 degC), quality, status (1 = valid) */
+                            if (Modbus_Safe_Transaction_T(target_sid, 0x03, reg_addr, 3, rs, 60)) {
+                                uint8_t t = ch - 6;
+                                mu->temp[t] = (rs[2] == 1U) ? ((int16_t)rs[0]) / 10.0f : -1000.0f;
+                                ok = 1;
+                            }
                         }
-                        osDelay(15); /* 15ms inter-channel gap for line discharge */
+                        osDelay(10);
                     }
 
-                    /* Calculate average from all channels that have valid values */
-                    uint32_t sum = 0; uint8_t valid = 0;
-                    for (uint8_t i = 0; i < 8; i++) {
-                        if (mu->dist[i] > 0.0f && mu->dist[i] < 10000.0f) {
-                            sum += (uint32_t)mu->dist[i];
-                            valid++;
-                        }
-                    }
-                    if (valid > 0) {
-                        mu->avg = (float)(sum / valid);
-                        ok = 1;
+                    if (summary_now) {
+                        /* Aggregates computed by the slave over all of its channels */
+                        mu->avg  = (mu->summary[0] > 0U) ? (float)mu->summary[0] : -1000.0f;
+                        mu->comp = (mu->summary[2] > 0U) ? (float)mu->summary[2] : -1000.0f;
                     } else {
-                        mu->avg = -1000.0f;
-                    }
-
-                    /* Poll temp & config compensation once in a while */
-                    if (multi_us_channel_offset == 0) {
-                        if (Modbus_Safe_Transaction_T(sid, 0x03, 0x0080, 3, rs, 40)) {
-                            mu->temp = rs[0] / 10.0f;
+                        /* FC04 missed this cycle: average the valid US channels locally */
+                        uint32_t sum = 0; uint8_t valid_us = 0;
+                        for (uint8_t i = 0; i < 3; i++) {
+                            if (mu->dist[i] > 0.0f && mu->dist[i] < 10000.0f) {
+                                sum += (uint32_t)mu->dist[i];
+                                valid_us++;
+                            }
                         }
-                        if (Modbus_Safe_Transaction_T(sid, 0x04, 0x0000, 3, rs, 40)) {
-                            mu->comp = (float)rs[2];
-                        }
+                        mu->avg = (valid_us > 0) ? (float)(sum / valid_us) : -1000.0f;
                     }
 
                     if (mu_idx >= local.multi_us_count) local.multi_us_count = mu_idx + 1;
                     mu_idx++;
-                    rd->value = mu->avg;
-                    rd->temp  = mu->temp;
+
+                    rd->value = (mu->avg > 0.0f) ? mu->avg : mu->flow[0].rate;
+                    if (summary_now) {
+                        rd->temp = ((int16_t)mu->summary[1]) / 10.0f;
+                    } else {
+                        rd->temp = (mu->temp[0] > -50.0f) ? mu->temp[0] : ((mu->temp[1] > -50.0f) ? mu->temp[1] : 0.0f);
+                    }
+                    mu->legacy_temp = rd->temp;
+
+                    /* Log significant sensor change (COV: distance delta > 50mm, flow delta > 2.0 L/m, or temp delta > 1.0 C) */
+                    static float s_last_log_dist = -999.0f;
+                    static float s_last_log_flow = -999.0f;
+                    static float s_last_log_temp = -999.0f;
+                    static uint32_t s_last_sensor_log_s = 0;
+                    float d_dist = mu->dist[0] - s_last_log_dist; if (d_dist < 0) d_dist = -d_dist;
+                    float d_flow = mu->flow[0].rate - s_last_log_flow; if (d_flow < 0) d_flow = -d_flow;
+                    float d_temp = mu->temp[0] - s_last_log_temp; if (d_temp < 0) d_temp = -d_temp;
+                    if (s_last_sensor_log_s == 0 || d_dist >= 50.0f || d_flow >= 2.0f || d_temp >= 1.0f || (g_uptime_seconds - s_last_sensor_log_s >= 60)) {
+                        s_last_log_dist = mu->dist[0];
+                        s_last_log_flow = mu->flow[0].rate;
+                        s_last_log_temp = mu->temp[0];
+                        s_last_sensor_log_s = g_uptime_seconds;
+                        char s_log[96];
+                        snprintf(s_log, sizeof(s_log), "MultiSensor (ID %u): Dist=%.0fmm, Flow=%.1fL/m, Temp=%.1f C",
+                                 target_sid, mu->dist[0], mu->flow[0].rate, mu->temp[0]);
+                        extern void Log_Event(const char *category, const char *message);
+                        Log_Event("SENSOR", s_log);
+                    }
                 }
                 break;
 
@@ -425,7 +616,7 @@ void Modbus_DMA_PollSensors(void) {
                 else if (rd->type == 4) tname = "DO";
                 else if (rd->type == 5) tname = "Ammonia";
                 else if (rd->type == 6) tname = "Ultrasonic";
-                else if (rd->type == 7) tname = "Multi-US";
+                else if (rd->type == 7) tname = "Multi-Sensor";
                 
                  char log_buf[64];
                 snprintf(log_buf, sizeof(log_buf), "Sensor %s (ID %u) connected.", tname, rd->id);
@@ -450,7 +641,7 @@ void Modbus_DMA_PollSensors(void) {
                 else if (rd->type == 4) tname = "DO";
                 else if (rd->type == 5) tname = "Ammonia";
                 else if (rd->type == 6) tname = "Ultrasonic";
-                else if (rd->type == 7) tname = "Multi-US";
+                else if (rd->type == 7) tname = "Multi-Sensor";
                 
                 char log_buf[64];
                 snprintf(log_buf, sizeof(log_buf), "Sensor %s (ID %u) disconnected.", tname, rd->id);
@@ -470,39 +661,59 @@ void Modbus_DMA_PollSensors(void) {
     Update_Shared_Sensor_Data(&local);
 }
 
+/* Copies sharedSensorData into a batch. Caller holds sensorMutex (or the
+ * kernel is not running yet). */
+static void Fill_Batch(TelemetryBatch_t *dest) {
+    dest->count = sharedSensorData.readings_count;
+    for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
+        SensorReading_t *rd = &sharedSensorData.readings[i];
+        dest->records[i].type = rd->type;
+        dest->records[i].id   = rd->id;
+        dest->records[i].avg_value         = rd->value;
+        dest->records[i].avg_temp          = rd->temp;
+        dest->records[i].samples_collected = 1;
+        dest->records[i].valid             = rd->valid;
+    }
+
+    /* Multi-sensor boards: per-channel values, valid with the board's reading */
+    dest->multi_count = 0;
+    for (uint8_t i = 0; i < sharedSensorData.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *mu = &sharedSensorData.multi_us[i];
+        MultiChRecord_t *mc = &dest->multi[dest->multi_count++];
+        mc->id = mu->id;
+        mc->valid = 0;
+        for (uint8_t r = 0; r < dest->count; r++) {
+            if (dest->records[r].type == SENSOR_TYPE_MULTI_US && dest->records[r].id == mu->id) {
+                mc->valid = dest->records[r].valid;
+                break;
+            }
+        }
+        for (uint8_t c = 0; c < 3; c++) mc->ch[MULTI_CH_US + c]   = mu->dist[c];
+        for (uint8_t c = 0; c < 3; c++) mc->ch[MULTI_CH_FLOW + c] = mu->flow[c].rate;
+        for (uint8_t c = 0; c < 2; c++) mc->ch[MULTI_CH_TEMP + c] = mu->temp[c];
+    }
+}
+
 void Modbus_DMA_ConsumeBatch(TelemetryBatch_t *dest) {
     if (!dest) return;
 
     if (osKernelGetState() != osKernelRunning || sensorMutex == NULL) {
-        dest->count = sharedSensorData.readings_count;
-        for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
-            SensorReading_t *rd = &sharedSensorData.readings[i];
-            dest->records[i].type = rd->type;
-            dest->records[i].id   = rd->id;
-            dest->records[i].avg_value         = rd->value;
-            dest->records[i].avg_temp          = rd->temp;
-            dest->records[i].samples_collected = 1;
-            dest->records[i].valid             = rd->valid;
-        }
+        Fill_Batch(dest);
         return;
     }
 
     if (osMutexAcquire(sensorMutex, 50) == osOK) {
-        dest->count = sharedSensorData.readings_count;
-        for (uint8_t i = 0; i < sharedSensorData.readings_count && i < MAX_SENSORS; i++) {
-            SensorReading_t *rd = &sharedSensorData.readings[i];
-            dest->records[i].type = rd->type;
-            dest->records[i].id   = rd->id;
-            dest->records[i].avg_value         = rd->value;
-            dest->records[i].avg_temp          = rd->temp;
-            dest->records[i].samples_collected = 1;
-            dest->records[i].valid             = rd->valid;
-        }
+        Fill_Batch(dest);
         osMutexRelease(sensorMutex);
     } else {
         dest->count = 0;
+        dest->multi_count = 0;
     }
 }
+
+/* Scan probes use a generous turnaround: unknown slaves (e.g. a Blue Pill
+ * board) may take tens of ms to start replying. */
+#define SCAN_TURNAROUND_MS 100U
 
 void Modbus_DMA_PerformScan(void) {
     g_scan_status.is_scanning = 1;
@@ -511,31 +722,43 @@ void Modbus_DMA_PerformScan(void) {
     for(int i=1; i<=247; i++) {
         if(!g_scan_status.is_scanning) break;
         uint8_t type = 0;
-        /* Check for DO sensor (Kacise KWS-630) */
-        if(Modbus_Safe_Transaction(i, 0x03, 0x2600, 6, d)) {
-            type = 4;
-        /* Check for multi-ultrasonic board (read US#1 block at 0x00) */
-        } else if(Modbus_Safe_Transaction(i, 0x03, 0x00, 3, d)) {
-            if(d[0] > 0 && d[0] < 10000 && d[2] == 0) {
-                if(Modbus_Safe_Transaction(i, 0x03, 0x10, 3, d))
-                    type = 7;
-            }
-            if(!type && Modbus_Safe_Transaction(i, 0x03, 0, 10, d)) {
+
+        /* 1. Presence probe: any valid reply, including an exception frame,
+         *    proves a device lives at this address. */
+        uint8_t present = Modbus_Safe_Transaction_T(i, 0x03, 0x0000, 1, d, SCAN_TURNAROUND_MS);
+        if (!present && s_last_exception) present = 1;
+
+        if (present) {
+            osDelay(10);
+            /* 2. Multi-Sensor Board: FC04 summary (0, qty 10) AND the
+             *    DS18B20 block at 0x60, which plain sensors do not expose. */
+            if (Modbus_Safe_Transaction_T(i, 0x04, 0x0000, 10, d, SCAN_TURNAROUND_MS) &&
+                Modbus_Safe_Transaction_T(i, 0x03, 0x0060, 2, d, SCAN_TURNAROUND_MS)) {
+                type = 7;
+            /* 3. DO sensor (Kacise KWS-630) */
+            } else if (Modbus_Safe_Transaction_T(i, 0x03, 0x2600, 6, d, SCAN_TURNAROUND_MS)) {
+                type = 4;
+            /* 4. Single ultrasonic: 10-register block at 0 */
+            } else if (Modbus_Safe_Transaction_T(i, 0x03, 0x0000, 10, d, SCAN_TURNAROUND_MS)) {
                 type = 6;
+            /* 5. Generic 2-register water-quality sensor (pH/ORP/EC/Ammonia) */
+            } else if (Modbus_Safe_Transaction_T(i, 0x03, 0x0000, 2, d, SCAN_TURNAROUND_MS)) {
+                type = 1;
+            } else {
+                type = 255; /* present but unrecognised */
             }
-            if(!type) type = 1;
         }
-        if(type && g_scan_status.count < 32) {
+
+        if(type && g_scan_status.count < SCAN_MAX_DEVICES) {
             g_scan_status.devices[g_scan_status.count].id = i;
             g_scan_status.devices[g_scan_status.count].type = type;
             g_scan_status.count++;
+            printf("[SCAN] Found device ID %d type %u\r\n", i, type);
         }
         g_scan_status.progress = (i * 100) / 247;
-        osDelay(10); /* 10ms between probed addresses: lets a non-responding
-                      * slave's timeout elapse before the next probe. A full
-                      * network scan sweeps 247 addresses => many seconds,
-                      * far beyond 1ms (it's a one-shot background operation). */
+        osDelay(10); /* inter-frame silence before probing the next address */
     }
+    g_scan_status.progress = 100;
     g_scan_status.is_scanning = 0;
 }
 
@@ -598,5 +821,4 @@ void Update_Shared_Config(const Gateway_Config_t *src) {
     }
 }   
 
-void USART3_IRQHandler(void) { }
 void DMA1_Stream3_IRQHandler(void) { }

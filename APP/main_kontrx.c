@@ -46,6 +46,7 @@
 #include "analog_010v.h"
 #include "interface_discovery.h"
 #include "modbus_tcp_server.h"
+#include "fault_supervisor.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -85,7 +86,17 @@ static void SPI_CritExit(void) {
  * ====================================================================== */
 int _write(int file, char *ptr, int len) {
     (void)file;
-    for (int i = 0; i < len; i++) UART_Debug_SendByte((uint8_t)ptr[i]);
+    if (len <= 0) return 0;
+    uint32_t ipsr;
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+    /* Tasks queue the text for the TXE interrupt and never wait on the UART.
+     * Before the scheduler runs, or from an exception handler (fault hooks),
+     * send by polling so the message is not lost. */
+    if (ipsr == 0U && xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+        UART_Debug_WriteAsync((const uint8_t *)ptr, (uint32_t)len);
+    } else {
+        UART_Debug_WriteBlocking((const uint8_t *)ptr, (uint32_t)len);
+    }
     return len;
 }
 
@@ -104,16 +115,14 @@ static void    W5500_SPI_WriteByte(uint8_t data)  { SPI2_ReadWriteByte(data); }
 /* ======================================================================
  *  Stack overflow / malloc hooks
  * ====================================================================== */
+/* No reset and no hang: the overflowing task is removed and restarted by
+ * the fault supervisor; a failed allocation only fails that request. */
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
-    (void)xTask;
-    printf("\r\n!!! STACK OVERFLOW: %s !!!\r\n", pcTaskName);
-    while (1);
+    Supervisor_OnStackOverflow(xTask, pcTaskName);
 }
 
 void vApplicationMallocFailedHook(void) {
-    printf("\r\n!!! FreeRTOS MALLOC FAILED -> Auto-resetting !!!\r\n");
-    SCB_AIRCR = AIRCR_VECTKEY | AIRCR_SYSRESET;
-    while (1);
+    Supervisor_OnMallocFailed();
 }
 
 /* ======================================================================
@@ -222,6 +231,7 @@ static void Load_Config_From_Flash(void) {
 
         strncpy(sharedConfig.admin_username, "admin", sizeof(sharedConfig.admin_username));
         strncpy(sharedConfig.admin_password, "adminkontrx", sizeof(sharedConfig.admin_password));
+        strncpy(sharedConfig.master_password, "KontrxMaster2026", sizeof(sharedConfig.master_password));
         sharedConfig.actuator_mask = 0x0F; // All enabled by default (PTO, 0-10V, 4-20mA, PWM)
 
         Partition_SaveConfig(&sharedConfig);
@@ -239,6 +249,7 @@ int main(void) {
 
     /* ---- 0. High-Performance Clock: 168 MHz via PLL (HSE / HSI auto-fallback) ---- */
     RCC_SystemClock_168MHz_Init();
+    Supervisor_Init();
 
     /* ---- 1. NVIC priority grouping: 4 bits preemption, 0 sub-priority ---- */
     SCB_AIRCR = AIRCR_VECTKEY | (3U << 8);
@@ -267,6 +278,7 @@ int main(void) {
      * entry (which is extremely common inside WIZnet ioLibrary functions like
      * high-level socket APIs calling low-level register writes) does not deadlock the task. */
     spiMutex = xSemaphoreCreateRecursiveMutex();
+    Supervisor_RegisterMutex(spiMutex, 1);
     if (!spiMutex) {
         printf("[SPI] FATAL: spiMutex creation failed!\r\n");
         while (1);  /* halt — SPI bus would be unprotected */
@@ -276,9 +288,13 @@ int main(void) {
     reg_wizchip_cs_cbfunc(W5500_CS_Select, W5500_CS_Deselect);
     reg_wizchip_spi_cbfunc(W5500_SPI_ReadByte, W5500_SPI_WriteByte);
 
-    /* Start from known W5500 register state.  This also clears a stale
-     * PING-block/PPPoE mode or an abandoned socket left by a brown-out. */
+    /* Ensure CS is deselected and lines are settled */
+    W5500_CS_Deselect();
+    for (volatile uint32_t i = 0; i < 500000; i++) __asm__("nop");
+
+    /* Start from known W5500 register state. */
     wizchip_sw_reset();
+    for (volatile uint32_t i = 0; i < 200000; i++) __asm__("nop");
 
     /* Set RX/TX buffer sizes for 8 sockets (2KB each = 16KB total) */
     uint8_t rx_tx_buf_sizes[8] = {2, 2, 2, 2, 2, 2, 2, 2};
@@ -286,10 +302,15 @@ int main(void) {
         printf("[NET] wizchip_init FAILED\r\n");
     }
 
-    /* VERSIONR is a direct SPI sanity check.  It must be 0x04 on a W5500;
-     * report a wiring/reset fault explicitly instead of only printing an IP
-     * address that was stored in software. */
-    uint8_t w5500_version = getVERSIONR();
+    /* VERSIONR is a direct SPI sanity check. Retry up to 5 times to allow
+     * internal W5500 PLL / clock to stabilize if recently powered on. */
+    uint8_t w5500_version = 0;
+    for (int retry = 0; retry < 5; retry++) {
+        w5500_version = getVERSIONR();
+        if (w5500_version == 0x04U) break;
+        for (volatile uint32_t i = 0; i < 200000; i++) __asm__("nop");
+    }
+
     if (w5500_version != 0x04U) {
         printf("[NET] W5500 SPI FAILED: VERSIONR=0x%02X (expected 0x04)\r\n",
                w5500_version);

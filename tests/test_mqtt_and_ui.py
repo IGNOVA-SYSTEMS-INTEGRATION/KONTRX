@@ -71,6 +71,11 @@ class TestUIElementsAndScripts:
         assert "fetch" in body
         assert "/api/config/mqtt/skip_offline" in body
 
+    def test_mqtt_detail_fetches_full_payload(self, html):
+        """Ensure showMqttLogDetail fetches the full payload via idx parameter."""
+        assert "/api/mqtt/log?idx=" in html
+        assert "activeModalPayloadRaw" in html
+
 
 class TestOTAAuthentication:
     @pytest.fixture(scope="class")
@@ -122,18 +127,23 @@ class TestBackendMQTTRoutesAndQueue:
         """Ensure skip_offline endpoint is handled and persisted."""
         assert "POST /api/config/mqtt/skip_offline" in http_c
 
+    def test_mqtt_log_entry_detail_endpoint_exists(self, http_c):
+        """Ensure GET /api/mqtt/log?idx= is supported and JSON_MqttLogEntryResponse exists."""
+        assert "JSON_MqttLogEntryResponse" in http_c
+        assert 'ParseQueryStringParam(line, "idx"' in http_c
+
     def test_queue_drain_throttled(self, tasks_c):
         """Ensure offline queue draining is rate-limited and respects mqtt_tx_enabled."""
-        idx = tasks_c.find("Partition_Queue_Count() > 0")
+        idx = tasks_c.find("Queue_Count() > 0")
         assert idx != -1
         context = tasks_c[max(0, idx - 400):idx + 400]
         assert "drain_interval_ticks" in context or "s_last_queue_drain_tick" in context
         assert "mqtt_tx_enabled" in context
 
     def test_queue_drain_prevents_duplicate_keys(self, tasks_c):
-        """Ensure offline JSON building avoids duplicate sensor keys."""
-        assert "emitted_keys" in tasks_c
-        assert "duplicate" in tasks_c
+        """Ensure offline JSON building aggregates into batch without duplicate keys."""
+        assert "q_batch" in tasks_c
+        assert "MultiCh_Find" in tasks_c
 
 
 class TestWebAssetsSync:

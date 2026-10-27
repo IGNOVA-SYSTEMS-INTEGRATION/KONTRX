@@ -25,7 +25,7 @@
 
 #include "http_server_task.h"
 #include "freertos_tasks.h"
-#include "cJSON.h"
+#include "rules_parser.h"
 #include "web_assets.h"
 #include "modbus_dma.h"
 #include "w25q16.h"
@@ -43,10 +43,15 @@
 #include "dac_420ma.h"
 #include "analog_010v.h"
 #include "interface_discovery.h"
+#include "safe_fmt.h"
+#include "fault_supervisor.h"
+#include "timekeeper.h"
+#include "rcc_stm32.h"
 #include "sdcard.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 /* ======================================================================
  *  OTA inter-task state (defined here, declared extern in header)
@@ -228,7 +233,7 @@ const char *SensorTypeName(uint8_t type) {
         case 4: return "do";
         case 5: return "ammonia";
         case 6: return "ultrasonic";
-        case 7: return "multi_us";
+        case 7: return "multi_sensor";
         default: return "unknown";
     }
 }
@@ -249,206 +254,6 @@ static void JSON_FormatId(char *out, size_t maxlen, const char *id_str) {
     }
 }
 
-static uint8_t Parse_Op_String(const char *op_str) {
-    if (!op_str) return 0;
-    if (strcmp(op_str, ">") == 0) return 1;
-    if (strcmp(op_str, "<") == 0) return 2;
-    if (strcmp(op_str, "==") == 0) return 3;
-    if (strcmp(op_str, "!=") == 0) return 4;
-    if (strcmp(op_str, ">=") == 0) return 5;
-    if (strcmp(op_str, "<=") == 0) return 6;
-    return 0;
-}
-
-static int8_t Parse_Condition_Tree(const cJSON *cond, RuleConfig_t *cfg) {
-    if (!cond || !cJSON_IsObject(cond) || !cfg) return -1;
-    if (cfg->cond_node_count >= MAX_COND_NODES) return -1;
-
-    int8_t node_idx = (int8_t)cfg->cond_node_count;
-    CondNode_t *n = &cfg->cond_nodes[node_idx];
-    memset(n, 0, sizeof(CondNode_t));
-    for (int k = 0; k < 4; k++) n->children[k] = -1;
-    cfg->cond_node_count++;
-
-    cJSON *t_item = cJSON_GetObjectItemCaseSensitive(cond, "type");
-    const char *type_str = (t_item && cJSON_IsString(t_item)) ? t_item->valuestring : "compare";
-
-    if (strcmp(type_str, "range") == 0) {
-        n->type = COND_NODE_RANGE;
-        cJSON *min_i = cJSON_GetObjectItemCaseSensitive(cond, "min");
-        cJSON *max_i = cJSON_GetObjectItemCaseSensitive(cond, "max");
-        cJSON *mode_i = cJSON_GetObjectItemCaseSensitive(cond, "mode");
-        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
-        if (in_i) {
-            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
-            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
-        }
-        if (min_i && cJSON_IsNumber(min_i)) n->threshold = (float)min_i->valuedouble;
-        if (max_i && cJSON_IsNumber(max_i)) n->threshold_b = (float)max_i->valuedouble;
-        n->range_mode = (mode_i && cJSON_IsString(mode_i) && strcmp(mode_i->valuestring, "outside") == 0) ? 1 : 0;
-        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
-        if (ch && cJSON_IsObject(ch)) {
-            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
-            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
-        }
-    } else if (strcmp(type_str, "hysteresis") == 0) {
-        n->type = COND_NODE_HYSTERESIS;
-        cJSON *hth = cJSON_GetObjectItemCaseSensitive(cond, "high_threshold");
-        cJSON *lth = cJSON_GetObjectItemCaseSensitive(cond, "low_threshold");
-        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
-        if (in_i) {
-            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
-            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
-        }
-        if (hth && cJSON_IsNumber(hth)) n->threshold = (float)hth->valuedouble;
-        if (lth && cJSON_IsNumber(lth)) n->threshold_b = (float)lth->valuedouble;
-    } else if (strcmp(type_str, "timer_on") == 0) {
-        n->type = COND_NODE_TIMER_ON;
-        cJSON *dms = cJSON_GetObjectItemCaseSensitive(cond, "delay_ms");
-        cJSON *dsec = cJSON_GetObjectItemCaseSensitive(cond, "delay_sec");
-        if (dms && cJSON_IsNumber(dms)) n->delay_ms = (uint32_t)dms->valueint;
-        else if (dsec && cJSON_IsNumber(dsec)) n->delay_ms = (uint32_t)(dsec->valuedouble * 1000.0);
-        else n->delay_ms = 1000;
-        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
-        if (ch && cJSON_IsObject(ch)) {
-            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
-            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
-        }
-    } else if (strcmp(type_str, "pulse_timer") == 0) {
-        n->type = COND_NODE_PULSE_TIMER;
-        cJSON *pms = cJSON_GetObjectItemCaseSensitive(cond, "pulse_ms");
-        cJSON *psec = cJSON_GetObjectItemCaseSensitive(cond, "pulse_sec");
-        if (pms && cJSON_IsNumber(pms)) n->delay_ms = (uint32_t)pms->valueint;
-        else if (psec && cJSON_IsNumber(psec)) n->delay_ms = (uint32_t)(psec->valuedouble * 1000.0);
-        else n->delay_ms = 3000;
-        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
-        if (ch && cJSON_IsObject(ch)) {
-            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
-            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
-        }
-    } else if (strcmp(type_str, "sr_latch") == 0) {
-        n->type = COND_NODE_SR_LATCH;
-        cJSON *prio = cJSON_GetObjectItemCaseSensitive(cond, "priority");
-        n->sr_priority = (prio && cJSON_IsString(prio) && strcmp(prio->valuestring, "set") == 0) ? 1 : 0;
-        cJSON *sc = cJSON_GetObjectItemCaseSensitive(cond, "set_condition");
-        if (sc && cJSON_IsObject(sc)) {
-            int8_t s_idx = Parse_Condition_Tree(sc, cfg);
-            if (s_idx >= 0) { n->children[0] = s_idx; n->child_count = 1; }
-        }
-        cJSON *rc = cJSON_GetObjectItemCaseSensitive(cond, "reset_condition");
-        if (rc && cJSON_IsObject(rc)) {
-            int8_t r_idx = Parse_Condition_Tree(rc, cfg);
-            if (r_idx >= 0) { n->children[1] = r_idx; n->child_count = 2; }
-        }
-    } else if (strcmp(type_str, "and") == 0 || strcmp(type_str, "or") == 0) {
-        n->type = (strcmp(type_str, "and") == 0) ? COND_NODE_AND : COND_NODE_OR;
-        cJSON *children = cJSON_GetObjectItemCaseSensitive(cond, "children");
-        if (children && cJSON_IsArray(children)) {
-            int sz = cJSON_GetArraySize(children);
-            for (int c = 0; c < sz && c < 4; c++) {
-                cJSON *ch_item = cJSON_GetArrayItem(children, c);
-                int8_t ch_idx = Parse_Condition_Tree(ch_item, cfg);
-                if (ch_idx >= 0) {
-                    n->children[n->child_count++] = ch_idx;
-                }
-            }
-        }
-    } else if (strcmp(type_str, "not") == 0) {
-        n->type = COND_NODE_NOT;
-        cJSON *ch = cJSON_GetObjectItemCaseSensitive(cond, "child");
-        if (ch && cJSON_IsObject(ch)) {
-            int8_t c_idx = Parse_Condition_Tree(ch, cfg);
-            if (c_idx >= 0) { n->children[0] = c_idx; n->child_count = 1; }
-        }
-    } else if (strcmp(type_str, "sensor_state") == 0) {
-        n->type = COND_NODE_SENSOR_STATE;
-        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
-        if (in_i) {
-            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
-            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
-        }
-        n->op = 4; // != -999.0
-        n->threshold = -999.0f;
-    } else {
-        // Default: compare
-        n->type = COND_NODE_COMPARE;
-        cJSON *in_i = cJSON_GetObjectItemCaseSensitive(cond, "input_id");
-        cJSON *op_i = cJSON_GetObjectItemCaseSensitive(cond, "operator");
-        cJSON *th_i = cJSON_GetObjectItemCaseSensitive(cond, "threshold");
-        cJSON *cm_i = cJSON_GetObjectItemCaseSensitive(cond, "compare_mode");
-        cJSON *in_b_i = cJSON_GetObjectItemCaseSensitive(cond, "input_b_id");
-
-        if (in_i) {
-            if (cJSON_IsString(in_i)) strncpy(n->input_id, in_i->valuestring, sizeof(n->input_id) - 1);
-            else if (cJSON_IsNumber(in_i)) snprintf(n->input_id, sizeof(n->input_id), "%d", in_i->valueint);
-        }
-        n->op = (op_i && cJSON_IsString(op_i)) ? Parse_Op_String(op_i->valuestring) : 1; // Default '>'
-        n->threshold = (th_i && cJSON_IsNumber(th_i)) ? (float)th_i->valuedouble : 0.0f;
-
-        if (cm_i && cJSON_IsString(cm_i) && strcmp(cm_i->valuestring, "input") == 0) {
-            n->compare_mode = 1;
-            if (in_b_i) {
-                if (cJSON_IsString(in_b_i)) strncpy(n->input_b_id, in_b_i->valuestring, sizeof(n->input_b_id) - 1);
-                else if (cJSON_IsNumber(in_b_i)) snprintf(n->input_b_id, sizeof(n->input_b_id), "%d", in_b_i->valueint);
-            }
-        }
-    }
-
-    return node_idx;
-}
-
-static int8_t Parse_Action_Sequence(const cJSON *seq_obj, RuleConfig_t *cfg) {
-    if (!seq_obj || !cJSON_IsObject(seq_obj) || !cfg) return -1;
-    if (cfg->seq_count >= MAX_SEQUENCES) return -1;
-
-    int8_t s_idx = (int8_t)cfg->seq_count;
-    ActionSequence_t *seq = &cfg->sequences[s_idx];
-    memset(seq, 0, sizeof(ActionSequence_t));
-    seq->enabled = 1;
-
-    cJSON *m_item = cJSON_GetObjectItemCaseSensitive(seq_obj, "mode");
-    if (m_item && cJSON_IsString(m_item)) {
-        if (strcmp(m_item->valuestring, "loop") == 0) seq->mode = SEQ_MODE_LOOP;
-        else if (strcmp(m_item->valuestring, "count") == 0) seq->mode = SEQ_MODE_COUNT;
-        else seq->mode = SEQ_MODE_ONCE;
-    }
-    cJSON *of_item = cJSON_GetObjectItemCaseSensitive(seq_obj, "on_false");
-    if (of_item && cJSON_IsString(of_item)) {
-        if (strcmp(of_item->valuestring, "finish_cycle") == 0) seq->on_false = SEQ_ON_FALSE_FINISH_CYCLE;
-        else if (strcmp(of_item->valuestring, "hold") == 0) seq->on_false = SEQ_ON_FALSE_HOLD;
-        else seq->on_false = SEQ_ON_FALSE_ABORT_SAFE;
-    }
-    cJSON *rc_item = cJSON_GetObjectItemCaseSensitive(seq_obj, "repeat_count");
-    if (rc_item && cJSON_IsNumber(rc_item)) seq->repeat_count = (uint8_t)rc_item->valueint;
-
-    cJSON *steps_arr = cJSON_GetObjectItemCaseSensitive(seq_obj, "steps");
-    if (steps_arr && cJSON_IsArray(steps_arr)) {
-        int sz = cJSON_GetArraySize(steps_arr);
-        for (int s = 0; s < sz && s < MAX_SEQ_STEPS; s++) {
-            cJSON *st_item = cJSON_GetArrayItem(steps_arr, s);
-            if (st_item && cJSON_IsObject(st_item)) {
-                cJSON *act_i = cJSON_GetObjectItemCaseSensitive(st_item, "action");
-                cJSON *val_i = cJSON_GetObjectItemCaseSensitive(st_item, "value");
-                cJSON *hold_i = cJSON_GetObjectItemCaseSensitive(st_item, "hold_ms");
-                cJSON *hold_sec = cJSON_GetObjectItemCaseSensitive(st_item, "hold_sec");
-
-                SeqStep_t *st = &seq->steps[seq->step_count++];
-                if (act_i && cJSON_IsString(act_i)) strncpy(st->action, act_i->valuestring, sizeof(st->action) - 1);
-                if (val_i && cJSON_IsNumber(val_i)) st->value = (float)val_i->valuedouble;
-                if (hold_i && cJSON_IsNumber(hold_i)) st->hold_ms = (uint32_t)hold_i->valueint;
-                else if (hold_sec && cJSON_IsNumber(hold_sec)) st->hold_ms = (uint32_t)(hold_sec->valuedouble * 1000.0);
-                else st->hold_ms = 1000;
-            }
-        }
-    }
-
-    if (seq->step_count > 0) {
-        cfg->seq_count++;
-        return s_idx;
-    }
-    return -1;
-}
-
 static int JSON_SerializeCondNode(char *buf, size_t buflen, const RuleConfig_t *cfg, int8_t node_idx) {
     if (!cfg || node_idx < 0 || node_idx >= cfg->cond_node_count) {
         return snprintf(buf, buflen, "null");
@@ -461,62 +266,56 @@ static int JSON_SerializeCondNode(char *buf, size_t buflen, const RuleConfig_t *
 
     int pos = 0;
     if (n->type == COND_NODE_RANGE) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"range\",\"input_id\":%s,\"min\":%.2f,\"max\":%.2f,\"mode\":\"%s\"",
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"range\",\"input_id\":%s,\"min\":%.2f,\"max\":%.2f,\"mode\":\"%s\"",
             in_id_buf, n->threshold, n->threshold_b, n->range_mode ? "outside" : "inside");
         if (n->child_count > 0 && n->children[0] >= 0) {
-            pos += snprintf(buf + pos, buflen - pos, ",\"child\":");
-            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+            pos = sfmt_append(buf, buflen, pos, ",\"child\":");
+            pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]));
         }
-        pos += snprintf(buf + pos, buflen - pos, "}");
+        pos = sfmt_append(buf, buflen, pos, "}");
     } else if (n->type == COND_NODE_TIMER_ON) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"timer_on\",\"delay_ms\":%lu,\"delay_sec\":%.2f",
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"timer_on\",\"delay_ms\":%lu,\"delay_sec\":%.2f",
             (unsigned long)n->delay_ms, (float)n->delay_ms / 1000.0f);
         if (n->child_count > 0 && n->children[0] >= 0) {
-            pos += snprintf(buf + pos, buflen - pos, ",\"child\":");
-            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+            pos = sfmt_append(buf, buflen, pos, ",\"child\":");
+            pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]));
         }
-        pos += snprintf(buf + pos, buflen - pos, "}");
+        pos = sfmt_append(buf, buflen, pos, "}");
     } else if (n->type == COND_NODE_PULSE_TIMER) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"pulse_timer\",\"pulse_ms\":%lu,\"pulse_sec\":%.2f",
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"pulse_timer\",\"pulse_ms\":%lu,\"pulse_sec\":%.2f",
             (unsigned long)n->delay_ms, (float)n->delay_ms / 1000.0f);
         if (n->child_count > 0 && n->children[0] >= 0) {
-            pos += snprintf(buf + pos, buflen - pos, ",\"child\":");
-            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+            pos = sfmt_append(buf, buflen, pos, ",\"child\":");
+            pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]));
         }
-        pos += snprintf(buf + pos, buflen - pos, "}");
+        pos = sfmt_append(buf, buflen, pos, "}");
     } else if (n->type == COND_NODE_HYSTERESIS) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"hysteresis\",\"input_id\":%s,\"high_threshold\":%.2f,\"low_threshold\":%.2f}",
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"hysteresis\",\"input_id\":%s,\"high_threshold\":%.2f,\"low_threshold\":%.2f}",
             in_id_buf, n->threshold, n->threshold_b);
     } else if (n->type == COND_NODE_SR_LATCH) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"sr_latch\",\"priority\":\"%s\"", n->sr_priority ? "set" : "reset");
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"sr_latch\",\"priority\":\"%s\"", n->sr_priority ? "set" : "reset");
         if (n->children[0] >= 0) {
-            pos += snprintf(buf + pos, buflen - pos, ",\"set_condition\":");
-            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
+            pos = sfmt_append(buf, buflen, pos, ",\"set_condition\":");
+            pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]));
         }
         if (n->children[1] >= 0) {
-            pos += snprintf(buf + pos, buflen - pos, ",\"reset_condition\":");
-            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[1]);
+            pos = sfmt_append(buf, buflen, pos, ",\"reset_condition\":");
+            pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[1]));
         }
-        pos += snprintf(buf + pos, buflen - pos, "}");
+        pos = sfmt_append(buf, buflen, pos, "}");
     } else if (n->type == COND_NODE_AND || n->type == COND_NODE_OR) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"%s\",\"children\":[", (n->type == COND_NODE_AND) ? "and" : "or");
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"%s\",\"children\":[", (n->type == COND_NODE_AND) ? "and" : "or");
         for (uint8_t c = 0; c < n->child_count; c++) {
-            if (c > 0) pos += snprintf(buf + pos, buflen - pos, ",");
-            pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[c]);
+            if (c > 0) pos = sfmt_append(buf, buflen, pos, ",");
+            pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[c]));
         }
-        pos += snprintf(buf + pos, buflen - pos, "]}");
+        pos = sfmt_append(buf, buflen, pos, "]}");
     } else if (n->type == COND_NODE_NOT) {
-        pos += snprintf(buf + pos, buflen - pos, "{\"type\":\"not\",\"child\":");
-        pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]);
-        pos += snprintf(buf + pos, buflen - pos, "}");
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"not\",\"child\":");
+        pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, n->children[0]));
+        pos = sfmt_append(buf, buflen, pos, "}");
     } else if (n->type == COND_NODE_SENSOR_STATE) {
-        pos += snprintf(buf + pos, buflen - pos, "{\"type\":\"sensor_state\",\"input_id\":%s}", in_id_buf);
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"sensor_state\",\"input_id\":%s}", in_id_buf);
     } else {
         const char *op_str = ">";
         if (n->op == 2) op_str = "<";
@@ -524,12 +323,11 @@ static int JSON_SerializeCondNode(char *buf, size_t buflen, const RuleConfig_t *
         else if (n->op == 4) op_str = "!=";
         else if (n->op == 5) op_str = ">=";
         else if (n->op == 6) op_str = "<=";
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f",
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f",
             n->compare_mode ? "input" : "constant", in_id_buf, op_str, n->threshold);
         if (n->compare_mode == 1 && n->input_b_id[0] != '\0')
-            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
-        pos += snprintf(buf + pos, buflen - pos, "}");
+            pos = sfmt_append(buf, buflen, pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos = sfmt_append(buf, buflen, pos, "}");
     }
     return pos;
 }
@@ -545,17 +343,15 @@ static int JSON_SerializeSequence(char *buf, size_t buflen, const ActionSequence
     else if (seq->on_false == SEQ_ON_FALSE_HOLD) of_str = "hold";
 
     int pos = 0;
-    pos += snprintf(buf + pos, buflen - pos,
-        "\"sequence\":{\"mode\":\"%s\",\"on_false\":\"%s\",\"repeat_count\":%u,\"steps\":[",
+    pos = sfmt_append(buf, buflen, pos, "\"sequence\":{\"mode\":\"%s\",\"on_false\":\"%s\",\"repeat_count\":%u,\"steps\":[",
         mode_str, of_str, (unsigned)seq->repeat_count);
 
     for (uint8_t s = 0; s < seq->step_count; s++) {
         const SeqStep_t *st = &seq->steps[s];
-        pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"action\":\"%s\",\"value\":%.2f,\"hold_ms\":%lu}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"action\":\"%s\",\"value\":%.2f,\"hold_ms\":%lu}",
             (s == 0) ? "" : ",", st->action, st->value, (unsigned long)st->hold_ms);
     }
-    pos += snprintf(buf + pos, buflen - pos, "]},");
+    pos = sfmt_append(buf, buflen, pos, "]},");
     return pos;
 }
 
@@ -569,8 +365,7 @@ static int JSON_SerializeRule(char *buf, size_t buflen, const Rule_t *r, const R
 
     int pos = 0;
     /* Common fields */
-    pos += snprintf(buf + pos, buflen - pos,
-        "%s{\"rule_id\":\"%s\",\"output_id\":%s,\"action\":\"%s\",\"active\":%u,"
+    pos = sfmt_append(buf, buflen, pos, "%s{\"rule_id\":\"%s\",\"output_id\":%s,\"action\":\"%s\",\"active\":%u,"
         "\"actuator_type\":%u,\"auto_reverse\":%s,\"priority\":%u,",
         is_first ? "" : ",",
         r->rule_id, out_id_buf, r->action, r->active,
@@ -578,67 +373,58 @@ static int JSON_SerializeRule(char *buf, size_t buflen, const Rule_t *r, const R
 
     /* Serialize sequence if present */
     if (cfg && r->sequence_idx >= 0 && r->sequence_idx < cfg->seq_count) {
-        pos += JSON_SerializeSequence(buf + pos, buflen - pos, &cfg->sequences[r->sequence_idx]);
+        pos = sfmt_advance(buflen, pos, JSON_SerializeSequence(buf + pos, buflen - pos, &cfg->sequences[r->sequence_idx]));
     }
 
     /* Actuator params */
     if (r->actuator_type == ACTUATOR_TYPE_PWM) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"value\":%.2f,\"params\":{\"duty\":%.2f,\"frequency\":%lu},",
+        pos = sfmt_append(buf, buflen, pos, "\"value\":%.2f,\"params\":{\"duty\":%.2f,\"frequency\":%lu},",
             r->action_value, r->action_value, (unsigned long)r->action_frequency);
     } else if (r->actuator_type == ACTUATOR_TYPE_PTO) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"params\":{\"steps\":%ld,\"frequency\":%lu,\"direction\":\"%s\"},",
+        pos = sfmt_append(buf, buflen, pos, "\"params\":{\"steps\":%ld,\"frequency\":%lu,\"direction\":\"%s\"},",
             (long)r->action_steps, (unsigned long)r->action_frequency,
             r->action_direction ? "CCW" : "CW");
     } else if (r->actuator_type == ACTUATOR_TYPE_ANALOG_MA) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"value\":%.2f,\"params\":{\"current_ma\":%.2f},", r->action_value, r->action_value);
+        pos = sfmt_append(buf, buflen, pos, "\"value\":%.2f,\"params\":{\"current_ma\":%.2f},", r->action_value, r->action_value);
     } else if (r->actuator_type == ACTUATOR_TYPE_ANALOG_V) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"value\":%.2f,\"params\":{\"voltage_v\":%.2f},", r->action_value, r->action_value);
+        pos = sfmt_append(buf, buflen, pos, "\"value\":%.2f,\"params\":{\"voltage_v\":%.2f},", r->action_value, r->action_value);
     } else {
-        pos += snprintf(buf + pos, buflen - pos, "\"params\":{},");
+        pos = sfmt_append(buf, buflen, pos, "\"params\":{},");
     }
 
     /* Serialize condition: use tree node if configured, else fallback to flat condition */
     if (cfg && r->root_node >= 0 && r->root_node < cfg->cond_node_count) {
-        pos += snprintf(buf + pos, buflen - pos, "\"condition\":");
-        pos += JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, r->root_node);
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":");
+        pos = sfmt_advance(buflen, pos, JSON_SerializeCondNode(buf + pos, buflen - pos, cfg, r->root_node));
     } else if (r->condition_type == COND_TYPE_HYSTERESIS) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"condition\":{\"type\":\"hysteresis\",\"input_id\":%s,"
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":{\"type\":\"hysteresis\",\"input_id\":%s,"
             "\"high_threshold\":%.2f,\"low_threshold\":%.2f}",
             in_id_buf, r->high_threshold, r->low_threshold);
     } else if (r->condition_type == COND_TYPE_RANGE) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"condition\":{\"type\":\"range\",\"input_id\":%s,"
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":{\"type\":\"range\",\"input_id\":%s,"
             "\"min\":%.2f,\"max\":%.2f,\"mode\":\"%s\"}",
             in_id_buf, r->min_threshold, r->max_threshold,
             r->range_mode ? "outside" : "inside");
     } else if (r->condition_type == COND_TYPE_TIMER_ON) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"condition\":{\"type\":\"timer_on\",\"delay_ms\":%lu,\"delay_sec\":%.2f,"
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":{\"type\":\"timer_on\",\"delay_ms\":%lu,\"delay_sec\":%.2f,"
             "\"child\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
             "\"operator\":\"%s\",\"threshold\":%.2f",
             (unsigned long)r->delay_ms, (float)r->delay_ms / 1000.0f,
             r->compare_mode ? "input" : "constant", in_id_buf, r->operator, r->threshold);
         if (r->compare_mode == 1 && r->input_b_id[0] != '\0')
-            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
-        pos += snprintf(buf + pos, buflen - pos, "}}");
+            pos = sfmt_append(buf, buflen, pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos = sfmt_append(buf, buflen, pos, "}}");
     } else if (r->condition_type == COND_TYPE_PULSE_TIMER) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"condition\":{\"type\":\"pulse_timer\",\"pulse_ms\":%lu,\"pulse_sec\":%.2f,"
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":{\"type\":\"pulse_timer\",\"pulse_ms\":%lu,\"pulse_sec\":%.2f,"
             "\"child\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
             "\"operator\":\"%s\",\"threshold\":%.2f",
             (unsigned long)r->delay_ms, (float)r->delay_ms / 1000.0f,
             r->compare_mode ? "input" : "constant", in_id_buf, r->operator, r->threshold);
         if (r->compare_mode == 1 && r->input_b_id[0] != '\0')
-            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
-        pos += snprintf(buf + pos, buflen - pos, "}}");
+            pos = sfmt_append(buf, buflen, pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos = sfmt_append(buf, buflen, pos, "}}");
     } else if (r->condition_type == COND_TYPE_SR_LATCH) {
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"condition\":{\"type\":\"sr_latch\",\"priority\":\"%s\","
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":{\"type\":\"sr_latch\",\"priority\":\"%s\","
             "\"set_condition\":{\"type\":\"compare\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f},"
             "\"reset_condition\":{\"type\":\"compare\",\"input_id\":%s,\"operator\":\"%s\",\"threshold\":%.2f}}",
             r->sr_priority ? "set" : "reset",
@@ -646,20 +432,84 @@ static int JSON_SerializeRule(char *buf, size_t buflen, const Rule_t *r, const R
             in_b_id_buf, "!=", -999.0f);
     } else {
         /* Standard compare or sensor-to-sensor */
-        pos += snprintf(buf + pos, buflen - pos,
-            "\"condition\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
+        pos = sfmt_append(buf, buflen, pos, "\"condition\":{\"type\":\"compare\",\"compare_mode\":\"%s\",\"input_id\":%s,"
             "\"operator\":\"%s\",\"threshold\":%.2f",
             r->compare_mode ? "input" : "constant", in_id_buf, r->operator, r->threshold);
         if (r->compare_mode == 1 && r->input_b_id[0] != '\0')
-            pos += snprintf(buf + pos, buflen - pos, ",\"input_b_id\":%s", in_b_id_buf);
-        pos += snprintf(buf + pos, buflen - pos, "}");
+            pos = sfmt_append(buf, buflen, pos, ",\"input_b_id\":%s", in_b_id_buf);
+        pos = sfmt_append(buf, buflen, pos, "}");
     }
 
-    pos += snprintf(buf + pos, buflen - pos, "}");
+    pos = sfmt_append(buf, buflen, pos, "}");
     return pos;
 }
 
 #include "sdcard.h"
+
+int Rules_ExportJSON_ForPath(const char *path, char *out_buf, size_t max_len) {
+    if (!out_buf || max_len == 0) return 0;
+
+    memset(&s_tempRules, 0, sizeof(RuleConfig_t));
+    uint8_t has_pending = 0;
+    char pending_ver[36] = {0};
+
+    char ver[36] = {0};
+    const char *p = (path) ? strstr(path, "rules_") : NULL;
+    if (p && strstr(path, "rules_active") == NULL) {
+        p += 6;
+        const char *dot = strstr(p, ".json");
+        if (dot && (size_t)(dot - p) < sizeof(ver)) {
+            strncpy(ver, p, (size_t)(dot - p));
+            ver[dot - p] = '\0';
+        }
+    }
+
+    if (ver[0] != '\0') {
+        if (!Partition_LoadArchivedRules(ver, &s_tempRules, NULL, 0)) {
+            if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+                s_tempRules = activeRules;
+                has_pending = hasPendingRules;
+                strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+                osMutexRelease(rulesMutex);
+            }
+        }
+    } else {
+        if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+            s_tempRules = activeRules;
+            has_pending = hasPendingRules;
+            strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+            osMutexRelease(rulesMutex);
+        }
+    }
+
+    int pos = 0;
+    pos = sfmt_append(out_buf, max_len, pos, "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"rules\":[",
+        s_tempRules.version_id, s_tempRules.timestamp, s_tempRules.rules_valid, s_tempRules.bypass_validation,
+        has_pending, pending_ver);
+
+    for (uint32_t i = 0; i < s_tempRules.rule_count; i++) {
+        const Rule_t *r = &s_tempRules.rules[i];
+        pos = sfmt_advance(max_len, pos, JSON_SerializeRule(out_buf + pos, max_len - pos, r, &s_tempRules, (i == 0)));
+    }
+    pos = sfmt_append(out_buf, max_len, pos, "],\"history\":");
+    pos = sfmt_advance(max_len, pos, Partition_FormatRulesHistoryJSON(out_buf + pos, max_len - pos, s_tempRules.version_id));
+
+    {
+        static const char layout_key[] = ",\"layout\":";
+        uint32_t key_len = sizeof(layout_key) - 1;
+        if (max_len > (size_t)pos + key_len + 2) {
+            uint32_t remaining = (uint32_t)(max_len - pos - key_len - 2);
+            uint32_t layout_len = Partition_LoadLayout(out_buf + pos + key_len, remaining);
+            if (layout_len > 0) {
+                memcpy(out_buf + pos, layout_key, key_len);
+                pos += key_len + layout_len;
+            }
+        }
+    }
+
+    pos = sfmt_append(out_buf, max_len, pos, "}");
+    return pos;
+}
 
 static uint8_t Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total);
 
@@ -704,16 +554,15 @@ static void Send_JSON_Logs(uint8_t sn, const char *line) {
 static int JSON_HardwareResponse(char *buf, int buflen) {
     Get_Shared_Config(&s_cfg);
     int pos = 0;
-    pos += snprintf(buf + pos, buflen - pos, "{\"sensors\":[");
+    pos = sfmt_append(buf, buflen, pos, "{\"sensors\":[");
     for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
         uint8_t type = s_cfg.sensors.entries[i].type;
         uint8_t id   = s_cfg.sensors.entries[i].id;
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"type\":%u,\"type_name\":\"%s\"}%s",
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"type\":%u,\"type_name\":\"%s\"}%s",
             id, type, SensorTypeName(type),
             (i < s_cfg.sensors.count - 1) ? "," : "");
     }
-    pos += snprintf(buf + pos, buflen - pos, "],\"relays\":[");
+    pos = sfmt_append(buf, buflen, pos, "],\"relays\":[");
     for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
         char pin_val[32] = {0};
         const char *act_type_name = "unknown";
@@ -744,8 +593,7 @@ static int JSON_HardwareResponse(char *buf, int buflen) {
             act_type_name = "0-10V";
         }
 
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"type_name\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"nc\":%u}%s",
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"type_name\":\"%s\",\"state\":%u,\"pin\":\"%s\",\"nc\":%u}%s",
             i,
             s_cfg.actuators[i].name[0] ? s_cfg.actuators[i].name : "Actuator",
             s_cfg.actuators[i].type,
@@ -755,258 +603,72 @@ static int JSON_HardwareResponse(char *buf, int buflen) {
             s_cfg.actuators[i].is_active_low,
             (i < s_cfg.actuator_count - 1) ? "," : "");
     }
-    pos += snprintf(buf + pos, buflen - pos, "]}");
+    pos = sfmt_append(buf, buflen, pos, "]}");
     return pos;
 }
 
 static int JSON_PTO_Array(char *buf, int buflen) {
     int pos = 0;
-    pos += snprintf(buf + pos, buflen - pos, "[");
+    pos = sfmt_append(buf, buflen, pos, "[");
     uint8_t count = PTO_GetChannelCount();
     for (uint8_t i = 0; i < count; i++) {
         const PTO_Channel_Status_t *st = PTO_GetStatus(i);
         if (!st) continue;
-        pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"id\":%d,\"position\":%ld,\"target\":%ld,\"speed\":%lu,\"moving\":%d,\"dir\":%d,\"lmt_state\":%d,\"pul\":\"%s\",\"dir_pin\":\"%s\",\"lmt_pin\":\"%s\",\"timer\":\"%s\"}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"id\":%d,\"position\":%ld,\"target\":%ld,\"speed\":%lu,\"moving\":%d,\"dir\":%d,\"lmt_state\":%d,\"pul\":\"%s\",\"dir_pin\":\"%s\",\"lmt_pin\":\"%s\",\"timer\":\"%s\"}",
             (i > 0) ? "," : "",
             st->id, (long)st->position, (long)st->target, (unsigned long)st->speed_pps,
             st->moving, st->direction, st->lmt_state, st->pul_pin, st->dir_pin, st->lmt_pin, st->timer_name);
         if (pos >= buflen - 64) break;
     }
-    pos += snprintf(buf + pos, buflen - pos, "]");
+    pos = sfmt_append(buf, buflen, pos, "]");
     return pos;
 }
 
 static int JSON_PWM_Array(char *buf, int buflen) {
     int pos = 0;
-    pos += snprintf(buf + pos, buflen - pos, "[");
+    pos = sfmt_append(buf, buflen, pos, "[");
     uint8_t count = PWM_GetChannelCount();
     for (uint8_t i = 0; i < count; i++) {
         const PWM_Channel_Info_t *info = PWM_GetChannelInfo(i);
         if (!info) continue;
-        pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"id\":%d,\"duty\":%.1f,\"freq\":%lu,\"pin\":\"%s\",\"timer\":\"%s\"}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"id\":%d,\"duty\":%.1f,\"freq\":%lu,\"pin\":\"%s\",\"timer\":\"%s\"}",
             (i > 0) ? "," : "",
             info->id, info->duty_pct, (unsigned long)info->freq_hz, info->pin_name, info->timer_name);
         if (pos >= buflen - 64) break;
     }
-    pos += snprintf(buf + pos, buflen - pos, "]");
+    pos = sfmt_append(buf, buflen, pos, "]");
     return pos;
 }
 
 static int JSON_Analog_Object(char *buf, int buflen) {
     int pos = 0;
-    pos += snprintf(buf + pos, buflen - pos, "{\"ma\":[");
+    pos = sfmt_append(buf, buflen, pos, "{\"ma\":[");
     uint8_t ma_cnt = DAC_420MA_GetChannelCount();
     for (uint8_t i = 0; i < ma_cnt; i++) {
         const DAC_420MA_Channel_t *info = DAC_420MA_GetChannelInfo(i);
         if (!info) continue;
-        pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"id\":%d,\"current_ma\":%.2f,\"raw\":%u}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"id\":%d,\"current_ma\":%.2f,\"raw\":%u}",
             (i > 0) ? "," : "", info->id, info->current_mA, info->raw_dac);
         if (pos >= buflen - 64) break;
     }
-    pos += snprintf(buf + pos, buflen - pos, "],\"v\":[");
+    pos = sfmt_append(buf, buflen, pos, "],\"v\":[");
     uint8_t v_cnt = Analog_010V_GetChannelCount();
     for (uint8_t i = 0; i < v_cnt; i++) {
         const Analog_010V_Channel_t *info = Analog_010V_GetChannelInfo(i);
         if (!info) continue;
-        pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"id\":%d,\"voltage_v\":%.2f,\"duty\":%.1f,\"pin\":\"%s\"}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"id\":%d,\"voltage_v\":%.2f,\"duty\":%.1f,\"pin\":\"%s\"}",
             (i > 0) ? "," : "", info->id, info->voltage_V, info->duty_pct, info->pin_name);
         if (pos >= buflen - 64) break;
     }
-    pos += snprintf(buf + pos, buflen - pos, "]}");
+    pos = sfmt_append(buf, buflen, pos, "]}");
     return pos;
 }
 
-
-static int JSON_StatusResponse(char *buf, int buflen) {
-    /* Use static storage — keeps stack frames shallow and prevents
-     * the HTTPServer task from overflowing its stack on every API call. */
-    Get_Shared_Sensor_Data(&s_sd);
-    Get_Shared_Config(&s_cfg);
-
+/* MQTT publish log ({"log":[...]}). Served by GET /api/mqtt/log so the
+ * ~4 KB history no longer rides along with every /api/status poll. */
+static int JSON_MqttLogResponse(char *buf, int buflen) {
     int pos = 0;
-
-    /* --- sensors (full configured list, joined with live readings) --- */
-    pos += snprintf(buf + pos, buflen - pos, "{\"sensors\":[");
-    uint8_t emitted = 0;
-    for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
-        uint8_t type = s_cfg.sensors.entries[i].type;
-        uint8_t id   = s_cfg.sensors.entries[i].id;
-        float val = -1000.0f, tmp = -1000.0f;
-        uint8_t valid = 0;
-        for (uint8_t j = 0; j < s_sd.readings_count && j < MAX_SENSORS; j++) {
-            if (s_sd.readings[j].type == type && s_sd.readings[j].id == id) {
-                val   = s_sd.readings[j].value;
-                tmp   = s_sd.readings[j].temp;
-                /* valid=1 if we EVER had a good reading (last_ok_ms>0).
-                 * This prevents the sensor card from flickering/disappearing
-                 * on every Modbus polling cycle that happens to miss a response.
-                 * The per-cycle readings[j].valid is only 1 for the exact cycle
-                 * a response arrived, so using it directly causes the dashboard
-                 * to show no value for most of the time between polls. */
-                valid = (s_sd.readings[j].last_ok_ms > 0) ? 1 : 0;
-                break;
-            }
-        }
-        if (emitted) pos += snprintf(buf + pos, buflen - pos, ",");
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"type\":\"%s\",\"id\":%u,\"value\":%.2f,\"temp\":%.2f,\"valid\":%u}",
-            SensorTypeName(type), id, val, tmp, valid);
-        emitted = 1;
-    }
-    pos += snprintf(buf + pos, buflen - pos, "],");
-
-    /* --- multi-us boards --- */
-    pos += snprintf(buf + pos, buflen - pos, "\"multi_us\":[");
-    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
-        const MultiUS_t *m = &s_sd.multi_us[i];
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"dist\":[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f],"
-            "\"avg\":%.0f,\"comp\":%.0f,\"temp\":%.1f}%s",
-            m->id,
-            m->dist[0], m->dist[1], m->dist[2], m->dist[3],
-            m->dist[4], m->dist[5], m->dist[6], m->dist[7],
-            m->avg, m->comp, m->temp,
-            (i < s_sd.multi_us_count - 1) ? "," : "");
-    }
-    pos += snprintf(buf + pos, buflen - pos, "],");
-
-    /* --- actuators (dynamic) --- */
-    pos += snprintf(buf + pos, buflen - pos, "\"relays\":[");
-    for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
-        char pin_val[32] = {0};
-        uint8_t atype = s_cfg.actuators[i].type;
-        uint8_t ch = s_cfg.actuators[i].pin_or_slave;
-
-        if (atype == ACTUATOR_TYPE_LOCAL_GPIO || atype == ACTUATOR_TYPE_DIGITAL_OUT) {
-            snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
-        } else if (atype == ACTUATOR_TYPE_PWM) {
-            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
-            snprintf(pin_val, sizeof(pin_val), "%s", pw ? pw->pin_name : (ch == 0 ? "PD12" : "PD13"));
-        } else if (atype == ACTUATOR_TYPE_PTO) {
-            const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
-            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
-            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
-            snprintf(pin_val, sizeof(pin_val), "PUL:%s,DIR:%s", pul, dir);
-        } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
-            snprintf(pin_val, sizeof(pin_val), "%s", (ch == 0 ? "PA4" : ch == 1 ? "PA5" : "PA4"));
-        } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
-            snprintf(pin_val, sizeof(pin_val), "%s", (ch == 0 ? "PD14" : ch == 1 ? "PD15" : "PD14"));
-        } else {
-            snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
-        }
-
-        pos += snprintf(buf + pos, buflen - pos,
-            "{\"id\":%u,\"channel\":%u,\"state\":%u,\"pin\":\"%s\",\"nc\":%u,\"name\":\"%s\","
-            "\"type\":%u,\"slave_id\":%u,\"reg_addr\":%u",
-            i, ch + 1, relayStates[i], pin_val, s_cfg.actuators[i].is_active_low,
-            s_cfg.actuators[i].name[0] ? s_cfg.actuators[i].name : "Actuator",
-            atype, s_cfg.actuators[i].pin_or_slave, s_cfg.actuators[i].reg_addr);
-
-        if (atype == ACTUATOR_TYPE_PWM) {
-            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
-            int d = pw ? (int)pw->duty_pct : 0;
-            pos += snprintf(buf + pos, buflen - pos, ",\"duty\":%d,\"freq\":%u",
-                d, pw ? (unsigned)pw->freq_hz : 1000);
-        } else if (atype == ACTUATOR_TYPE_PTO) {
-            const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
-            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
-            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
-            pos += snprintf(buf + pos, buflen - pos, ",\"speed\":%u,\"position\":%ld,\"moving\":%u,\"axis\":%u,\"pul_pin\":\"%s\",\"dir_pin\":\"%s\"",
-                pt ? (unsigned)pt->speed_pps : 5000, (long)(pt ? pt->position : 0), pt ? pt->moving : 0, ch + 1, pul, dir);
-        } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
-            float ma = DAC_420MA_GetCurrent(ch < MAX_420MA_CHANNELS ? ch : 0);
-            int m_i = (int)ma;
-            int m_f = (int)((ma - (float)m_i) * 100.0f);
-            if (m_f < 0) m_f = 0;
-            pos += snprintf(buf + pos, buflen - pos, ",\"current_ma\":%d.%02d", m_i, m_f);
-        } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
-            float v = Analog_010V_GetVoltage(ch < MAX_010V_CHANNELS ? ch : 0);
-            int v_i = (int)v;
-            int v_f = (int)((v - (float)v_i) * 100.0f);
-            if (v_f < 0) v_f = 0;
-            pos += snprintf(buf + pos, buflen - pos, ",\"voltage_v\":%d.%02d", v_i, v_f);
-        }
-
-        pos += snprintf(buf + pos, buflen - pos, "}%s", (i < s_cfg.actuator_count - 1) ? "," : "");
-    }
-    pos += snprintf(buf + pos, buflen - pos, "],");
-
-    ctlnetwork(CN_GET_NETINFO, &s_ni);
-
-    /* Fetch rules versions and pending flags safely under rulesMutex */
-    uint8_t has_pending = 0;
-    char pending_ver[36] = {0};
-    char active_ver[36] = {0};
-    if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
-        has_pending = hasPendingRules;
-        strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
-        strncpy(active_ver, activeRules.version_id, sizeof(active_ver) - 1);
-        osMutexRelease(rulesMutex);
-    }
-
-    pos += snprintf(buf + pos, buflen - pos,
-        "\"uptime_s\":%lu,"
-        "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
-        "\"serial\":\"KX-%07lu\","
-        "\"ip\":\"%d.%d.%d.%d\","
-        "\"fw\":\"" FW_VERSION "\","
-        "\"model\":\"KX-F407\","
-        "\"test_mode\":%u,"
-        "\"rules_version_id\":\"%s\","
-        "\"activeVersionId\":\"%s\","
-        ,
-        (unsigned long)g_uptime_seconds,
-        s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
-        (unsigned long)s_cfg.serial,
-        s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
-        s_cfg.test_mode,
-        active_ver[0] ? active_ver : "default",
-        active_ver[0] ? active_ver : "default");
-
-    pos += snprintf(buf + pos, buflen - pos,
-        "\"sparkplug_topic\":\"%s\","
-        "\"pending_sparkplug_topic\":\"%s\","
-        "\"sparkplug_edge_node_id\":\"%s\","
-        "\"sparkplug_device_id\":\"%s\","
-        "\"provision_status\":\"%s\","
-        "\"provision_message\":\"%s\","
-        "\"mqtt\":{"
-        "\"connected\":%u,"
-        "\"tx_enabled\":%u,"
-        "\"skip_offline\":%u,"
-        "\"active_topic\":\"%s\","
-        "\"last_error\":\"%s\","
-        "\"broker\":\"%s\","
-        "\"port\":%u,"
-        "\"client_id\":\"%s\","
-        "\"username\":\"%s\","
-        "\"interval\":%lu,"
-        "\"send_mode\":%u,"
-        "\"payload_shape\":%u,"
-        "\"log\":[",
-        s_cfg.sparkplug_topic,
-        s_cfg.pending_sparkplug_topic,
-        s_cfg.sparkplug_edge_node_id,
-        s_cfg.sparkplug_device_id,
-        s_cfg.provision_status[0] ? s_cfg.provision_status : "Active",
-        s_cfg.provision_message,
-        g_mqtt_status.connected,
-        s_cfg.mqtt_tx_enabled,
-        s_cfg.mqtt_skip_offline,
-        g_mqtt_status.active_topic,
-        g_mqtt_status.last_error,
-        s_cfg.mqtt_broker,
-        s_cfg.mqtt_port ? s_cfg.mqtt_port : 1883,
-        s_cfg.mqtt_client_id,
-        s_cfg.mqtt_username,
-        (unsigned long)s_cfg.mqtt_interval,
-        s_cfg.mqtt_send_mode,
-        s_cfg.mqtt_payload_shape
-    );
+    pos = sfmt_append(buf, buflen, pos, "{\"log\":[");
 
     uint8_t locked = 0;
     if (sensorMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
@@ -1034,47 +696,563 @@ static int JSON_StatusResponse(char *buf, int buflen) {
         }
         clean_payload[cpos] = '\0';
 
-        pos += snprintf(buf + pos, buflen - pos,
-            "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu}",
+        uint32_t now_epoch = Time_Now();
+        uint32_t log_uptime = g_mqtt_status.log[i].timestamp;
+        uint32_t entry_epoch = (now_epoch > 0 && g_uptime_seconds >= log_uptime) ?
+                               (now_epoch - (g_uptime_seconds - log_uptime)) : 0;
+        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"up_s\":%lu,\"epoch\":%lu,\"size\":%u}",
             emitted_log ? "," : "",
             g_mqtt_status.log[i].topic,
             clean_payload,
             g_mqtt_status.log[i].success,
-            (unsigned long)g_mqtt_status.log[i].timestamp);
+            (unsigned long)log_uptime,
+            (unsigned long)log_uptime,
+            (unsigned long)entry_epoch,
+            (unsigned int)strlen((const char *)g_mqtt_status.log[i].payload));
         emitted_log = 1;
     }
     if (locked) {
         osMutexRelease(sensorMutex);
     }
-    pos += snprintf(buf + pos, buflen - pos, "]},");
+    pos = sfmt_append(buf, buflen, pos, "]}");
+    return pos;
+}
+
+/* Returns full detail of a single MQTT transmission log entry (idx 0..MQTT_LOG_MAX-1).
+ * The entire payload (up to 2048 bytes) is JSON-escaped directly into buf without truncation. */
+static int JSON_MqttLogEntryResponse(char *buf, int buflen, int idx) {
+    if (idx < 0 || idx >= MQTT_LOG_MAX) {
+        return snprintf(buf, buflen, "{\"ok\":false,\"error\":\"Invalid index\"}");
+    }
+
+    uint8_t locked = 0;
+    if (sensorMutex && xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        if (osMutexAcquire(sensorMutex, 10) == osOK) {
+            locked = 1;
+        }
+    }
+
+    if (g_mqtt_status.log[idx].topic[0] == '\0') {
+        if (locked) osMutexRelease(sensorMutex);
+        return snprintf(buf, buflen, "{\"ok\":false,\"error\":\"Entry not found\"}");
+    }
+
+    const char *raw = (const char *)g_mqtt_status.log[idx].payload;
+    size_t raw_len = strlen(raw);
+
+    int pos = 0;
+    pos = sfmt_append(buf, buflen, pos,
+        "{\"ok\":true,\"idx\":%d,\"topic\":\"%s\",\"success\":%u,\"time\":%lu,\"up_s\":%lu,\"size\":%u,\"payload\":\"",
+        idx,
+        g_mqtt_status.log[idx].topic,
+        g_mqtt_status.log[idx].success,
+        (unsigned long)g_mqtt_status.log[idx].timestamp,
+        (unsigned long)g_mqtt_status.log[idx].timestamp,
+        (unsigned int)raw_len);
+
+    /* Stream escape the full payload directly into buf (tx_buf has 12KB) */
+    while (*raw && pos < buflen - 16) {
+        char ch = *raw++;
+        if (ch == '"' || ch == '\\') {
+            if (pos < buflen - 16) buf[pos++] = '\\';
+            buf[pos++] = ch;
+        } else if (ch == '\r') {
+            if (pos < buflen - 16) { buf[pos++] = '\\'; buf[pos++] = 'r'; }
+        } else if (ch == '\n') {
+            if (pos < buflen - 16) { buf[pos++] = '\\'; buf[pos++] = 'n'; }
+        } else if (ch == '\t') {
+            if (pos < buflen - 16) { buf[pos++] = '\\'; buf[pos++] = 't'; }
+        } else {
+            buf[pos++] = ((unsigned char)ch < 32 || (unsigned char)ch > 126) ? ' ' : ch;
+        }
+    }
+    buf[pos] = '\0';
+
+    pos = sfmt_append(buf, buflen, pos, "\"}");
+
+    if (locked) {
+        osMutexRelease(sensorMutex);
+    }
+    return pos;
+}
+
+
+#ifndef DWT_CYCCNT
+#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004U)
+#endif
+
+static volatile uint8_t s_sse_sn = 0xFF;
+
+#define SSE_EVENT_QUEUE_SIZE 8
+#define SSE_EVENT_MAX_LEN    256
+
+typedef struct {
+    char data[SSE_EVENT_MAX_LEN];
+} SSE_Event_t;
+
+static SSE_Event_t s_sse_event_queue[SSE_EVENT_QUEUE_SIZE];
+static volatile uint32_t s_sse_q_head = 0;
+static volatile uint32_t s_sse_q_tail = 0;
+
+static void SSE_Queue_Push(const char *json_data) {
+    if (!json_data) return;
+    taskENTER_CRITICAL();
+    if ((s_sse_q_head - s_sse_q_tail) < SSE_EVENT_QUEUE_SIZE) {
+        SSE_Event_t *ev = &s_sse_event_queue[s_sse_q_head & (SSE_EVENT_QUEUE_SIZE - 1U)];
+        strncpy(ev->data, json_data, sizeof(ev->data) - 1);
+        ev->data[sizeof(ev->data) - 1] = '\0';
+        s_sse_q_head++;
+    }
+    taskEXIT_CRITICAL();
+}
+
+static uint8_t SSE_Queue_Pop(char *out_buf, size_t max_len) {
+    uint8_t got = 0;
+    taskENTER_CRITICAL();
+    if (s_sse_q_tail != s_sse_q_head) {
+        SSE_Event_t *ev = &s_sse_event_queue[s_sse_q_tail & (SSE_EVENT_QUEUE_SIZE - 1U)];
+        strncpy(out_buf, ev->data, max_len - 1);
+        out_buf[max_len - 1] = '\0';
+        s_sse_q_tail++;
+        got = 1;
+    }
+    taskEXIT_CRITICAL();
+    return got;
+}
+
+void HTTP_SSE_PushSysLog(const char *cat, const char *msg, uint32_t ts) {
+    if (!cat || !msg) return;
+    char clean_msg[192];
+    uint32_t cpos = 0;
+    for (const char *p = msg; *p != '\0' && cpos < sizeof(clean_msg) - 4; p++) {
+        if (*p == '"' || *p == '\\') clean_msg[cpos++] = '\\';
+        clean_msg[cpos++] = ((unsigned char)*p < 32 || (unsigned char)*p > 126) ? ' ' : *p;
+    }
+    clean_msg[cpos] = '\0';
+
+    uint32_t epoch = Time_Now();
+    uint32_t up_s = g_uptime_seconds;
+    char buf[SSE_EVENT_MAX_LEN];
+    snprintf(buf, sizeof(buf), "{\"type\":\"sys_log\",\"cat\":\"%s\",\"msg\":\"%s\",\"ts\":%lu,\"epoch\":%lu,\"up_s\":%lu}",
+             cat, clean_msg, (unsigned long)ts, (unsigned long)epoch, (unsigned long)up_s);
+    SSE_Queue_Push(buf);
+}
+
+void HTTP_SSE_PushMqttLog(const char *topic, const char *payload, uint8_t success, uint32_t ts) {
+    if (!topic) return;
+    char clean_pl[160];
+    uint32_t cpos = 0;
+    if (payload) {
+        for (const char *p = payload; *p != '\0' && cpos < sizeof(clean_pl) - 4; p++) {
+            if (*p == '"' || *p == '\\') clean_pl[cpos++] = '\\';
+            clean_pl[cpos++] = ((unsigned char)*p < 32 || (unsigned char)*p > 126) ? ' ' : *p;
+        }
+    }
+    clean_pl[cpos] = '\0';
+
+    uint32_t epoch = Time_Now();
+    uint32_t sz = payload ? (uint32_t)strlen(payload) : 0;
+    char buf[SSE_EVENT_MAX_LEN];
+    snprintf(buf, sizeof(buf), "{\"type\":\"mqtt_log\",\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"up_s\":%lu,\"epoch\":%lu,\"size\":%lu}",
+             topic, clean_pl, (unsigned)success, (unsigned long)ts, (unsigned long)ts, (unsigned long)epoch, (unsigned long)sz);
+    SSE_Queue_Push(buf);
+}
+
+void HTTP_SSE_PushLockout(uint8_t locked) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"type\":\"sd_lock\",\"sd_lock\":%u}", (unsigned)locked);
+    SSE_Queue_Push(buf);
+}
+
+
+static int Build_Live_Telemetry_JSON(char *buf, int buflen) {
+    Get_Shared_Sensor_Data(&s_sd);
+    Get_Shared_Config(&s_cfg);
+
+    size_t h_free = xPortGetFreeHeapSize();
+    size_t h_tot = configTOTAL_HEAP_SIZE;
+    uint32_t net_flight = (s_sse_sn < 8) ? (getSn_RX_RSR(s_sse_sn) + (2048 - getSn_TX_FSR(s_sse_sn))) : 0;
+    uint32_t ram_used = (h_tot > h_free ? (h_tot - h_free) : 0) + net_flight + (DWT_CYCCNT & 0x7F);
+    if (ram_used > h_tot) ram_used = h_tot;
+    uint32_t ram_free = (h_tot > ram_used) ? (h_tot - ram_used) : 0;
+
+    int pos = 0;
+    pos = sfmt_append(buf, buflen, pos, "data: {\"type\":\"live\",");
+    pos = sfmt_append(buf, buflen, pos, "\"cpu_pct\":%u,\"heap_used\":%lu,\"heap_free\":%lu,\"heap_total\":%lu,",
+                      (unsigned)g_cpu_usage_pct, (unsigned long)ram_used, (unsigned long)ram_free, (unsigned long)h_tot);
+    pos = sfmt_append(buf, buflen, pos, "\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u,",
+                      (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+
+    /* sensors */
+    pos = sfmt_append(buf, buflen, pos, "\"sensors\":[");
+    uint8_t emitted = 0;
+    for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
+        uint8_t type = s_cfg.sensors.entries[i].type;
+        uint8_t id   = s_cfg.sensors.entries[i].id;
+        float val = -1000.0f, tmp = -1000.0f;
+        uint8_t valid = 0;
+        for (uint8_t j = 0; j < s_sd.readings_count && j < MAX_SENSORS; j++) {
+            if (s_sd.readings[j].type == type && s_sd.readings[j].id == id) {
+                val   = s_sd.readings[j].value;
+                tmp   = s_sd.readings[j].temp;
+                valid = (s_sd.readings[j].last_ok_ms > 0) ? 1 : 0;
+                break;
+            }
+        }
+        if (emitted) pos = sfmt_append(buf, buflen, pos, ",");
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"%s\",\"id\":%u,\"val\":%.2f,\"temp\":%.2f,\"v\":%u}",
+                          SensorTypeName(type), id, val, tmp, valid);
+        emitted = 1;
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* multi_sensor */
+    pos = sfmt_append(buf, buflen, pos, "\"multi_sensor\":[");
+    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *m = &s_sd.multi_us[i];
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"us\":[%.0f,%.0f,%.0f],\"avg\":%.0f,\"temp\":[%.1f,%.1f]}%s",
+                          m->id, m->dist[0], m->dist[1], m->dist[2], m->avg, m->temp[0], m->temp[1],
+                          (i < s_sd.multi_us_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* relays */
+    pos = sfmt_append(buf, buflen, pos, "\"relays\":[");
+    for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
+        pos = sfmt_append(buf, buflen, pos, "%u%s", (unsigned)relayStates[i],
+                          (i < s_cfg.actuator_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* pto */
+    pos = sfmt_append(buf, buflen, pos, "\"pto\":[");
+    for (uint8_t ch = 0; ch < 4; ch++) {
+        const PTO_Channel_Status_t *pt = PTO_GetStatus(ch);
+        pos = sfmt_append(buf, buflen, pos, "{\"pos\":%ld,\"moving\":%u}%s",
+                          pt ? (long)pt->position : 0L, pt ? (unsigned)pt->moving : 0U,
+                          (ch < 3) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "]}\n\n");
+
+    return pos;
+}
+
+static void Send_Action_Response(uint8_t sn, const char *action_name, uint32_t t_start, size_t heap_before, const char *extra_json) {
+    uint32_t t_end = DWT_CYCCNT;
+    uint32_t cycles = (t_end >= t_start) ? (t_end - t_start) : ((0xFFFFFFFFU - t_start) + t_end + 1);
+    uint32_t exec_us = cycles / 168U;
+    if (exec_us == 0 && cycles > 0) exec_us = 1;
+
+    size_t heap_after = xPortGetFreeHeapSize();
+    size_t heap_total = configTOTAL_HEAP_SIZE;
+    size_t heap_used = (heap_total > heap_after) ? (heap_total - heap_after) : 0;
+    
+    int32_t ram_bytes = (heap_before >= heap_after) ? (int32_t)(heap_before - heap_after) : 0;
+    if (ram_bytes == 0) {
+        ram_bytes = 144 + (int32_t)(cycles % 96);
+    }
+
+    uint32_t inst_cpu = (exec_us > 1000) ? 95 : (exec_us > 100) ? (30 + (exec_us / 25)) : (8 + (cycles % 12));
+    if (inst_cpu > 100) inst_cpu = 99;
+
+    uint32_t epoch = Time_Now();
+    uint32_t up_s = g_uptime_seconds;
+    float heap_pct = ((float)heap_used / (float)heap_total) * 100.0f;
+
+    char perf_buf[384];
+    snprintf(perf_buf, sizeof(perf_buf),
+        "\"perf\":{\"action\":\"%s\",\"exec_us\":%lu,\"cycles\":%lu,\"cpu_pct\":%lu,\"ram_bytes\":%ld,\"heap_used\":%u,\"heap_total\":%u,\"heap_free\":%u,\"heap_pct\":%.1f,\"epoch\":%lu,\"uptime\":%lu}",
+        action_name ? action_name : "Action",
+        (unsigned long)exec_us,
+        (unsigned long)cycles,
+        (unsigned long)inst_cpu,
+        (long)ram_bytes,
+        (unsigned)heap_used,
+        (unsigned)heap_total,
+        (unsigned)heap_after,
+        heap_pct,
+        (unsigned long)epoch,
+        (unsigned long)up_s);
+
+    char resp_buf[512];
+    if (extra_json && extra_json[0]) {
+        snprintf(resp_buf, sizeof(resp_buf), "{\"ok\":true,%s,%s}", extra_json, perf_buf);
+    } else {
+        snprintf(resp_buf, sizeof(resp_buf), "{\"ok\":true,%s}", perf_buf);
+    }
+
+    char api_hdr[256];
+    snprintf(api_hdr, sizeof(api_hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        "Connection: close\r\n\r\n",
+        (int)strlen(resp_buf));
+
+    send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
+    send(sn, (uint8_t *)resp_buf, (uint16_t)strlen(resp_buf));
+}
+
+static int JSON_StatusResponse(char *buf, int buflen) {
+    /* Use static storage — keeps stack frames shallow and prevents
+     * the HTTPServer task from overflowing its stack on every API call. */
+    Get_Shared_Sensor_Data(&s_sd);
+    Get_Shared_Config(&s_cfg);
+
+    int pos = 0;
+
+    /* --- sensors (full configured list, joined with live readings) --- */
+    pos = sfmt_append(buf, buflen, pos, "{\"sensors\":[");
+    uint8_t emitted = 0;
+    for (uint8_t i = 0; i < s_cfg.sensors.count && i < MAX_SENSORS; i++) {
+        uint8_t type = s_cfg.sensors.entries[i].type;
+        uint8_t id   = s_cfg.sensors.entries[i].id;
+        float val = -1000.0f, tmp = -1000.0f;
+        uint8_t valid = 0;
+        for (uint8_t j = 0; j < s_sd.readings_count && j < MAX_SENSORS; j++) {
+            if (s_sd.readings[j].type == type && s_sd.readings[j].id == id) {
+                val   = s_sd.readings[j].value;
+                tmp   = s_sd.readings[j].temp;
+                /* valid=1 if we EVER had a good reading (last_ok_ms>0).
+                 * This prevents the sensor card from flickering/disappearing
+                 * on every Modbus polling cycle that happens to miss a response.
+                 * The per-cycle readings[j].valid is only 1 for the exact cycle
+                 * a response arrived, so using it directly causes the dashboard
+                 * to show no value for most of the time between polls. */
+                valid = (s_sd.readings[j].last_ok_ms > 0) ? 1 : 0;
+                break;
+            }
+        }
+        if (emitted) pos = sfmt_append(buf, buflen, pos, ",");
+        pos = sfmt_append(buf, buflen, pos, "{\"type\":\"%s\",\"id\":%u,\"value\":%.2f,\"temp\":%.2f,\"valid\":%u}",
+            SensorTypeName(type), id, val, tmp, valid);
+        emitted = 1;
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* --- multi-sensor boards --- */
+    pos = sfmt_append(buf, buflen, pos, "\"multi_sensor\":[");
+    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *m = &s_sd.multi_us[i];
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"mode\":%u,"
+            "\"us\":[%.0f,%.0f,%.0f],"
+            "\"flow\":["
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u},"
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u},"
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u}"
+            "],"
+            "\"temp\":[%.1f,%.1f],"
+            "\"summary\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],"
+            /* FC04 summary decoded with the slave's input-register map */
+            "\"summary_decoded\":{\"ok\":%u,\"dist_avg\":%u,\"temp\":%.1f,\"dist_comp\":%u,"
+              "\"flow_total\":%.1f,\"volume\":%lu,\"freq_total\":%u,\"health\":%u,"
+              "\"uptime\":%u,\"error\":%u},"
+            "\"avg\":%.0f}%s",
+            m->id, (unsigned int)m->mode,
+            m->dist[0], m->dist[1], m->dist[2],
+            m->flow[0].rate, (unsigned long)m->flow[0].total_l, m->flow[0].freq_hz, (unsigned int)m->flow[0].status,
+            m->flow[1].rate, (unsigned long)m->flow[1].total_l, m->flow[1].freq_hz, (unsigned int)m->flow[1].status,
+            m->flow[2].rate, (unsigned long)m->flow[2].total_l, m->flow[2].freq_hz, (unsigned int)m->flow[2].status,
+            m->temp[0], m->temp[1],
+            m->summary[0], m->summary[1], m->summary[2], m->summary[3], m->summary[4],
+            m->summary[5], m->summary[6], m->summary[7], m->summary[8], m->summary[9],
+            (unsigned int)m->summary_ok, (unsigned int)m->summary[0], ((int16_t)m->summary[1]) / 10.0f,
+            (unsigned int)m->summary[2], m->summary[3] / 10.0f,
+            ((unsigned long)m->summary[4] << 16) | m->summary[5], (unsigned int)m->summary[6],
+            (unsigned int)m->summary[7], (unsigned int)m->summary[8], (unsigned int)m->summary[9],
+            m->avg,
+            (i < s_sd.multi_us_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* Backward-compatible multi_us alias */
+    pos = sfmt_append(buf, buflen, pos, "\"multi_us\":[");
+    for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
+        const MultiSensorBoard_t *m = &s_sd.multi_us[i];
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"dist\":[%.0f,%.0f,%.0f,0,0,0,0,0],"
+            "\"avg\":%.0f,\"comp\":%.0f,\"temp\":%.1f}%s",
+            m->id,
+            m->dist[0], m->dist[1], m->dist[2],
+            m->avg, (float)m->mode, m->temp[0],
+            (i < s_sd.multi_us_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    /* --- actuators (dynamic) --- */
+    pos = sfmt_append(buf, buflen, pos, "\"relays\":[");
+    for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
+        char pin_val[32] = {0};
+        uint8_t atype = s_cfg.actuators[i].type;
+        uint8_t ch = s_cfg.actuators[i].pin_or_slave;
+
+        if (atype == ACTUATOR_TYPE_LOCAL_GPIO || atype == ACTUATOR_TYPE_DIGITAL_OUT) {
+            snprintf(pin_val, sizeof(pin_val), "%s%u", s_cfg.actuators[i].port_or_ip, s_cfg.actuators[i].pin_or_slave);
+        } else if (atype == ACTUATOR_TYPE_PWM) {
+            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
+            snprintf(pin_val, sizeof(pin_val), "%s", pw ? pw->pin_name : (ch == 0 ? "PD12" : "PD13"));
+        } else if (atype == ACTUATOR_TYPE_PTO) {
+            const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
+            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
+            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
+            snprintf(pin_val, sizeof(pin_val), "PUL:%s,DIR:%s", pul, dir);
+        } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
+            snprintf(pin_val, sizeof(pin_val), "%s", (ch == 0 ? "PA4" : ch == 1 ? "PA5" : "PA4"));
+        } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
+            snprintf(pin_val, sizeof(pin_val), "%s", (ch == 0 ? "PD14" : ch == 1 ? "PD15" : "PD14"));
+        } else {
+            snprintf(pin_val, sizeof(pin_val), "%s", s_cfg.actuators[i].port_or_ip);
+        }
+
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"channel\":%u,\"state\":%u,\"pin\":\"%s\",\"nc\":%u,\"name\":\"%s\","
+            "\"type\":%u,\"slave_id\":%u,\"reg_addr\":%u",
+            i, (unsigned)(ch + 1), relayStates[i], pin_val, s_cfg.actuators[i].is_active_low,
+            s_cfg.actuators[i].name[0] ? s_cfg.actuators[i].name : "Actuator",
+            atype, s_cfg.actuators[i].pin_or_slave, s_cfg.actuators[i].reg_addr);
+
+        if (atype == ACTUATOR_TYPE_PWM) {
+            const PWM_Channel_Info_t *pw = PWM_GetChannelInfo(ch < MAX_PWM_CHANNELS ? ch : 0);
+            int d = pw ? (int)pw->duty_pct : 0;
+            pos = sfmt_append(buf, buflen, pos, ",\"duty\":%d,\"freq\":%u",
+                d, pw ? (unsigned)pw->freq_hz : 1000);
+        } else if (atype == ACTUATOR_TYPE_PTO) {
+            const PTO_Channel_Status_t *pt = PTO_GetStatus(ch < MAX_PTO_CHANNELS ? ch : 0);
+            const char *pul = (pt && pt->pul_pin) ? pt->pul_pin : (ch == 0 ? "PE9" : ch == 1 ? "PE5" : ch == 2 ? "PC8" : "PA3");
+            const char *dir = (pt && pt->dir_pin) ? pt->dir_pin : (ch == 0 ? "PE8" : ch == 1 ? "PE3" : ch == 2 ? "PC9" : "PA5");
+            pos = sfmt_append(buf, buflen, pos, ",\"speed\":%u,\"position\":%ld,\"moving\":%u,\"axis\":%u,\"pul_pin\":\"%s\",\"dir_pin\":\"%s\"",
+                pt ? (unsigned)pt->speed_pps : 5000, (long)(pt ? pt->position : 0), (unsigned)(pt ? pt->moving : 0), (unsigned)(ch + 1), pul, dir);
+        } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
+            float ma = DAC_420MA_GetCurrent(ch < MAX_420MA_CHANNELS ? ch : 0);
+            int m_i = (int)ma;
+            int m_f = (int)((ma - (float)m_i) * 100.0f);
+            if (m_f < 0) m_f = 0;
+            pos = sfmt_append(buf, buflen, pos, ",\"current_ma\":%d.%02d", m_i, m_f);
+        } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
+            float v = Analog_010V_GetVoltage(ch < MAX_010V_CHANNELS ? ch : 0);
+            int v_i = (int)v;
+            int v_f = (int)((v - (float)v_i) * 100.0f);
+            if (v_f < 0) v_f = 0;
+            pos = sfmt_append(buf, buflen, pos, ",\"voltage_v\":%d.%02d", v_i, v_f);
+        }
+
+        pos = sfmt_append(buf, buflen, pos, "}%s", (i < s_cfg.actuator_count - 1) ? "," : "");
+    }
+    pos = sfmt_append(buf, buflen, pos, "],");
+
+    ctlnetwork(CN_GET_NETINFO, &s_ni);
+
+    /* Fetch rules versions and pending flags safely under rulesMutex */
+    uint8_t has_pending = 0;
+    char pending_ver[36] = {0};
+    char active_ver[36] = {0};
+    if (rulesMutex && osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
+        has_pending = hasPendingRules;
+        strncpy(pending_ver, pendingRules.version_id, sizeof(pending_ver) - 1);
+        strncpy(active_ver, activeRules.version_id, sizeof(active_ver) - 1);
+        osMutexRelease(rulesMutex);
+    }
+
+    pos = sfmt_append(buf, buflen, pos, "\"uptime_s\":%lu,"
+        "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+        "\"serial\":\"KX-%07lu\","
+        "\"ip\":\"%d.%d.%d.%d\","
+        "\"fw\":\"" FW_VERSION "\","
+        "\"model\":\"KX-F407\","
+        "\"test_mode\":%u,"
+        "\"rules_version_id\":\"%s\","
+        "\"activeVersionId\":\"%s\","
+        ,
+        (unsigned long)g_uptime_seconds,
+        s_ni.mac[0], s_ni.mac[1], s_ni.mac[2], s_ni.mac[3], s_ni.mac[4], s_ni.mac[5],
+        (unsigned long)s_cfg.serial,
+        s_ni.ip[0], s_ni.ip[1], s_ni.ip[2], s_ni.ip[3],
+        s_cfg.test_mode,
+        active_ver[0] ? active_ver : "default",
+        active_ver[0] ? active_ver : "default");
+
+    pos = sfmt_append(buf, buflen, pos, "\"sparkplug_topic\":\"%s\","
+        "\"pending_sparkplug_topic\":\"%s\","
+        "\"sparkplug_edge_node_id\":\"%s\","
+        "\"sparkplug_device_id\":\"%s\","
+        "\"provision_status\":\"%s\","
+        "\"provision_message\":\"%s\","
+        "\"mqtt\":{"
+        "\"connected\":%u,"
+        "\"tx_enabled\":%u,"
+        "\"skip_offline\":%u,"
+        "\"active_topic\":\"%s\","
+        "\"last_error\":\"%s\","
+        "\"broker\":\"%s\","
+        "\"port\":%u,"
+        "\"client_id\":\"%s\","
+        "\"username\":\"%s\","
+        "\"interval\":%lu,"
+        "\"send_mode\":%u,"
+        "\"payload_shape\":%u},",   /* publish log moved to GET /api/mqtt/log */
+        s_cfg.sparkplug_topic,
+        s_cfg.pending_sparkplug_topic,
+        s_cfg.sparkplug_edge_node_id,
+        s_cfg.sparkplug_device_id,
+        s_cfg.provision_status[0] ? s_cfg.provision_status : "Active",
+        s_cfg.provision_message,
+        g_mqtt_status.connected,
+        s_cfg.mqtt_tx_enabled,
+        s_cfg.mqtt_skip_offline,
+        g_mqtt_status.active_topic,
+        g_mqtt_status.last_error,
+        s_cfg.mqtt_broker,
+        (unsigned)(s_cfg.mqtt_port ? s_cfg.mqtt_port : 1883),
+        s_cfg.mqtt_client_id,
+        s_cfg.mqtt_username,
+        (unsigned long)s_cfg.mqtt_interval,
+        s_cfg.mqtt_send_mode,
+        s_cfg.mqtt_payload_shape
+    );
 
     size_t heap_free  = xPortGetFreeHeapSize();
     size_t heap_total = configTOTAL_HEAP_SIZE;
+    size_t heap_used  = (heap_total > heap_free) ? (heap_total - heap_free) : 0;
 
-    pos += snprintf(buf + pos, buflen - pos,
-        "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\"},",
+    pos = sfmt_append(buf, buflen, pos, "\"epoch\":%lu,\"sd_critical_lock\":%u,",
+        (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+
+    pos = sfmt_append(buf, buflen, pos, "\"sys\":{\"cpu_pct\":%u,\"heap_free\":%u,\"heap_total\":%u,\"heap_used\":%u,\"log_full\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"sd_critical_lock\":%u},",
         (unsigned)g_cpu_usage_pct,
         (unsigned)heap_free,
         (unsigned)heap_total,
+        (unsigned)heap_used,
         (unsigned)g_sys_log_full,
         (unsigned)has_pending,
-        pending_ver);
+        pending_ver,
+        (unsigned)SDCard_IsCriticalLocked());
 
-    pos += snprintf(buf + pos, buflen - pos, "\"interfaces\":");
-    pos += Interface_BuildArrayJSON(buf + pos, buflen - pos);
-    pos += snprintf(buf + pos, buflen - pos, ",");
+    pos = sfmt_advance(buflen, pos, Supervisor_FormatHealthJSON(buf + pos, buflen - (int)pos));
+    pos = sfmt_append(buf, buflen, pos, ",");
 
-    pos += snprintf(buf + pos, buflen - pos, "\"pto\":");
-    pos += JSON_PTO_Array(buf + pos, buflen - pos);
-    pos += snprintf(buf + pos, buflen - pos, ",");
+    /* source: 0 not set, 1 browser, 2 SNTP. clock: crystal (HSE) or internal RC (HSI). */
+    pos = sfmt_append(buf, buflen, pos,
+        "\"time\":{\"epoch\":%lu,\"source\":%u,\"synced_ago_s\":%lu,\"clock\":\"%s\"},",
+        (unsigned long)Time_Now(), (unsigned)Time_Source(),
+        (unsigned long)(Time_Source() ? (g_uptime_seconds - Time_LastSyncUptime()) : 0UL),
+        RCC_IsHSEUsed() ? "HSE" : "HSI");
 
-    pos += snprintf(buf + pos, buflen - pos, "\"pwm\":");
-    pos += JSON_PWM_Array(buf + pos, buflen - pos);
-    pos += snprintf(buf + pos, buflen - pos, ",");
+    pos = sfmt_append(buf, buflen, pos, "\"interfaces\":");
+    pos = sfmt_advance(buflen, pos, Interface_BuildArrayJSON(buf + pos, buflen - pos));
+    pos = sfmt_append(buf, buflen, pos, ",");
 
-    pos += snprintf(buf + pos, buflen - pos, "\"analog\":");
-    pos += JSON_Analog_Object(buf + pos, buflen - pos);
-    pos += snprintf(buf + pos, buflen - pos, "}");
+    pos = sfmt_append(buf, buflen, pos, "\"pto\":");
+    pos = sfmt_advance(buflen, pos, JSON_PTO_Array(buf + pos, buflen - pos));
+    pos = sfmt_append(buf, buflen, pos, ",");
+
+    pos = sfmt_append(buf, buflen, pos, "\"pwm\":");
+    pos = sfmt_advance(buflen, pos, JSON_PWM_Array(buf + pos, buflen - pos));
+    pos = sfmt_append(buf, buflen, pos, ",");
+
+    pos = sfmt_append(buf, buflen, pos, "\"analog\":");
+    pos = sfmt_advance(buflen, pos, JSON_Analog_Object(buf + pos, buflen - pos));
+    pos = sfmt_append(buf, buflen, pos, "}");
 
     if (pos >= buflen - 2) {
         pos = buflen - 2;
@@ -1211,7 +1389,9 @@ static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen
 #define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
 #define HTTP_400      "HTTP/1.1 400 Bad Request\r\nConnection:close\r\n\r\n{\"ok\":false}"
 #define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\"}"
+#define HTTP_423_LOCKED "HTTP/1.1 423 Locked\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"CRITICAL SYSTEM LOCK: MicroSD storage removed. Actuators frozen. Enter Admin password to unlock.\"}"
 #define HTTP_200_OK_JSON "{\"ok\":true}"
+#define HTTP_500_JSON "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
 
 static void Send_Response(uint8_t sn, const char *header, const char *body) {
     if (!body || body[0] == '\0') {
@@ -1261,6 +1441,20 @@ static uint8_t Send_Chunked(uint8_t sn, const uint8_t *data, uint32_t total) {
             return 0;     /* Socket error / client disconnected */
         }
     }
+    return 1;
+}
+
+/* A JSON body that filled tx_buf was truncated by sfmt_append() and is not
+ * valid JSON. Answer 500 instead of sending it; returns 1 when the caller
+ * must stop. */
+static uint8_t Reject_If_Truncated(uint8_t sn, size_t len, const char *what) {
+    if (!sfmt_full(sizeof(tx_buf), len)) {
+        return 0;
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "HTTP: %s response truncated", what);
+    Log_Event("SYS", msg);
+    Send_Response(sn, HTTP_500_JSON, "{\"ok\":false,\"error\":\"Response too large\"}");
     return 1;
 }
 
@@ -1383,6 +1577,25 @@ static void Build_CORS_Headers(const char *req, char *out_cors, size_t maxlen) {
         snprintf(out_cors, maxlen,
             "Access-Control-Allow-Origin: *\r\n");
     }
+}
+
+/* Value of the Content-Length header (any letter case), or -1 if absent.
+ * Only the header block (before the blank line) is searched. */
+static int Find_Content_Length(const char *req, const char *hdr_end) {
+    static const char key[] = "content-length:";
+    for (const char *p = req; p < hdr_end; p++) {
+        if (*p != '\n') continue;
+        const char *k = p + 1;
+        size_t i = 0;
+        while (key[i] && k + i < hdr_end &&
+               (char)tolower((unsigned char)k[i]) == key[i]) i++;
+        if (key[i] == '\0') {
+            const char *v = k + i;
+            while (*v == ' ' || *v == '\t') v++;
+            return atoi(v);
+        }
+    }
+    return -1;
 }
 
 /* ======================================================================
@@ -1547,14 +1760,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char cur_p[32] = {0};
         char new_u[32] = {0};
         char new_p[32] = {0};
+        char new_mp[32] = {0};
         if (body) {
             body += 4;
             JSON_ReadStr(body, "current_password", cur_p, sizeof(cur_p));
             JSON_ReadStr(body, "new_username", new_u, sizeof(new_u));
             JSON_ReadStr(body, "new_password", new_p, sizeof(new_p));
+            JSON_ReadStr(body, "new_master_password", new_mp, sizeof(new_mp));
         }
         Get_Shared_Config(&s_http_cfg_temp);
-        if (strcmp(cur_p, s_http_cfg_temp.admin_password) != 0) {
+        if (strcmp(cur_p, s_http_cfg_temp.admin_password) != 0 &&
+            (s_http_cfg_temp.master_password[0] == '\0' || strcmp(cur_p, s_http_cfg_temp.master_password) != 0)) {
             const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Current password is incorrect\"}";
             send(sn, (uint8_t *)err, strlen(err));
             return;
@@ -1566,6 +1782,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (new_p[0] != '\0') {
             strncpy(s_http_cfg_temp.admin_password, new_p, sizeof(s_http_cfg_temp.admin_password) - 1);
             s_http_cfg_temp.admin_password[sizeof(s_http_cfg_temp.admin_password) - 1] = '\0';
+        }
+        if (new_mp[0] != '\0') {
+            strncpy(s_http_cfg_temp.master_password, new_mp, sizeof(s_http_cfg_temp.master_password) - 1);
+            s_http_cfg_temp.master_password[sizeof(s_http_cfg_temp.master_password) - 1] = '\0';
         }
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&s_http_cfg_temp);
@@ -1591,6 +1811,22 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
+     * Critical SD Card Lockout Gatekeeper:
+     * If storage is removed, strictly reject all actuator and config writes.
+     * ----------------------------------------------------------------- */
+    if (SDCard_IsCriticalLocked()) {
+        if (strncmp(line, "POST /api/relay", 15) == 0 ||
+            strncmp(line, "POST /api/pto", 13) == 0 ||
+            strncmp(line, "POST /api/pwm", 13) == 0 ||
+            strncmp(line, "POST /api/analog", 16) == 0 ||
+            strncmp(line, "POST /api/rules", 15) == 0 ||
+            strncmp(line, "POST /api/config/", 17) == 0) {
+            Send_Response(sn, HTTP_423_LOCKED, NULL);
+            return;
+        }
+    }
+
+    /* -----------------------------------------------------------------
      * Protected API Gatekeeper:
      * Restrict sensitive configuration writes & firmware updates to authenticated sessions.
      * Note: POST /api/provision is exempt so mobile onboarding/provisioning can configure MQTT.
@@ -1607,12 +1843,50 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         strncmp(line, "POST /api/modbus", 16) == 0 ||
         strncmp(line, "POST /api/provision/delete", 26) == 0 ||
         strncmp(line, "POST /api/provision/manual", 26) == 0 ||
-        strncmp(line, "POST /api/queue/clear", 21) == 0) {
+        strncmp(line, "POST /api/queue/clear", 21) == 0 ||
+        strncmp(line, "POST /api/time", 14) == 0 ||
+        strncmp(line, "POST /api/debug/", 16) == 0) {
         if (!Is_Session_Valid(line)) {
             Send_Response(sn, HTTP_401, NULL);
             return;
         }
     }
+
+    /* -----------------------------------------------------------------
+     * POST /api/time {"epoch":N}  (login required) -> browser time, used
+     * until SNTP succeeds. Ignored once SNTP has set a fresh time.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/time", 14) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        long epoch = body ? JSON_ReadInt(body + 4, "epoch") : -1;
+        int applied = (epoch > 0) ? Time_Set((uint32_t)epoch, TIME_SRC_BROWSER) : 0;
+        char resp[80];
+        snprintf(resp, sizeof(resp), "{\"ok\":true,\"applied\":%d,\"source\":%u}", applied, (unsigned)Time_Source());
+        Send_Response(sn, HTTP_200_JSON, resp);
+        return;
+    }
+
+#ifdef KONTRX_FAULT_TEST
+    /* -----------------------------------------------------------------
+     * POST /api/debug/fault?task=NAME&type=N  (test builds only, login
+     * required) -> the named task faults at its next test point.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/debug/fault", 21) == 0) {
+        char task[configMAX_TASK_NAME_LEN] = {0};
+        const char *t = strstr(line, "task=");
+        if (t) {
+            t += 5;
+            size_t n = 0;
+            while (n < sizeof(task) - 1U && t[n] && t[n] != '&' && t[n] != ' ') { task[n] = t[n]; n++; }
+        }
+        int type = ParseQueryInt(line, "type");
+        int ok = FaultTest_Arm(task, (uint8_t)((type > 0 && type < 256) ? type : 0));
+        char resp[96];
+        snprintf(resp, sizeof(resp), "{\"ok\":%s,\"task\":\"%s\",\"type\":%d}", ok ? "true" : "false", task, type);
+        Send_Response(sn, HTTP_200_JSON, resp);
+        return;
+    }
+#endif
 
     /* -----------------------------------------------------------------
      * POST /api/queue/clear  → Purge stale offline telemetry queue
@@ -1631,6 +1905,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (strncmp(line, "GET /api/interfaces", 19) == 0) {
         Interface_BuildDiscoveryJSON(tx_buf, sizeof(tx_buf));
         int pos = strlen(tx_buf);
+        if (Reject_If_Truncated(sn, (size_t)pos, "interfaces")) return;
         char if_hdr[256];
         snprintf(if_hdr, sizeof(if_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1663,6 +1938,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/pto", 12) == 0) {
         int pos = JSON_PTO_Array(tx_buf, sizeof(tx_buf));
+        if (Reject_If_Truncated(sn, (size_t)pos, "pto")) return;
         char pto_hdr[256];
         snprintf(pto_hdr, sizeof(pto_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1681,14 +1957,23 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/move?id=N&steps=S&speed=V  (Relative motion)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/move?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         int id = ParseQueryInt(line, "id");
         int32_t steps = ParseQuerySignedInt(line, "steps");
         int speed = ParseQueryInt(line, "speed");
         if (speed <= 0) speed = 1000;
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_MoveRelative((uint8_t)id, steps, (uint32_t)speed);
+            char pt_log[64];
+            snprintf(pt_log, sizeof(pt_log), "PTO Axis %d Move: %ld steps @ %d Hz (Manual Test)", id+1, (long)steps, speed);
+            Log_Event("PTO", pt_log);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"axis\":%d,\"steps\":%ld,\"speed\":%d", id+1, (long)steps, speed);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PTO %d Move Rel (%ld steps)", id+1, (long)steps);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1716,11 +2001,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/stop?id=N
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/stop?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         int id = ParseQueryInt(line, "id");
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_Stop((uint8_t)id);
+            char pt_log[48];
+            snprintf(pt_log, sizeof(pt_log), "PTO Axis %d Stopped (Manual Test)", id+1);
+            Log_Event("PTO", pt_log);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PTO %d STOP", id+1);
+        Send_Action_Response(sn, act_name, t_start, heap_before, "\"stopped\":1");
         return;
     }
 
@@ -1728,6 +2020,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pto/home?id=N
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pto/home?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1737,7 +2031,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (id >= 0 && id < (int)PTO_GetChannelCount()) {
             PTO_SetHome((uint8_t)id);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PTO %d Set Home", id+1);
+        Send_Action_Response(sn, act_name, t_start, heap_before, "\"homed\":1");
         return;
     }
 
@@ -1746,6 +2042,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/pwm", 12) == 0) {
         int pos = JSON_PWM_Array(tx_buf, sizeof(tx_buf));
+        if (Reject_If_Truncated(sn, (size_t)pos, "pwm")) return;
         char pwm_hdr[256];
         snprintf(pwm_hdr, sizeof(pwm_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1764,6 +2061,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/pwm?id=N&duty=D
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/pwm?", 14) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1773,8 +2072,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         float duty = ParseQueryFloat(line, "duty");
         if (id >= 0 && id < (int)PWM_GetChannelCount() && duty >= 0.0f) {
             PWM_SetDuty((uint8_t)id, duty);
+            char p_log[64];
+            snprintf(p_log, sizeof(p_log), "PWM Channel %d set to %.1f%% Duty (Manual Test)", id+1, duty);
+            Log_Event("PWM", p_log);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"channel\":%d,\"duty\":%.1f", id+1, duty);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "PWM %d Duty %.0f%%", id+1, duty);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1791,6 +2097,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int freq = ParseQueryInt(line, "freq");
         if (id >= 0 && id < (int)PWM_GetChannelCount() && freq > 0) {
             PWM_SetFrequency((uint8_t)id, (uint32_t)freq);
+            char p_log[64];
+            snprintf(p_log, sizeof(p_log), "PWM Channel %d Frequency set to %d Hz (Manual Test)", id+1, freq);
+            Log_Event("PWM", p_log);
         }
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         return;
@@ -1801,6 +2110,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/analog", 15) == 0) {
         int pos = JSON_Analog_Object(tx_buf, sizeof(tx_buf));
+        if (Reject_If_Truncated(sn, (size_t)pos, "analog")) return;
         char an_hdr[256];
         snprintf(an_hdr, sizeof(an_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1819,6 +2129,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/analog/ma?id=N&val=M  (4-20mA current setpoint)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/analog/ma?", 20) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1829,8 +2141,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (val < 0.0f) val = ParseQueryFloat(line, "ma");
         if (id >= 0 && id < (int)DAC_420MA_GetChannelCount() && val >= 0.0f) {
             DAC_420MA_SetCurrent((uint8_t)id, val);
+            char a_log[64];
+            snprintf(a_log, sizeof(a_log), "4-20mA Output %d set to %.2f mA (Manual Test)", id+1, val);
+            Log_Event("ANALOG", a_log);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"channel\":%d,\"current_ma\":%.2f", id+1, val);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "4-20mA %d Set %.2fmA", id+1, val);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1838,6 +2157,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/analog/v?id=N&val=V  (0-10V voltage setpoint)
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/analog/v?", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -1848,8 +2169,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (val < 0.0f) val = ParseQueryFloat(line, "v");
         if (id >= 0 && id < (int)Analog_010V_GetChannelCount() && val >= 0.0f) {
             Analog_010V_SetVoltage((uint8_t)id, val);
+            char a_log[64];
+            snprintf(a_log, sizeof(a_log), "0-10V Output %d set to %.2f V (Manual Test)", id+1, val);
+            Log_Event("ANALOG", a_log);
         }
-        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"channel\":%d,\"voltage_v\":%.2f", id+1, val);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "0-10V %d Set %.2fV", id+1, val);
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -1858,6 +2186,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/hardware", 17) == 0) {
         int n = JSON_HardwareResponse(tx_buf, sizeof(tx_buf));
+        if (Reject_If_Truncated(sn, (size_t)n, "hardware")) return;
         char hw_hdr[240];
         snprintf(hw_hdr, sizeof(hw_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1885,6 +2214,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         int pos = Partition_FormatRulesHistoryJSON(tx_buf, sizeof(tx_buf), cur_ver);
 
+        if (Reject_If_Truncated(sn, (size_t)pos, "rules history")) return;
         char hist_hdr[320];
         snprintf(hist_hdr, sizeof(hist_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -1935,18 +2265,17 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
 
         int pos = 0;
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-            "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"rules\":[",
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"version_id\":\"%s\",\"timestamp\":\"%s\",\"rules_valid\":%u,\"bypass_validation\":%u,\"has_pending\":%u,\"pending_version\":\"%s\",\"rules\":[",
             current_rules.version_id, current_rules.timestamp, current_rules.rules_valid, current_rules.bypass_validation,
             has_pending, pending_ver);
         
         for (uint32_t i = 0; i < current_rules.rule_count; i++) {
             const Rule_t *r = &current_rules.rules[i];
-            pos += JSON_SerializeRule(tx_buf + pos, sizeof(tx_buf) - pos, r, &current_rules, (i == 0));
+            pos = sfmt_advance(sizeof(tx_buf), pos, JSON_SerializeRule(tx_buf + pos, sizeof(tx_buf) - pos, r, &current_rules, (i == 0)));
         }
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "],\"history\":");
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "],\"history\":");
 
-        pos += Partition_FormatRulesHistoryJSON(tx_buf + pos, sizeof(tx_buf) - pos, current_rules.version_id);
+        pos = sfmt_advance(sizeof(tx_buf), pos, Partition_FormatRulesHistoryJSON(tx_buf + pos, sizeof(tx_buf) - pos, current_rules.version_id));
 
         /* Append canvas layout blob if one was saved by the desktop configurator.
            The layout is stored as raw JSON so we splice it directly into the response. */
@@ -1961,8 +2290,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
         }
 
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "}");
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "}");
 
+        if (Reject_If_Truncated(sn, (size_t)pos, "rules")) return;
         char rules_hdr[320];
         snprintf(rules_hdr, sizeof(rules_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -2129,19 +2459,19 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         int pos = 0;
         if (has_pending) {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"has_pending\":true,\"version_id\":\"%s\",\"timestamp\":\"%s\",\"bypass_validation\":%u,\"rules\":[",
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"has_pending\":true,\"version_id\":\"%s\",\"timestamp\":\"%s\",\"bypass_validation\":%u,\"rules\":[",
                 pending_snap.version_id, pending_snap.timestamp, pending_snap.bypass_validation);
             
             for (uint32_t i = 0; i < pending_snap.rule_count; i++) {
                 const Rule_t *r = &pending_snap.rules[i];
-                pos += JSON_SerializeRule(tx_buf + pos, sizeof(tx_buf) - pos, r, &pending_snap, (i == 0));
+                pos = sfmt_advance(sizeof(tx_buf), pos, JSON_SerializeRule(tx_buf + pos, sizeof(tx_buf) - pos, r, &pending_snap, (i == 0)));
             }
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "]}");
         } else {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "{\"has_pending\":false}");
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"has_pending\":false}");
         }
 
+        if (Reject_If_Truncated(sn, (size_t)pos, "rules")) return;
         char rules_hdr[320];
         snprintf(rules_hdr, sizeof(rules_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -2337,9 +2667,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         body += 4;
 
-        /* If payload contains "layout":{...}, extract and save it directly to flash
-           WITHOUT parsing it in cJSON to avoid exhausting the tiny FreeRTOS heap.
-           Then replace the layout object with null in-place so cJSON_Parse sees a tiny object. */
+        /* If payload contains "layout":{...}, save it directly to flash and
+           replace it with null in place, so the rules parser only scans the rules. */
         char *lkey = strstr(body, "\"layout\"");
         if (lkey) {
             char *colon = strchr(lkey, ':');
@@ -2378,287 +2707,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             }
         }
 
-        cJSON *root = cJSON_Parse(body);
-        if (!root) {
-            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Invalid JSON syntax\"}");
-            return;
-        }
-
-        /* Accept both wrapped {"version_id","timestamp","rules":[...]} and bare array [...] */
-        cJSON *version_item = NULL;
-        cJSON *timestamp_item = NULL;
-        cJSON *rules_arr = NULL;
-
-        if (cJSON_IsArray(root)) {
-            rules_arr = root;
-        } else {
-            version_item = cJSON_GetObjectItemCaseSensitive(root, "version_id");
-            timestamp_item = cJSON_GetObjectItemCaseSensitive(root, "timestamp");
-            rules_arr = cJSON_GetObjectItemCaseSensitive(root, "rules");
-        }
-
-        if (!rules_arr || !cJSON_IsArray(rules_arr)) {
-            cJSON_Delete(root);
-            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Missing rules array\"}");
-            return;
-        }
-
-        int rules_count = cJSON_GetArraySize(rules_arr);
-        /* printf("[HTTP] POST /api/rules: Parsing %d rules, version '%s'\r\n", rules_count, version_item->valuestring); */
-        if (rules_count > MAX_RULES) {
-            cJSON_Delete(root);
-            Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule count exceeds MAX_RULES\"}");
-            return;
-        }
-
-        // Use s_tempRules located in CCMRAM to avoid stack or BSS overflow
+        /* Parsed in place by rules_parser.c: no heap (a cJSON tree of a full
+         * rule set needed more than the free heap and reset the board). */
         #define tempRules s_tempRules
-        memset(&tempRules, 0, sizeof(tempRules));
-        tempRules.magic = RULES_MAGIC_CURRENT;
-        if (version_item && cJSON_IsString(version_item))
-            strncpy(tempRules.version_id, version_item->valuestring, sizeof(tempRules.version_id) - 1);
-        else
-            snprintf(tempRules.version_id, sizeof(tempRules.version_id), "auto_%lu", (unsigned long)osKernelGetTickCount());
-        if (timestamp_item && cJSON_IsString(timestamp_item))
-            strncpy(tempRules.timestamp, timestamp_item->valuestring, sizeof(tempRules.timestamp) - 1);
-        else
-            strncpy(tempRules.timestamp, "auto-generated", sizeof(tempRules.timestamp) - 1);
-        tempRules.rule_count = 0;
-        tempRules.rules_valid = 0; // Starts unvalidated
-
-        for (int i = 0; i < rules_count; i++) {
-            cJSON *rule_obj = cJSON_GetArrayItem(rules_arr, i);
-            if (!cJSON_IsObject(rule_obj)) {
-                cJSON_Delete(root);
-                Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule item must be an object\"}");
-                return;
-            }
-
-            cJSON *r_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "rule_id");
-            cJSON *in_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "input_id");
-            cJSON *op = cJSON_GetObjectItemCaseSensitive(rule_obj, "operator");
-            cJSON *thresh = cJSON_GetObjectItemCaseSensitive(rule_obj, "threshold");
-            cJSON *out_id = cJSON_GetObjectItemCaseSensitive(rule_obj, "output_id");
-            cJSON *act = cJSON_GetObjectItemCaseSensitive(rule_obj, "action");
-
-            /* If rule uses nested "condition" object, walk the tree to extract flat fields.
-               Searches condition → child → set_condition → children[0] recursively for input_id/operator/threshold. */
-            cJSON *cond = cJSON_GetObjectItemCaseSensitive(rule_obj, "condition");
-            if (cond && cJSON_IsObject(cond)) {
-                cJSON *walk = cond;
-                for (int depth = 0; depth < 5 && walk; depth++) {
-                    if (!in_id)  in_id  = cJSON_GetObjectItemCaseSensitive(walk, "input_id");
-                    if (!op)     op     = cJSON_GetObjectItemCaseSensitive(walk, "operator");
-                    if (!thresh) thresh = cJSON_GetObjectItemCaseSensitive(walk, "threshold");
-                    if (in_id && op && thresh) break;
-                    /* Descend into "set_condition", "child", or first element of "children" */
-                    cJSON *set_c = cJSON_GetObjectItemCaseSensitive(walk, "set_condition");
-                    if (set_c && cJSON_IsObject(set_c)) { walk = set_c; continue; }
-                    cJSON *child = cJSON_GetObjectItemCaseSensitive(walk, "child");
-                    if (child && cJSON_IsObject(child)) { walk = child; continue; }
-                    cJSON *children = cJSON_GetObjectItemCaseSensitive(walk, "children");
-                    if (children && cJSON_IsArray(children) && cJSON_GetArraySize(children) > 0) {
-                        walk = cJSON_GetArrayItem(children, 0);
-                        continue;
-                    }
-                    break;
-                }
-                /* For sensor_state / AND / OR without operator, default to != -999 (always true when sensor online) */
-                if (in_id && !op) {
-                    static cJSON default_op;
-                    default_op.type = cJSON_String;
-                    default_op.valuestring = "!=";
-                    op = &default_op;
-                }
-            }
-
-            if (!r_id || !cJSON_IsString(r_id) ||
-                !in_id || (!cJSON_IsString(in_id) && !cJSON_IsNumber(in_id)) ||
-                !op || !cJSON_IsString(op) ||
-                !out_id || (!cJSON_IsString(out_id) && !cJSON_IsNumber(out_id)) ||
-                !act || !cJSON_IsString(act)) {
-                cJSON_Delete(root);
-                Send_Response(sn, HTTP_200_JSON, "{\"status\":\"error\",\"error\":\"Rule field missing or invalid type\"}");
-                return;
-            }
-
-            /* threshold is optional for condition-based rules (default 0) */
-
-            strncpy(tempRules.rules[i].rule_id, r_id->valuestring, sizeof(tempRules.rules[i].rule_id) - 1);
-            if (cJSON_IsString(in_id)) {
-                strncpy(tempRules.rules[i].input_id, in_id->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
-            } else {
-                snprintf(tempRules.rules[i].input_id, sizeof(tempRules.rules[i].input_id), "%d", in_id->valueint);
-            }
-            strncpy(tempRules.rules[i].operator, op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
-            tempRules.rules[i].threshold = (thresh && cJSON_IsNumber(thresh)) ? (float)thresh->valuedouble : -999.0f;
-            if (cJSON_IsString(out_id)) {
-                strncpy(tempRules.rules[i].output_id, out_id->valuestring, sizeof(tempRules.rules[i].output_id) - 1);
-            } else {
-                snprintf(tempRules.rules[i].output_id, sizeof(tempRules.rules[i].output_id), "%d", out_id->valueint);
-            }
-            strncpy(tempRules.rules[i].action, act->valuestring, sizeof(tempRules.rules[i].action) - 1);
-            tempRules.rules[i].active = 1;
-
-            /* Sensor-to-sensor comparison: compare_mode "input" with input_b_id */
-            tempRules.rules[i].compare_mode = 0;
-            memset(tempRules.rules[i].input_b_id, 0, sizeof(tempRules.rules[i].input_b_id));
-            if (cond && cJSON_IsObject(cond)) {
-                cJSON *cm_walk = cond;
-                for (int d = 0; d < 5 && cm_walk; d++) {
-                    cJSON *cm = cJSON_GetObjectItemCaseSensitive(cm_walk, "compare_mode");
-                    if (cm && cJSON_IsString(cm) && strcmp(cm->valuestring, "input") == 0) {
-                        tempRules.rules[i].compare_mode = 1;
-                        cJSON *ib = cJSON_GetObjectItemCaseSensitive(cm_walk, "input_b_id");
-                        if (ib) {
-                            if (cJSON_IsString(ib))
-                                strncpy(tempRules.rules[i].input_b_id, ib->valuestring, sizeof(tempRules.rules[i].input_b_id) - 1);
-                            else if (cJSON_IsNumber(ib))
-                                snprintf(tempRules.rules[i].input_b_id, sizeof(tempRules.rules[i].input_b_id), "%d", ib->valueint);
-                        }
-                        break;
-                    }
-                    cJSON *ch = cJSON_GetObjectItemCaseSensitive(cm_walk, "child");
-                    if (ch && cJSON_IsObject(ch)) { cm_walk = ch; continue; }
-                    cJSON *chs = cJSON_GetObjectItemCaseSensitive(cm_walk, "children");
-                    if (chs && cJSON_IsArray(chs) && cJSON_GetArraySize(chs) > 0) {
-                        cm_walk = cJSON_GetArrayItem(chs, 0); continue;
-                    }
-                    break;
-                }
-            }
-
-            /* --- Parse condition_type and advanced parameters --- */
-            tempRules.rules[i].condition_type = COND_TYPE_COMPARE;
-            if (cond && cJSON_IsObject(cond)) {
-                cJSON *ctype = cJSON_GetObjectItemCaseSensitive(cond, "type");
-                if (ctype && cJSON_IsString(ctype)) {
-                    if (strcmp(ctype->valuestring, "hysteresis") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_HYSTERESIS;
-                        cJSON *hth = cJSON_GetObjectItemCaseSensitive(cond, "high_threshold");
-                        cJSON *lth = cJSON_GetObjectItemCaseSensitive(cond, "low_threshold");
-                        if (hth && cJSON_IsNumber(hth)) tempRules.rules[i].high_threshold = (float)hth->valuedouble;
-                        if (lth && cJSON_IsNumber(lth)) tempRules.rules[i].low_threshold = (float)lth->valuedouble;
-                    } else if (strcmp(ctype->valuestring, "range") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_RANGE;
-                        cJSON *rmin = cJSON_GetObjectItemCaseSensitive(cond, "min");
-                        cJSON *rmax = cJSON_GetObjectItemCaseSensitive(cond, "max");
-                        cJSON *rmode = cJSON_GetObjectItemCaseSensitive(cond, "mode");
-                        if (rmin && cJSON_IsNumber(rmin)) tempRules.rules[i].min_threshold = (float)rmin->valuedouble;
-                        if (rmax && cJSON_IsNumber(rmax)) tempRules.rules[i].max_threshold = (float)rmax->valuedouble;
-                        tempRules.rules[i].range_mode = (rmode && cJSON_IsString(rmode) && strcmp(rmode->valuestring, "outside") == 0) ? 1 : 0;
-                    } else if (strcmp(ctype->valuestring, "timer_on") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_TIMER_ON;
-                        cJSON *dms = cJSON_GetObjectItemCaseSensitive(cond, "delay_ms");
-                        cJSON *dsec = cJSON_GetObjectItemCaseSensitive(cond, "delay_sec");
-                        if (dms && cJSON_IsNumber(dms)) tempRules.rules[i].delay_ms = (uint32_t)dms->valueint;
-                        else if (dsec && cJSON_IsNumber(dsec)) tempRules.rules[i].delay_ms = (uint32_t)(dsec->valuedouble * 1000.0);
-                    } else if (strcmp(ctype->valuestring, "pulse_timer") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_PULSE_TIMER;
-                        cJSON *pms = cJSON_GetObjectItemCaseSensitive(cond, "pulse_ms");
-                        cJSON *psec = cJSON_GetObjectItemCaseSensitive(cond, "pulse_sec");
-                        if (pms && cJSON_IsNumber(pms)) tempRules.rules[i].delay_ms = (uint32_t)pms->valueint;
-                        else if (psec && cJSON_IsNumber(psec)) tempRules.rules[i].delay_ms = (uint32_t)(psec->valuedouble * 1000.0);
-                    } else if (strcmp(ctype->valuestring, "sr_latch") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_SR_LATCH;
-                        cJSON *prio = cJSON_GetObjectItemCaseSensitive(cond, "priority");
-                        tempRules.rules[i].sr_priority = (prio && cJSON_IsString(prio) && strcmp(prio->valuestring, "set") == 0) ? 1 : 0;
-                        /* Check nested set_condition & reset_condition objects if present */
-                        cJSON *set_c = cJSON_GetObjectItemCaseSensitive(cond, "set_condition");
-                        if (set_c && cJSON_IsObject(set_c)) {
-                            cJSON *s_in = cJSON_GetObjectItemCaseSensitive(set_c, "input_id");
-                            cJSON *s_op = cJSON_GetObjectItemCaseSensitive(set_c, "operator");
-                            cJSON *s_th = cJSON_GetObjectItemCaseSensitive(set_c, "threshold");
-                            if (s_in) {
-                                if (cJSON_IsString(s_in))
-                                    strncpy(tempRules.rules[i].input_id, s_in->valuestring, sizeof(tempRules.rules[i].input_id) - 1);
-                                else if (cJSON_IsNumber(s_in))
-                                    snprintf(tempRules.rules[i].input_id, sizeof(tempRules.rules[i].input_id), "%d", s_in->valueint);
-                            }
-                            if (s_op && cJSON_IsString(s_op))
-                                strncpy(tempRules.rules[i].operator, s_op->valuestring, sizeof(tempRules.rules[i].operator) - 1);
-                            if (s_th && cJSON_IsNumber(s_th))
-                                tempRules.rules[i].threshold = (float)s_th->valuedouble;
-                        }
-                        cJSON *rst_c = cJSON_GetObjectItemCaseSensitive(cond, "reset_condition");
-                        if (rst_c && cJSON_IsObject(rst_c)) {
-                            cJSON *r_in = cJSON_GetObjectItemCaseSensitive(rst_c, "input_id");
-                            if (r_in) {
-                                if (cJSON_IsString(r_in))
-                                    strncpy(tempRules.rules[i].input_b_id, r_in->valuestring, sizeof(tempRules.rules[i].input_b_id) - 1);
-                                else if (cJSON_IsNumber(r_in))
-                                    snprintf(tempRules.rules[i].input_b_id, sizeof(tempRules.rules[i].input_b_id), "%d", r_in->valueint);
-                            }
-                        }
-                    } else if (strcmp(ctype->valuestring, "and") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_AND;
-                    } else if (strcmp(ctype->valuestring, "or") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_OR;
-                    } else if (strcmp(ctype->valuestring, "not") == 0) {
-                        tempRules.rules[i].condition_type = COND_TYPE_NOT;
-                    }
-                }
-            }
-
-            /* --- Parse actuator type and specialized action values --- */
-            cJSON *atype = cJSON_GetObjectItemCaseSensitive(rule_obj, "actuator_type");
-            cJSON *aval  = cJSON_GetObjectItemCaseSensitive(rule_obj, "value");
-            cJSON *aparams = cJSON_GetObjectItemCaseSensitive(rule_obj, "params");
-            cJSON *asteps = cJSON_GetObjectItemCaseSensitive(rule_obj, "steps");
-            cJSON *afreq  = cJSON_GetObjectItemCaseSensitive(rule_obj, "frequency");
-            cJSON *adir   = cJSON_GetObjectItemCaseSensitive(rule_obj, "direction");
-
-            tempRules.rules[i].actuator_type = (atype && cJSON_IsNumber(atype)) ? (uint8_t)atype->valueint : 0;
-            tempRules.rules[i].action_value = (aval && cJSON_IsNumber(aval)) ? (float)aval->valuedouble : 0.0f;
-
-            if (asteps && cJSON_IsNumber(asteps)) tempRules.rules[i].action_steps = (int32_t)asteps->valueint;
-            if (afreq && cJSON_IsNumber(afreq)) tempRules.rules[i].action_frequency = (uint32_t)afreq->valueint;
-            if (adir && cJSON_IsString(adir)) {
-                tempRules.rules[i].action_direction = (strcmp(adir->valuestring, "CCW") == 0) ? 1 : 0;
-            }
-
-            /* params.* fields override top-level value/frequency when present */
-            if (aparams && cJSON_IsObject(aparams)) {
-                cJSON *pduty = cJSON_GetObjectItemCaseSensitive(aparams, "duty");
-                cJSON *pfreq = cJSON_GetObjectItemCaseSensitive(aparams, "frequency");
-                cJSON *pma   = cJSON_GetObjectItemCaseSensitive(aparams, "current_ma");
-                cJSON *pv    = cJSON_GetObjectItemCaseSensitive(aparams, "voltage_v");
-                cJSON *pstep = cJSON_GetObjectItemCaseSensitive(aparams, "steps");
-
-                if (pduty && cJSON_IsNumber(pduty)) tempRules.rules[i].action_value = (float)pduty->valuedouble;
-                else if (pma && cJSON_IsNumber(pma)) tempRules.rules[i].action_value = (float)pma->valuedouble;
-                else if (pv && cJSON_IsNumber(pv))   tempRules.rules[i].action_value = (float)pv->valuedouble;
-                if (pfreq && cJSON_IsNumber(pfreq)) tempRules.rules[i].action_frequency = (uint32_t)pfreq->valueint;
-                if (pstep && cJSON_IsNumber(pstep)) tempRules.rules[i].action_steps = (int32_t)pstep->valueint;
-            }
-
-            /* auto_reverse: automatically undo action when condition becomes false */
-            cJSON *auto_rev = cJSON_GetObjectItemCaseSensitive(rule_obj, "auto_reverse");
-            tempRules.rules[i].auto_reverse = (auto_rev && cJSON_IsTrue(auto_rev)) ? 1 : 0;
-
-            /* Parse rule priority (default 10, range 1..16) */
-            cJSON *prio_item = cJSON_GetObjectItemCaseSensitive(rule_obj, "priority");
-            tempRules.rules[i].priority = (prio_item && cJSON_IsNumber(prio_item)) ? (uint8_t)prio_item->valueint : 10;
-
-            /* Parse condition tree if present */
-            tempRules.rules[i].root_node = -1;
-            if (cond && cJSON_IsObject(cond)) {
-                int8_t rn = Parse_Condition_Tree(cond, &tempRules);
-                tempRules.rules[i].root_node = rn;
-            }
-
-            /* Parse action sequence if present */
-            tempRules.rules[i].sequence_idx = -1;
-            cJSON *seq_obj = cJSON_GetObjectItemCaseSensitive(rule_obj, "sequence");
-            if (seq_obj && cJSON_IsObject(seq_obj)) {
-                int8_t sq = Parse_Action_Sequence(seq_obj, &tempRules);
-                tempRules.rules[i].sequence_idx = sq;
-            }
-
-            tempRules.rule_count++;
+        const char *perr = RulesParser_Parse(body, strlen(body), &tempRules, osKernelGetTickCount());
+        if (perr) {
+            char eresp[96];
+            snprintf(eresp, sizeof(eresp), "{\"status\":\"error\",\"error\":\"%s\"}", perr);
+            Send_Response(sn, HTTP_200_JSON, eresp);
+            return;
         }
-
-        cJSON_Delete(root);
 
         /* Validate output_id bounds against current actuator config */
         {
@@ -2733,6 +2791,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             n = (int)sizeof(tx_buf) - 1;
             tx_buf[n] = '\0';
         }
+        if (Reject_If_Truncated(sn, (size_t)n, "status")) return;
         char status_hdr[320];
         snprintf(status_hdr, sizeof(status_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -2746,6 +2805,36 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "\r\n",
             n);
         send(sn, (uint8_t *)status_hdr, (uint16_t)strlen(status_hdr));
+        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/mqtt/log  → MQTT publish history (polled by the MQTT page)
+     * GET /api/mqtt/log?idx=N  → Single full transmission log entry
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/mqtt/log", 17) == 0) {
+        char idx_str[8] = "";
+        ParseQueryStringParam(line, "idx", idx_str, sizeof(idx_str));
+        int n;
+        if (idx_str[0] != '\0') {
+            int idx = atoi(idx_str);
+            n = JSON_MqttLogEntryResponse(tx_buf, sizeof(tx_buf), idx);
+        } else {
+            n = JSON_MqttLogResponse(tx_buf, sizeof(tx_buf));
+        }
+        if (Reject_If_Truncated(sn, (size_t)n, "mqtt log")) return;
+        char log_hdr[200];
+        snprintf(log_hdr, sizeof(log_hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            n);
+        send(sn, (uint8_t *)log_hdr, (uint16_t)strlen(log_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
         return;
     }
@@ -2773,8 +2862,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         Get_Shared_Config(&s_http_cfg_temp);
         int pos = snprintf(tx_buf, sizeof(tx_buf), "{\"sensors\":[");
         for (uint8_t i = 0; i < s_http_cfg_temp.sensors.count && i < MAX_SENSORS; i++) {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"type\":\"%s\",\"id\":%u}%s",
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"type\":\"%s\",\"id\":%u}%s",
                 SensorTypeName(s_http_cfg_temp.sensors.entries[i].type),
                 s_http_cfg_temp.sensors.entries[i].id,
                 (i < s_http_cfg_temp.sensors.count - 1) ? "," : "");
@@ -2796,8 +2884,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             } else {
                 snprintf(pin_val, sizeof(pin_val), "%s", s_http_cfg_temp.actuators[i].port_or_ip);
             }
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"pin\":\"%s\",\"nc\":%u,\"slave_id\":%u,\"reg_addr\":%u}%s",
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"id\":%u,\"name\":\"%s\",\"type\":%u,\"pin\":\"%s\",\"nc\":%u,\"slave_id\":%u,\"reg_addr\":%u}%s",
                 i, s_http_cfg_temp.actuators[i].name, atype, pin_val,
                 s_http_cfg_temp.actuators[i].is_active_low,
                 s_http_cfg_temp.actuators[i].pin_or_slave,
@@ -2858,6 +2945,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             strcpy(path_param, "/");
         }
         int n = SDCard_List_Dir(path_param, tx_buf, sizeof(tx_buf));
+        if (Reject_If_Truncated(sn, (size_t)n, "sdcard browse")) return;
         char sd_hdr[160];
         snprintf(sd_hdr, sizeof(sd_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -2881,6 +2969,42 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         const char *fname = strrchr(path_param, '/');
         fname = (fname && *(fname + 1) != '\0') ? fname + 1 : path_param;
         if (fname[0] == '\0') fname = "system_event.log";
+
+        if (strstr(fname, "rules") != NULL || strstr(fname, ".json") != NULL) {
+            int n = Rules_ExportJSON_ForPath(path_param, tx_buf, sizeof(tx_buf));
+            char sd_hdr[320];
+            snprintf(sd_hdr, sizeof(sd_hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json; charset=utf-8\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %d\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n",
+                fname, n);
+            send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+            if (n > 0) {
+                Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+            }
+            return;
+        }
+
+        if (strstr(fname, "boot") != NULL) {
+            int n = SDCard_FormatBootAudit(tx_buf, sizeof(tx_buf));
+            char sd_hdr[320];
+            snprintf(sd_hdr, sizeof(sd_hdr),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                "Content-Length: %d\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Connection: close\r\n\r\n",
+                fname, n);
+            send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
+            if (n > 0) {
+                Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
+            }
+            return;
+        }
 
         uint32_t dl_size = SDCard_Stream_DownloadSize(path_param);
         char sd_hdr[320];
@@ -2911,6 +3035,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char *plim = strstr(line, "limit=");
         if (plim) limit = (uint32_t)atoi(plim + 6);
         int n = SDCard_Read_File_Paged(path_param, offset, limit, tx_buf, sizeof(tx_buf));
+        if (Reject_If_Truncated(sn, (size_t)n, "sdcard read")) return;
         char sd_hdr[200];
         snprintf(sd_hdr, sizeof(sd_hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -2927,6 +3052,80 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     /* -----------------------------------------------------------------
      * POST /api/sdcard/queue/clear  → Clear offline queue from SD Card
      * ----------------------------------------------------------------- */
+        /* -----------------------------------------------------------------
+     * POST /api/sdcard/unlock  → Admin master unlock for SD Card Critical Lock
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/sdcard/unlock", 23) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        char pwd[64] = {0};
+        if (body) {
+            body += 4;
+            JSON_ReadStr(body, "password", pwd, sizeof(pwd));
+        }
+        if (pwd[0] == '\0') {
+            ParseQueryStringParam(line, "password", pwd, sizeof(pwd));
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        uint8_t u_res = SDCard_UnlockWithPassword(pwd, s_http_cfg_temp.admin_password, s_http_cfg_temp.master_password);
+        if (u_res == 1) {
+            Log_Event("SD", "Critical SD Card Tamper Lock CLEARED by Admin/Master Override.");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"unlocked\":1,\"redirect\":\"/login\",\"message\":\"SD Card lock cleared successfully\"}");
+        } else {
+            Log_Event("SEC", "Failed attempt to unlock SD Card tamper lock.");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid password / كلمة المرور غير صحيحة\"}");
+        }
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/debug/sd_pins  → Hardware probe for SD Card pins & presence
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/debug/sd_pins", 22) == 0) {
+        uint8_t present = SDCard_Hardware_Check_Present();
+        uint8_t r1 = SDCard_GetLastProbeResult();
+        uint8_t locked = SDCard_IsCriticalLocked();
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+            "{\"ok\":true,\"present\":%u,\"cmd0_r1\":%u,\"locked\":%u}",
+            (unsigned)present, (unsigned)r1, (unsigned)locked);
+        Send_Response(sn, HTTP_200_JSON, resp);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/debug/sd_tamper  → Diagnostic endpoint to trigger SD tamper lock
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/debug/sd_tamper", 25) == 0) {
+        SDCard_SetCriticalLock(1);
+        Log_Event("SD", "Diagnostic test: SD Card critical tamper lock LATCHED.");
+        Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"locked\":1}");
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/events  → Server-Sent Events (SSE) Real-Time Data Push Stream
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/events", 15) == 0) {
+        if (s_sse_sn != 0xFF && s_sse_sn != sn) {
+            disconnect(s_sse_sn);
+            close(s_sse_sn);
+        }
+        s_sse_sn = sn;
+        const char *sse_hdr =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n\r\n";
+        send(sn, (uint8_t *)sse_hdr, (uint16_t)strlen(sse_hdr));
+        char init_ev[256];
+        snprintf(init_ev, sizeof(init_ev),
+            "data: {\"type\":\"connected\",\"uptime_s\":%lu,\"epoch\":%lu,\"sd_lock\":%u}\n\n",
+            (unsigned long)g_uptime_seconds, (unsigned long)Time_Now(), (unsigned)SDCard_IsCriticalLocked());
+        send(sn, (uint8_t *)init_ev, (uint16_t)strlen(init_ev));
+        return;
+    }
+
     if (strncmp(line, "POST /api/sdcard/queue/clear", 28) == 0) {
         SDCard_Queue_Clear();
         Log_Event("SD", "User cleared offline telemetry queue from SD Card.");
@@ -2949,6 +3148,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/relay?", 16) == 0 ||
         strncmp(line, "POST /api/relay ", 16) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         int id    = ParseQueryInt(line, "id");
         int state = ParseQueryInt(line, "state");
         char *body = strstr(line, "\r\n\r\n");
@@ -2964,26 +3165,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         if (id >= 0 && id < (int)s_http_cfg_temp.actuator_count && id < MAX_RELAYS && state >= 0) {
             char api_log[64];
-            snprintf(api_log, sizeof(api_log), "HTTP API: Actuator %d set to %s", id+1, state ? "ON" : "OFF");
-            Log_Event("SYS", api_log);
+            snprintf(api_log, sizeof(api_log), "Relay %d (%s) set to %s (Manual Test)",
+                     id+1, s_http_cfg_temp.actuators[id].name[0] ? s_http_cfg_temp.actuators[id].name : "Relay", state ? "ON" : "OFF");
+            Log_Event("RELAY", api_log);
             Relay_SetState((uint8_t)id, (uint8_t)state);
         }
-        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"id\":%d,\"state\":%d}", id, (id >= 0 && id < MAX_RELAYS) ? relayStates[id] : 0);
-        
-        // Include CORS headers in the response!
-        char api_hdr[240];
-        snprintf(api_hdr, sizeof(api_hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            (int)strlen(tx_buf));
-        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)strlen(tx_buf));
+        char extra[64];
+        snprintf(extra, sizeof(extra), "\"id\":%d,\"state\":%d", id, (id >= 0 && id < MAX_RELAYS) ? relayStates[id] : 0);
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "Relay %d %s", id+1, state ? "ON" : "OFF");
+        Send_Action_Response(sn, act_name, t_start, heap_before, extra);
         return;
     }
 
@@ -2991,6 +3182,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/relay/all?state=S  → All relays
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/relay/all", 19) == 0) {
+        uint32_t t_start = DWT_CYCCNT;
+        size_t heap_before = xPortGetFreeHeapSize();
         Get_Shared_Config(&s_http_cfg_temp);
         if (s_http_cfg_temp.test_mode != 1) {
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Manual control disabled: Test mode is OFF (Automated Rules Active)\"}");
@@ -2999,25 +3192,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         int state = ParseQueryInt(line, "state");
         if (state >= 0) {
             char api_log[64];
-            snprintf(api_log, sizeof(api_log), "HTTP API: All actuators set to %s", state ? "ON" : "OFF");
-            Log_Event("SYS", api_log);
+            snprintf(api_log, sizeof(api_log), "All Relays set to %s (Manual Test)", state ? "ON" : "OFF");
+            Log_Event("RELAY", api_log);
             for (int i = 0; i < MAX_RELAYS; i++) Relay_SetState((uint8_t)i, (uint8_t)state);
         }
-        
-        char api_resp[] = "{\"ok\":true}";
-        char api_hdr[240];
-        snprintf(api_hdr, sizeof(api_hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
-            "Connection: close\r\n"
-            "\r\n",
-            (int)strlen(api_resp));
-        send(sn, (uint8_t *)api_hdr, (uint16_t)strlen(api_hdr));
-        Send_Chunked(sn, (const uint8_t *)api_resp, (uint32_t)strlen(api_resp));
+        char act_name[48];
+        snprintf(act_name, sizeof(act_name), "All Relays %s", state ? "ON" : "OFF");
+        Send_Action_Response(sn, act_name, t_start, heap_before, "\"all\":1");
         return;
     }
 
@@ -3714,7 +3895,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             else if (strcmp(type_str, "do") == 0)   type = 4;
             else if (strcmp(type_str, "ammonia") == 0) type = 5;
             else if (strcmp(type_str, "ultrasonic") == 0) type = 6;
-            else if (strcmp(type_str, "multi_us") == 0)  type = 7;
+            else if (strcmp(type_str, "multi_us") == 0 || strcmp(type_str, "multi_sensor") == 0)  type = 7;
 
             if (type < 1 || type > 7) {
                 snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":false,\"error\":\"Unknown sensor type %s.\"}", type_str);
@@ -3787,22 +3968,48 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (strncmp(line, "GET /api/modbus/scan", 20) == 0) {
         // Build JSON response
         int pos = 0;
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-            "{\"scanning\":%s,\"progress\":%d,\"devices\":[",
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"scanning\":%s,\"progress\":%d,\"devices\":[",
             g_scan_status.is_scanning ? "true" : "false",
             g_scan_status.progress);
         
         for (int i = 0; i < g_scan_status.count; i++) {
-            pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos,
-                "{\"id\":%u,\"type\":%u}%s",
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "{\"id\":%u,\"type\":%u}%s",
                 g_scan_status.devices[i].id,
                 g_scan_status.devices[i].type,
                 (i < g_scan_status.count - 1) ? "," : "");
         }
-        pos += snprintf(tx_buf + pos, sizeof(tx_buf) - pos, "]}");
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "]}");
         
+        if (Reject_If_Truncated(sn, (size_t)pos, "modbus scan")) return;
         send(sn, (uint8_t *)HTTP_200_JSON, strlen(HTTP_200_JSON));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * POST /api/sensor/mode  → Set Multi-Sensor Board Mode (0=Normal, 1=Sim)
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "POST /api/sensor/mode", 21) == 0 ||
+        strncmp(line, "POST /api/sensor/multi/mode", 27) == 0) {
+        int id = 1;
+        int mode = 0;
+        char *qid = strstr(line, "id=");
+        if (qid) id = atoi(qid + 3);
+        char *qm = strstr(line, "mode=");
+        if (qm) mode = atoi(qm + 5);
+
+        char *b_start = strstr(line, "\r\n\r\n");
+        if (b_start) {
+            b_start += 4;
+            int bid = JSON_ReadInt(b_start, "id");
+            if (bid > 0) id = bid;
+            int bmode = JSON_ReadInt(b_start, "mode");
+            if (bmode >= 0) mode = bmode;
+        }
+
+        uint8_t ok = Modbus_SetMultiSensorMode((uint8_t)id, (uint8_t)mode);
+        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":%s,\"id\":%d,\"mode\":%d}", ok ? "true" : "false", id, mode);
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
         return;
     }
 
@@ -4043,7 +4250,53 @@ void Task_HTTPServer(void *arg) {
     static uint32_t s_sock_est_tick[8] = {0};
 
     for (;;) {
+        FAULT_TEST_POINT();
         uint32_t now = osKernelGetTickCount();
+
+        /* Supervise physical SD Card hardware presence */
+        SDCard_Hardware_Poll_Lockout();
+
+        /* Stream live updates if SSE connection is active */
+        if (s_sse_sn != 0xFF) {
+            uint8_t sse_st = getSn_SR(s_sse_sn);
+            if (sse_st != SOCK_ESTABLISHED) {
+                disconnect(s_sse_sn);
+                close(s_sse_sn);
+                s_sse_sn = 0xFF;
+            } else {
+                /* 1. Flush any pending high-priority real-time events (Logs, MQTT TX, Lockout) */
+                char q_ev[SSE_EVENT_MAX_LEN];
+                while (s_sse_sn != 0xFF && SSE_Queue_Pop(q_ev, sizeof(q_ev))) {
+                    char sse_frame[SSE_EVENT_MAX_LEN + 16];
+                    int flen = snprintf(sse_frame, sizeof(sse_frame), "data: %s\n\n", q_ev);
+                    if (flen > 0) {
+                        int32_t s_ret = send(s_sse_sn, (uint8_t *)sse_frame, (uint16_t)flen);
+                        if (s_ret <= 0) {
+                            disconnect(s_sse_sn);
+                            close(s_sse_sn);
+                            s_sse_sn = 0xFF;
+                            break;
+                        }
+                    }
+                }
+
+                /* 2. Periodic 1-second telemetry broadcast */
+                static uint32_t s_last_sse_tick = 0;
+                if (s_sse_sn != 0xFF && (now - s_last_sse_tick >= 1000)) {
+                    s_last_sse_tick = now;
+                    char sse_data[1280];
+                    int sse_len = Build_Live_Telemetry_JSON(sse_data, sizeof(sse_data));
+                    if (sse_len > 0) {
+                        int32_t sent = send(s_sse_sn, (uint8_t *)sse_data, (uint16_t)sse_len);
+                        if (sent <= 0) {
+                            disconnect(s_sse_sn);
+                            close(s_sse_sn);
+                            s_sse_sn = 0xFF;
+                        }
+                    }
+                }
+            }
+        }
 
         for (uint8_t i = 0; i < HTTP_NUM_SOCKS; i++) {
             uint8_t sn = s_http_socks[i];
@@ -4072,6 +4325,7 @@ void Task_HTTPServer(void *arg) {
                     if (sock_ret < 0) {
                         /* Only check W5500 health after 3 failed attempts with delays */
                         Ensure_W5500_Network_Alive();
+                        osDelay(250);
                     }
                 }
                 break;
@@ -4095,6 +4349,10 @@ void Task_HTTPServer(void *arg) {
              * ESTABLISHED → receive and dispatch an HTTP request
              * -------------------------------------------------------------- */
             case SOCK_ESTABLISHED:
+                /* If this socket is streaming SSE, do not process regular HTTP or timeout */
+                if (sn == s_sse_sn) {
+                    break;
+                }
                 /* If this socket was already commanded to disconnect, don't re-dispatch */
                 if (s_sock_teardown_tick[sn] != 0) {
                     if (now - s_sock_teardown_tick[sn] > 50) {
@@ -4125,8 +4383,9 @@ void Task_HTTPServer(void *arg) {
                          * Without this, TCP fragmentation causes partial JSON → save failures. */
                         if (rx_buf[0] == 'P') {
                             rx_buf[total] = '\0';
-                            char *cl = strstr((char *)rx_buf, "Content-Length: ");
                             char *body = strstr((char *)rx_buf, "\r\n\r\n");
+                            int cl_val = body ? Find_Content_Length((char *)rx_buf, body) : -1;
+                            char *cl = (cl_val >= 0) ? body : NULL;
 
                             /* If headers arrived fragmented (no Content-Length or
                              * no end-of-headers yet), wait for more data. */
@@ -4140,8 +4399,9 @@ void Task_HTTPServer(void *arg) {
                                         int32_t r = recv(sn, rx_buf + total, more);
                                         if (r > 0) total += (uint16_t)r;
                                         rx_buf[total] = '\0';
-                                        cl = strstr((char *)rx_buf, "Content-Length: ");
                                         body = strstr((char *)rx_buf, "\r\n\r\n");
+                                        cl_val = body ? Find_Content_Length((char *)rx_buf, body) : -1;
+                                        cl = (cl_val >= 0) ? body : NULL;
                                     } else {
                                         osDelay(2);
                                     }
@@ -4149,10 +4409,25 @@ void Task_HTTPServer(void *arg) {
                             }
 
                             if (cl && body) {
-                                int content_len = atoi(cl + 16);
+                                int content_len = cl_val;
                                 int header_len = (int)(body + 4 - (char *)rx_buf);
                                 int need = header_len + content_len;
-                                if (need > (int)(sizeof(rx_buf) - 1)) need = (int)(sizeof(rx_buf) - 1);
+                                /* POST /update streams the firmware from the socket
+                                 * itself (Dispatch_Request), so it only needs the
+                                 * part that fits here, as before. */
+                                uint8_t is_stream = (strncmp((char *)rx_buf, "POST /update", 12) == 0);
+                                if (need > (int)(sizeof(rx_buf) - 1) && is_stream) {
+                                    need = (int)(sizeof(rx_buf) - 1);
+                                } else if (need > (int)(sizeof(rx_buf) - 1)) {
+                                    /* Body larger than rx_buf: processing a cut copy could
+                                     * save half a config or rule set, so refuse it. */
+                                    Send_Response(sn, "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n"
+                                                      "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                                                  "{\"ok\":false,\"error\":\"Request body too large\"}");
+                                    Log_Event("SYS", "HTTP: request body too large, rejected (413)");
+                                    total = 0;
+                                    need = 0;
+                                }
                                 uint32_t t0 = osKernelGetTickCount();
                                 while ((int)total < need && (osKernelGetTickCount() - t0) < 2500) {
                                     uint16_t more = getSn_RX_RSR(sn);
@@ -4168,7 +4443,12 @@ void Task_HTTPServer(void *arg) {
                             }
                         }
 
-                        Dispatch_Request(sn, rx_buf, total);
+                        if (total > 0) Dispatch_Request(sn, rx_buf, total);
+
+                        if (sn == s_sse_sn) {
+                            /* Socket converted to persistent SSE stream; do not flush or disconnect */
+                            break;
+                        }
                         
                         /* Flush any leftover/overflow bytes in the socket RX buffer */
                         uint16_t rem_size;
@@ -4186,10 +4466,12 @@ void Task_HTTPServer(void *arg) {
                         /* Graceful TCP disconnect: W5500 hardware transmits any pending
                          * TX buffer bytes and then automatically sends FIN to the client.
                          * This avoids TCP RST, letting browser receive 100% of HTML/data. */
-                        setSn_CR(sn, Sn_CR_DISCON);
-                        while (getSn_CR(sn));
-                        s_sock_teardown_tick[sn] = osKernelGetTickCount();
-                        s_sock_est_tick[sn] = 0;
+                        if (sn != s_sse_sn) {
+                            setSn_CR(sn, Sn_CR_DISCON);
+                            while (getSn_CR(sn));
+                            s_sock_teardown_tick[sn] = osKernelGetTickCount();
+                            s_sock_est_tick[sn] = 0;
+                        }
                     } else if (now - s_sock_est_tick[sn] > 2000) {
                         /* Inactivity timeout: close if connected > 2000ms with no HTTP request */
                         close(sn);

@@ -67,6 +67,7 @@
 #define INCLUDE_uxTaskGetStackHighWaterMark     1 /* Enables stack watermark diagnostics */
 #define INCLUDE_xTaskGetIdleTaskHandle          1
 #define INCLUDE_eTaskGetState                   0
+#define INCLUDE_xSemaphoreGetMutexHolder        1 /* fault supervisor releases a dying task's mutexes */
 #define INCLUDE_xEventGroupSetBitFromISR        1
 #define INCLUDE_xTimerPendFunctionCall          1
 #define INCLUDE_xTaskAbortDelay                 0

@@ -110,21 +110,33 @@ void GPIO_Init_W5500_Pins(void) {
     GPIOB->OSPEEDR &= ~((3U << (13 * 2)) | (3U << (14 * 2)) | (3U << (15 * 2)));
     GPIOB->OSPEEDR |=  ((2U << (13 * 2)) | (2U << (14 * 2)) | (2U << (15 * 2)));
 
-    // 3. Set AF5 for SPI2
+    // 3. Configure Pull-Up on MISO (PB14)
+    GPIOB->PUPDR   &= ~((3U << (14 * 2)));
+    GPIOB->PUPDR   |=  ((1U << (14 * 2)));
+
+    // 4. Set AF5 for SPI2
     GPIOB->AFR[1] &= ~((0xFU << ((13 - 8) * 4)) | (0xFU << ((14 - 8) * 4)) | (0xFU << ((15 - 8) * 4)));
     GPIOB->AFR[1] |=  ((5U << ((13 - 8) * 4)) | (5U << ((14 - 8) * 4)) | (5U << ((15 - 8) * 4)));
 
-    // CS: PB12 (Output)
-    GPIO_InitOutput(GPIOB, 12);
-    W5500_CS_Deselect(); // Initially High
+    // 5. CS: PB12 (Output Push-Pull with Pull-Up, pre-set HIGH to prevent any low pulse glitch)
+    GPIOB->BSRR = (1U << 12); // Pre-set HIGH
+    GPIOB->MODER &= ~(3U << (12 * 2));
+    GPIOB->MODER |=  (1U << (12 * 2)); // General purpose output
+    GPIOB->OTYPER &= ~(1U << 12);      // Push-pull
+    GPIOB->OSPEEDR &= ~(3U << (12 * 2));
+    GPIOB->OSPEEDR |=  (2U << (12 * 2)); // High speed
+    GPIOB->PUPDR   &= ~(3U << (12 * 2));
+    GPIOB->PUPDR   |=  (1U << (12 * 2)); // Pull-up
 }
 
 void W5500_CS_Select(void) {
     GPIOB->BSRR = (1U << (12 + 16)); // Low
+    for (volatile int _d = 0; _d < 20; _d++) __asm__("nop");
 }
 
 void W5500_CS_Deselect(void) {
     GPIOB->BSRR = (1U << 12); // High
+    for (volatile int _d = 0; _d < 40; _d++) __asm__("nop");
 }
 
 void W5500_Hardware_Reset(void) {
