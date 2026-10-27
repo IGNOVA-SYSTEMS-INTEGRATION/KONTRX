@@ -330,9 +330,6 @@ uint8_t SDCard_Hardware_Poll_Lockout(void) {
     if (s_sd_critical_locked) {
         return 1;
     }
-    if (s_sd_override_active) {
-        return 0; // Emergency master override is active
-    }
     static uint32_t s_last_poll_tick = 0;
     uint32_t now = xTaskGetTickCount();
     if (now - s_last_poll_tick < 100) {
@@ -373,11 +370,16 @@ uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd, const 
         return 0; // Invalid password
     }
 
+    /* Hardware presence check: physical SD card MUST be inserted to unlock */
+    if (SDCard_Hardware_Check_Present() == 0) {
+        return 2; // Password matched, but SD Card is physically missing!
+    }
+
     s_sd_critical_locked = 0;
     s_sd_status.critical_locked = 0;
-    s_sd_override_active = 1; // Admin emergency override active
+    s_sd_override_active = 0; // Re-arm supervisor immediately so future removals trigger lockdown
     HTTP_SSE_PushLockout(0);
-    Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Admin emergency master override activated.");
+    Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Master override verified with SD Card present.");
     return 1;
 }
 
