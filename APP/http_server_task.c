@@ -908,17 +908,38 @@ static int Build_Live_Telemetry_JSON(char *buf, int buflen) {
     }
     pos = sfmt_append(buf, buflen, pos, "],");
 
-    /* multi_sensor */
+        /* multi_sensor */
     pos = sfmt_append(buf, buflen, pos, "\"multi_sensor\":[");
     for (uint8_t i = 0; i < s_sd.multi_us_count && i < MAX_MULTI_US; i++) {
         const MultiSensorBoard_t *m = &s_sd.multi_us[i];
-        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"us\":[%.0f,%.0f,%.0f],\"avg\":%.0f,\"temp\":[%.1f,%.1f]}%s",
-                          m->id, m->dist[0], m->dist[1], m->dist[2], m->avg, m->temp[0], m->temp[1],
-                          (i < s_sd.multi_us_count - 1) ? "," : "");
+        pos = sfmt_append(buf, buflen, pos, "{\"id\":%u,\"mode\":%u,"
+            "\"us\":[%.0f,%.0f,%.0f],"
+            "\"flow\":["
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u},"
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u},"
+              "{\"rate\":%.1f,\"total\":%lu,\"freq\":%.0f,\"status\":%u}"
+            "],"
+            "\"temp\":[%.1f,%.1f],"
+            "\"summary_decoded\":{\"ok\":%u,\"dist_avg\":%u,\"temp\":%.1f,\"dist_comp\":%u,"
+              "\"flow_total\":%.1f,\"volume\":%lu,\"freq_total\":%u,\"health\":%u,"
+              "\"uptime\":%u,\"error\":%u},"
+            "\"avg\":%.0f}%s",
+            m->id, (unsigned int)m->mode,
+            m->dist[0], m->dist[1], m->dist[2],
+            m->flow[0].rate, (unsigned long)m->flow[0].total_l, m->flow[0].freq_hz, (unsigned int)m->flow[0].status,
+            m->flow[1].rate, (unsigned long)m->flow[1].total_l, m->flow[1].freq_hz, (unsigned int)m->flow[1].status,
+            m->flow[2].rate, (unsigned long)m->flow[2].total_l, m->flow[2].freq_hz, (unsigned int)m->flow[2].status,
+            m->temp[0], m->temp[1],
+            (unsigned int)m->summary_ok, (unsigned int)m->summary[0], ((int16_t)m->summary[1]) / 10.0f,
+            (unsigned int)m->summary[2], m->summary[3] / 10.0f,
+            ((unsigned long)m->summary[4] << 16) | m->summary[5], (unsigned int)m->summary[6],
+            (unsigned int)m->summary[7], (unsigned int)m->summary[8], (unsigned int)m->summary[9],
+            m->avg,
+            (i < s_sd.multi_us_count - 1) ? "," : "");
     }
     pos = sfmt_append(buf, buflen, pos, "],");
 
-    /* relays */
+/* relays */
     pos = sfmt_append(buf, buflen, pos, "\"relays\":[");
     for (uint8_t i = 0; i < s_cfg.actuator_count && i < MAX_RELAYS; i++) {
         pos = sfmt_append(buf, buflen, pos, "%u%s", (unsigned)relayStates[i],
