@@ -1458,7 +1458,7 @@ static void Build_Flat_Telemetry_JSON(char *json_buf, size_t max_len, const Tele
         }
     }
 
-    pos = sfmt_append(json_buf, max_len, pos, "}");
+    pos = sfmt_append(json_buf, max_len, pos, ",\"uptime_s\":%lu}", (unsigned long)g_uptime_seconds);
 }
 
 static void Build_Structured_Telemetry_JSON(char *json_buf, size_t max_len, const TelemetryBatch_t *batch, const Gateway_Config_t *cfg) {

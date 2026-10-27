@@ -599,6 +599,10 @@ uint32_t Partition_Log_Count(uint32_t *out_bytes) {
 /* Formats a log timestamp. Three kinds exist in flash: a UTC epoch (clock
  * set), TIME_UPTIME_FLAG | uptime (clock not set yet), and older entries
  * that hold the RTC time of day. */
+extern volatile uint32_t g_uptime_seconds;
+
+extern volatile uint32_t g_uptime_seconds;
+
 void Log_FormatStamp(uint32_t stamp, char *when, size_t n,
                             uint32_t *ts, uint32_t *up_s, uint8_t *is_up) {
     *ts = 0; *up_s = 0; *is_up = 0;
@@ -610,6 +614,14 @@ void Log_FormatStamp(uint32_t stamp, char *when, size_t n,
                  (unsigned long)((u % 3600U) / 60U), (unsigned long)(u % 60U));
     } else if (stamp >= 1000000000UL) {
         *ts = stamp;
+        uint32_t now = Time_Now();
+        if (now > 0 && now >= g_uptime_seconds) {
+            uint32_t boot = now - g_uptime_seconds;
+            if (stamp >= boot) {
+                *up_s = stamp - boot;
+                *is_up = 1;
+            }
+        }
         uint32_t days = stamp / 86400U, rem = stamp % 86400U;
         /* civil-from-days, UTC */
         uint32_t z = days + 719468U, era = z / 146097U, doe = z - era * 146097U;
