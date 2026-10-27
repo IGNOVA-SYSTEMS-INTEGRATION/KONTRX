@@ -231,6 +231,7 @@ static void Load_Config_From_Flash(void) {
 
         strncpy(sharedConfig.admin_username, "admin", sizeof(sharedConfig.admin_username));
         strncpy(sharedConfig.admin_password, "adminkontrx", sizeof(sharedConfig.admin_password));
+        strncpy(sharedConfig.master_password, "KontrxMaster2026", sizeof(sharedConfig.master_password));
         sharedConfig.actuator_mask = 0x0F; // All enabled by default (PTO, 0-10V, 4-20mA, PWM)
 
         Partition_SaveConfig(&sharedConfig);

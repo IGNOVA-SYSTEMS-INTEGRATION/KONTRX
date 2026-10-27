@@ -144,6 +144,7 @@ void Modbus_DMA_Init(void) {
         cfg.mqtt_tx_enabled = 1;
         strncpy(cfg.admin_username, "admin", sizeof(cfg.admin_username));
         strncpy(cfg.admin_password, "adminkontrx", sizeof(cfg.admin_password));
+        strncpy(cfg.master_password, "KontrxMaster2026", sizeof(cfg.master_password));
         cfg.actuator_mask = 0x0F;
         snprintf(cfg.sparkplug_edge_node_id, sizeof(cfg.sparkplug_edge_node_id), "KX-%07lu", (unsigned long)cfg.serial);
         snprintf(cfg.sparkplug_device_id, sizeof(cfg.sparkplug_device_id), "KX-%07lu-dev", (unsigned long)cfg.serial);
