@@ -216,7 +216,9 @@ static uint8_t Is_Page_Route(const char *line) {
         (strncmp(line, "GET /sdcard", 11) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
         (strncmp(line, "GET /ota", 8) == 0 && strncmp(line, "GET /api/", 9) != 0) ||
         strncmp(line, "GET /login", 10) == 0 ||
-        strncmp(line, "GET /settings", 13) == 0) {
+        strncmp(line, "GET /settings", 13) == 0 ||
+        strncmp(line, "GET /lockdown", 13) == 0 ||
+        strncmp(line, "GET /emergency", 14) == 0) {
         return 1;
     }
     return 0;
@@ -1643,8 +1645,20 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     /* -----------------------------------------------------------------
      * Multi-Page Web Route Dispatch:
      * Serves the full SPA HTML asset from W25Q16 for all registered UI paths.
+     * When critical lockdown is active, any UI page route redirects to /lockdown.
      * ----------------------------------------------------------------- */
     if (Is_Page_Route(line)) {
+        if (SDCard_IsCriticalLocked()) {
+            if (strncmp(line, "GET /lockdown", 13) != 0 &&
+                strncmp(line, "GET /emergency", 14) != 0) {
+                const char *r302 = "HTTP/1.1 302 Found\r\n"
+                                   "Location: /lockdown\r\n"
+                                   "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                                   "Connection: close\r\n\r\n";
+                send(sn, (uint8_t *)r302, strlen(r302));
+                return;
+            }
+        }
         Stream_Web_Asset(sn);
         return;
     }
