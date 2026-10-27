@@ -17,8 +17,20 @@ Follow the 5-stage task methodology in every task:
   2. Always branch off `dev` for any task: `git checkout dev && git pull origin dev && git checkout -b <type>/<name>`.
   3. Implement, test (`cmake --build build`), and commit atomically with Conventional Commits.
   4. Push the branch to `origin`: `git push -u origin <branch>`.
-  5. Checkout `dev`, merge with `--no-ff`, and push `dev` to `origin`.
-  6. ALWAYS leave the repository on `dev` (`git checkout dev`).
+  5. Create official GitHub PR with structured description (Summary, Details, Changes, Test Proof) & Review diff:
+     ```bash
+     gh pr create --base dev --head <type>/<name> --title "..." --body "..."
+     gh pr diff
+     gh pr merge --merge
+     ```
+  6. Pull merged `dev` and ALWAYS leave active working tree on `dev` (`git checkout dev && git pull origin dev`).
+  7. When merging `dev` into `main`, open, review, and merge a PR with release notes:
+     ```bash
+     gh pr create --base main --head dev --title "release: vX.Y.Z" --body "..."
+     gh pr diff
+     gh pr merge --merge
+     git checkout dev  # return immediately to dev!
+     ```
 
 ## Build & Test Instructions
 - ARM Toolchain: GCC ARM Embedded

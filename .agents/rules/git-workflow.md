@@ -20,22 +20,42 @@ Whenever performing any code modifications, updates, features, or bug fixes in t
 3. **Verify Build & Tests**:
    - Ensure the project builds cleanly before committing:
      ```bash
-     cmake --build build
+     cmake --build build  # or ninja -C build
      ```
 
-4. **Push Branch & Merge via PR Workflow**:
-   - Push the feature branch to the remote repository:
+4. **Push Branch & Open Official GitHub PR with Detailed Description**:
+   - Push the branch to the remote repository:
      ```bash
-     git push -u origin <branch-name>
+     git push -u origin <type>/<descriptive-kebab-name>
      ```
-   - Switch back to `dev`, pull latest, and perform a non-fast-forward merge commit (`--no-ff`) representing the Pull Request integration:
+   - Create an official Pull Request using GitHub CLI (`gh`) with a structured description (Summary, Root Cause, Key Changes, Test Proof, Checklist):
+     ```bash
+     gh pr create --base dev --head <type>/<descriptive-kebab-name> --title "<type>(<scope>): <summary>" --body "<Detailed description & test proof>"
+     ```
+   - Review the PR diff:
+     ```bash
+     gh pr diff
+     ```
+   - Merge the PR on GitHub:
+     ```bash
+     gh pr merge --merge
+     ```
+   - Switch back to `dev` and pull latest:
      ```bash
      git checkout dev
      git pull origin dev
-     git merge --no-ff <branch-name> -m "merge: <branch-name> into dev"
-     git push origin dev
      ```
 
-5. **Always Remain on `dev`**:
-   - After completing and merging any task, ALWAYS ensure you are on `dev`.
-   - Never leave the workspace checked out on a feature branch.
+5. **Release Workflow (dev -> main)**:
+   - When releasing to production, open an official PR from `dev` to `main` with complete release notes:
+     ```bash
+     gh pr create --base main --head dev --title "release: vX.Y.Z (merge dev into main)" --body "<Release summary, features, fixes, and verification proof>"
+     gh pr diff
+     gh pr merge --merge
+     git checkout main && git pull origin main
+     git checkout dev  # ALWAYS return immediately to dev!
+     ```
+
+6. **Always Remain on `dev`**:
+   - After completing and merging any task, ALWAYS ensure the active workspace is on `dev`.
+   - Never leave the workspace checked out on a feature branch or on `main`.
