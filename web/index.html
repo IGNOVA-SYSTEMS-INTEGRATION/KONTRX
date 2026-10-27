@@ -497,18 +497,30 @@ function startSSE() {
                 if (d.uptime_s !== undefined) {
                     updateClockUI(d.epoch, d.uptime_s);
                 }
+                if (d.multi_sensor && Array.isArray(d.multi_sensor) && d.multi_sensor.length > 0) {
+                    if (!window.lastStatusData) window.lastStatusData = {};
+                    if (!Array.isArray(window.lastStatusData.multi_sensor)) window.lastStatusData.multi_sensor = [];
+                    d.multi_sensor.forEach(function(newBd) {
+                        var existing = window.lastStatusData.multi_sensor.find(function(b) { return b.id === newBd.id; });
+                        if (existing) {
+                            if (newBd.us) existing.us = newBd.us;
+                            if (newBd.dist) existing.dist = newBd.dist;
+                            if (newBd.avg !== undefined) existing.avg = newBd.avg;
+                            if (newBd.temp) existing.temp = newBd.temp;
+                            if (newBd.mode !== undefined) existing.mode = newBd.mode;
+                            if (newBd.flow && newBd.flow.length > 0) existing.flow = newBd.flow;
+                            if (newBd.summary_decoded && newBd.summary_decoded.ok) existing.summary_decoded = newBd.summary_decoded;
+                            if (newBd.summary) existing.summary = newBd.summary;
+                        } else {
+                            window.lastStatusData.multi_sensor.push(newBd);
+                        }
+                    });
+                }
                 if (d.sensors && Array.isArray(d.sensors)) {
                     d.sensors.forEach(function(s) {
                         sensorValues[s.type + ":" + s.id] = { value: s.val, temp: s.temp, valid: s.v };
                     });
                     buildSensorCards();
-                }
-                if (d.multi_sensor && Array.isArray(d.multi_sensor) && d.multi_sensor.length > 0) {
-                    if (!window.lastStatusData) window.lastStatusData = {};
-                    window.lastStatusData.multi_sensor = d.multi_sensor;
-                    if (typeof renderMultiSensorCard === "function") {
-                        renderMultiSensorCard(d.multi_sensor[0]);
-                    }
                 }
                 if (d.relays && Array.isArray(d.relays)) {
                     for (var ri = 0; ri < d.relays.length && ri < relays.length; ri++) {
