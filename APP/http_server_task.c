@@ -3084,6 +3084,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         if (u_res == 1) {
             Log_Event("SD", "Critical SD Card Tamper Lock CLEARED by Admin/Master Override.");
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":true,\"unlocked\":1,\"redirect\":\"/login\",\"message\":\"SD Card lock cleared successfully\"}");
+        } else if (u_res == 2) {
+            Log_Event("SD", "Unlock rejected: SD Card physically missing.");
+            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"card_missing\":1,\"error\":\"SD Card not detected! Please re-insert the SD card before clearing the lockdown. / كارت الذاكرة غير متصل، يرجى إعادة تركيب الكارت أولاً.\"}");
         } else {
             Log_Event("SEC", "Failed attempt to unlock SD Card tamper lock.");
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false,\"error\":\"Invalid password / كلمة المرور غير صحيحة\"}");
