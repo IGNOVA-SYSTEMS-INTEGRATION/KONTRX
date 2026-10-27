@@ -98,12 +98,58 @@ def test_web_assets_synced():
     assert abs(len(gzipped_html) - len_in_h) < 15, f"Size mismatch: computed {len(gzipped_html)} vs header {len_in_h}"
     print(f"[PASS] test_web_assets_synced (gzipped {len_in_h} bytes)")
 
+
+def test_sd_rearm_and_card_presence_requirement():
+    with open("HAL/sdcard.c", "r", encoding="utf-8") as f:
+        sd = f.read()
+
+    # Verify physical presence check is mandatory before unlock
+    assert "SDCard_Hardware_Check_Present() == 0" in sd, "Physical SD presence check missing in SDCard_UnlockWithPassword"
+    assert "return 2;" in sd, "Return code 2 (card missing) not returned"
+
+    # Verify supervisor is re-armed
+    assert "s_sd_override_active = 0;" in sd, "s_sd_override_active not reset to 0 to re-arm supervisor"
+    # Verify s_sd_override_active does NOT permanently bypass poll lockout
+    assert "if (s_sd_override_active) return 0;" not in sd, "Permanent lockout bypass still present in poll function"
+
+    with open("APP/http_server_task.c", "r", encoding="utf-8") as f:
+        http = f.read()
+    assert "card_missing" in http, "card_missing JSON response missing in http_server_task.c"
+
+    with open("web/index.html", "r", encoding="utf-8") as f:
+        html = f.read()
+    assert "res.card_missing" in html, "card_missing handling missing in web/index.html submitSdAdminUnlock"
+    assert "sd-card-hw-status" in html, "SD card hardware socket status indicator missing in lockdown UI"
+    print("[PASS] test_sd_rearm_and_card_presence_requirement")
+
+def test_zero_emojis_and_valid_svg_icons():
+    import unicodedata
+    with open("web/index.html", "r", encoding="utf-8") as f:
+        html = f.read()
+
+    # Check for emojis or unstandardized symbols
+    for i, line in enumerate(html.splitlines(), 1):
+        for ch in line:
+            code = ord(ch)
+            if code > 127:
+                cat = unicodedata.category(ch)
+                if cat.startswith("S") and ch not in ["°", "µ"]:
+                    raise AssertionError(f"Symbol {ch} (U+{code:04X}) found at line {i}: {line[:80]}")
+
+    # Check required SVGs are defined
+    for sym in ["i-key", "i-alert", "i-flash", "i-qr", "i-sound", "i-first", "i-arrow-r", "i-arrow-l", "i-download"]:
+        assert f"id='{sym}'" in html or f'id="{sym}"' in html, f"SVG symbol {sym} not defined in defs"
+
+    print("[PASS] test_zero_emojis_and_valid_svg_icons")
+
 def main():
     test_http_server_route_and_redirect()
     test_web_modal_layer_and_z_index()
     test_web_realtime_and_routing()
     test_web_assets_synced()
-    print("\nALL EMERGENCY LOCKDOWN TESTS PASSED (4/4)!")
+    test_sd_rearm_and_card_presence_requirement()
+    test_zero_emojis_and_valid_svg_icons()
+    print("\nALL EMERGENCY LOCKDOWN TESTS PASSED (6/6)!")
 
 if __name__ == "__main__":
     main()
