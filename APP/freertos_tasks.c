@@ -196,6 +196,9 @@ void Log_Event(const char *category, const char *message) {
     uint8_t cat_id = Log_Category_Id(category);
     uint32_t ts = Time_LogStamp();
 
+    /* Push live event to active SSE stream */
+    HTTP_SSE_PushSysLog(category, message, ts);
+
     if (xTaskGetSchedulerState() != taskSCHEDULER_RUNNING || s_log_writer_task == NULL) {
         SDCard_Log_Append(ts, cat_id, message);
         return;
@@ -1317,6 +1320,9 @@ static void Log_Mqtt_Topic(const char *topic, const char *payload, uint8_t succe
     if (locked) {
         osMutexRelease(sensorMutex);
     }
+
+    /* Push live MQTT publish log to active SSE stream */
+    HTTP_SSE_PushMqttLog(topic, payload, success, g_uptime_seconds);
 }
 
 /* Appends `<sep><value>` as %.2f, or null when the channel has no valid reading. */

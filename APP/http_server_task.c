@@ -776,6 +776,84 @@ static int JSON_MqttLogEntryResponse(char *buf, int buflen, int idx) {
 
 static volatile uint8_t s_sse_sn = 0xFF;
 
+#define SSE_EVENT_QUEUE_SIZE 8
+#define SSE_EVENT_MAX_LEN    256
+
+typedef struct {
+    char data[SSE_EVENT_MAX_LEN];
+} SSE_Event_t;
+
+static SSE_Event_t s_sse_event_queue[SSE_EVENT_QUEUE_SIZE];
+static volatile uint32_t s_sse_q_head = 0;
+static volatile uint32_t s_sse_q_tail = 0;
+
+static void SSE_Queue_Push(const char *json_data) {
+    if (!json_data) return;
+    taskENTER_CRITICAL();
+    if ((s_sse_q_head - s_sse_q_tail) < SSE_EVENT_QUEUE_SIZE) {
+        SSE_Event_t *ev = &s_sse_event_queue[s_sse_q_head & (SSE_EVENT_QUEUE_SIZE - 1U)];
+        strncpy(ev->data, json_data, sizeof(ev->data) - 1);
+        ev->data[sizeof(ev->data) - 1] = '\0';
+        s_sse_q_head++;
+    }
+    taskEXIT_CRITICAL();
+}
+
+static uint8_t SSE_Queue_Pop(char *out_buf, size_t max_len) {
+    uint8_t got = 0;
+    taskENTER_CRITICAL();
+    if (s_sse_q_tail != s_sse_q_head) {
+        SSE_Event_t *ev = &s_sse_event_queue[s_sse_q_tail & (SSE_EVENT_QUEUE_SIZE - 1U)];
+        strncpy(out_buf, ev->data, max_len - 1);
+        out_buf[max_len - 1] = '\0';
+        s_sse_q_tail++;
+        got = 1;
+    }
+    taskEXIT_CRITICAL();
+    return got;
+}
+
+void HTTP_SSE_PushSysLog(const char *cat, const char *msg, uint32_t ts) {
+    if (!cat || !msg) return;
+    char clean_msg[192];
+    uint32_t cpos = 0;
+    for (const char *p = msg; *p != '\0' && cpos < sizeof(clean_msg) - 4; p++) {
+        if (*p == '"' || *p == '\\') clean_msg[cpos++] = '\\';
+        clean_msg[cpos++] = ((unsigned char)*p < 32 || (unsigned char)*p > 126) ? ' ' : *p;
+    }
+    clean_msg[cpos] = '\0';
+
+    char buf[SSE_EVENT_MAX_LEN];
+    snprintf(buf, sizeof(buf), "{\"type\":\"sys_log\",\"cat\":\"%s\",\"msg\":\"%s\",\"ts\":%lu}",
+             cat, clean_msg, (unsigned long)ts);
+    SSE_Queue_Push(buf);
+}
+
+void HTTP_SSE_PushMqttLog(const char *topic, const char *payload, uint8_t success, uint32_t ts) {
+    if (!topic) return;
+    char clean_pl[160];
+    uint32_t cpos = 0;
+    if (payload) {
+        for (const char *p = payload; *p != '\0' && cpos < sizeof(clean_pl) - 4; p++) {
+            if (*p == '"' || *p == '\\') clean_pl[cpos++] = '\\';
+            clean_pl[cpos++] = ((unsigned char)*p < 32 || (unsigned char)*p > 126) ? ' ' : *p;
+        }
+    }
+    clean_pl[cpos] = '\0';
+
+    uint32_t sz = payload ? (uint32_t)strlen(payload) : 0;
+    char buf[SSE_EVENT_MAX_LEN];
+    snprintf(buf, sizeof(buf), "{\"type\":\"mqtt_log\",\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"size\":%lu}",
+             topic, clean_pl, (unsigned)success, (unsigned long)ts, (unsigned long)sz);
+    SSE_Queue_Push(buf);
+}
+
+void HTTP_SSE_PushLockout(uint8_t locked) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"type\":\"sd_lock\",\"sd_lock\":%u}", (unsigned)locked);
+    SSE_Queue_Push(buf);
+}
+
 
 static int Build_Live_Telemetry_JSON(char *buf, int buflen) {
     Get_Shared_Sensor_Data(&s_sd);
@@ -2967,59 +3045,16 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
-     * GET /api/debug/sd_pins  → Hardware probe for SD Card pins
+     * GET /api/debug/sd_pins  → Hardware probe for SD Card pins & presence
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/debug/sd_pins", 22) == 0) {
-        RCC->AHB1ENR |= (1U << 2) | (1U << 3); // GPIOC, GPIOD
-        uint32_t c_idr_raw = GPIOC->IDR;
-        uint32_t d_idr_raw = GPIOD->IDR;
-
-        /* Test PC11 with pull-down */
-        uint32_t orig_c_moder = GPIOC->MODER;
-        uint32_t orig_c_pupdr = GPIOC->PUPDR;
-        GPIOC->MODER &= ~(3U << (11 * 2));
-        GPIOC->PUPDR &= ~(3U << (11 * 2));
-        GPIOC->PUPDR |=  (2U << (11 * 2)); // Pull-down
-        for (volatile int d = 0; d < 200; d++);
-        uint8_t pc11_pd = (GPIOC->IDR & (1U << 11)) ? 1U : 0U;
-
-        /* Test PC11 with pull-up */
-        GPIOC->PUPDR &= ~(3U << (11 * 2));
-        GPIOC->PUPDR |=  (1U << (11 * 2)); // Pull-up
-        for (volatile int d = 0; d < 200; d++);
-        uint8_t pc11_pu = (GPIOC->IDR & (1U << 11)) ? 1U : 0U;
-        GPIOC->MODER = orig_c_moder;
-        GPIOC->PUPDR = orig_c_pupdr;
-
-        /* Test PD0 with pull-down */
-        uint32_t orig_d_moder = GPIOD->MODER;
-        uint32_t orig_d_pupdr = GPIOD->PUPDR;
-        GPIOD->MODER &= ~(3U << 0);
-        GPIOD->PUPDR &= ~(3U << 0);
-        GPIOD->PUPDR |=  (2U << 0); // Pull-down
-        for (volatile int d = 0; d < 200; d++);
-        uint8_t pd0_pd = (GPIOD->IDR & 1U) ? 1U : 0U;
-
-        /* Test PD0 with pull-up */
-        GPIOD->PUPDR &= ~(3U << 0);
-        GPIOD->PUPDR |=  (1U << 0); // Pull-up
-        for (volatile int d = 0; d < 200; d++);
-        uint8_t pd0_pu = (GPIOD->IDR & 1U) ? 1U : 0U;
-        GPIOD->MODER = orig_d_moder;
-        GPIOD->PUPDR = orig_d_pupdr;
-
+        uint8_t present = SDCard_Hardware_Check_Present();
+        uint8_t r1 = SDCard_GetLastProbeResult();
+        uint8_t locked = SDCard_IsCriticalLocked();
         char resp[256];
         snprintf(resp, sizeof(resp),
-            "{\"ok\":true,\"pc8\":%u,\"pc9\":%u,\"pc10\":%u,\"pc11\":%u,\"pc12\":%u,\"pd0\":%u,\"pd2\":%u,\"pc11_pd\":%u,\"pc11_pu\":%u,\"pd0_pd\":%u,\"pd0_pu\":%u}",
-            (unsigned)((c_idr_raw >> 8) & 1),
-            (unsigned)((c_idr_raw >> 9) & 1),
-            (unsigned)((c_idr_raw >> 10) & 1),
-            (unsigned)((c_idr_raw >> 11) & 1),
-            (unsigned)((c_idr_raw >> 12) & 1),
-            (unsigned)((d_idr_raw >> 0) & 1),
-            (unsigned)((d_idr_raw >> 2) & 1),
-            (unsigned)pc11_pd, (unsigned)pc11_pu,
-            (unsigned)pd0_pd, (unsigned)pd0_pu);
+            "{\"ok\":true,\"present\":%u,\"cmd0_r1\":%u,\"locked\":%u}",
+            (unsigned)present, (unsigned)r1, (unsigned)locked);
         Send_Response(sn, HTTP_200_JSON, resp);
         return;
     }
@@ -4195,8 +4230,25 @@ void Task_HTTPServer(void *arg) {
                 close(s_sse_sn);
                 s_sse_sn = 0xFF;
             } else {
+                /* 1. Flush any pending high-priority real-time events (Logs, MQTT TX, Lockout) */
+                char q_ev[SSE_EVENT_MAX_LEN];
+                while (s_sse_sn != 0xFF && SSE_Queue_Pop(q_ev, sizeof(q_ev))) {
+                    char sse_frame[SSE_EVENT_MAX_LEN + 16];
+                    int flen = snprintf(sse_frame, sizeof(sse_frame), "data: %s\n\n", q_ev);
+                    if (flen > 0) {
+                        int32_t s_ret = send(s_sse_sn, (uint8_t *)sse_frame, (uint16_t)flen);
+                        if (s_ret <= 0) {
+                            disconnect(s_sse_sn);
+                            close(s_sse_sn);
+                            s_sse_sn = 0xFF;
+                            break;
+                        }
+                    }
+                }
+
+                /* 2. Periodic 1-second telemetry broadcast */
                 static uint32_t s_last_sse_tick = 0;
-                if (now - s_last_sse_tick >= 1000) {
+                if (s_sse_sn != 0xFF && (now - s_last_sse_tick >= 1000)) {
                     s_last_sse_tick = now;
                     char sse_data[1280];
                     int sse_len = Build_Live_Telemetry_JSON(sse_data, sizeof(sse_data));

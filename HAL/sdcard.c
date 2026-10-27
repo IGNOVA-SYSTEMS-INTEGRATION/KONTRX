@@ -16,6 +16,7 @@
 #include "fault_supervisor.h"
 #include "portable.h"
 #include "w25q16.h"
+#include "http_server_task.h"
 
 extern volatile uint32_t g_uptime_seconds;
 
@@ -179,6 +180,7 @@ void SDCard_Init(void) {
 }
 
 static volatile uint8_t s_sd_critical_locked = 0;
+static volatile uint8_t s_last_probe_r1 = 0xFF;
 
 uint8_t SDCard_IsMounted(void) {
     return s_sd_status.mounted;
@@ -193,13 +195,114 @@ void SDCard_SetCriticalLock(uint8_t locked) {
     s_sd_status.critical_locked = s_sd_critical_locked;
 }
 
+uint8_t SDCard_GetLastProbeResult(void) {
+    return s_last_probe_r1;
+}
+
+static inline void sd_spi_delay(void) {
+    for (volatile int d = 0; d < 8; d++) __asm__("nop");
+}
+
+static uint8_t sd_spi_xfer(uint8_t byte_out) {
+    uint8_t byte_in = 0;
+    for (int i = 7; i >= 0; i--) {
+        // SCK Low (PC12 = 0)
+        GPIOC->BSRR = (1U << (12 + 16));
+        // Set MOSI (PD2)
+        if (byte_out & (1U << i)) {
+            GPIOD->BSRR = (1U << 2);
+        } else {
+            GPIOD->BSRR = (1U << (2 + 16));
+        }
+        sd_spi_delay();
+        // SCK High (PC12 = 1)
+        GPIOC->BSRR = (1U << 12);
+        sd_spi_delay();
+        // Sample MISO (PC8)
+        if (GPIOC->IDR & (1U << 8)) {
+            byte_in |= (1U << i);
+        }
+    }
+    return byte_in;
+}
+
 uint8_t SDCard_Hardware_Check_Present(void) {
-    RCC->AHB1ENR |= (1U << 2); // GPIOC clock
-    GPIOC->MODER &= ~(3U << (11 * 2)); // Input mode
-    GPIOC->PUPDR &= ~(3U << (11 * 2));
-    GPIOC->PUPDR |=  (2U << (11 * 2)); // Pull-down
-    for (volatile int d = 0; d < 120; d++);
-    return (GPIOC->IDR & (1U << 11)) ? 1U : 0U;
+    RCC->AHB1ENR |= (1U << 2) | (1U << 3); // GPIOC, GPIOD
+
+    // Save original register states of GPIOC and GPIOD
+    uint32_t orig_c_moder = GPIOC->MODER;
+    uint32_t orig_c_pupdr = GPIOC->PUPDR;
+    uint32_t orig_c_odr   = GPIOC->ODR;
+    uint32_t orig_d_moder = GPIOD->MODER;
+    uint32_t orig_d_pupdr = GPIOD->PUPDR;
+    uint32_t orig_d_odr   = GPIOD->ODR;
+
+    // Configure pins for fast probe:
+    // PC11 (CS): Output Push-Pull
+    GPIOC->MODER &= ~(3U << (11 * 2));
+    GPIOC->MODER |=  (1U << (11 * 2));
+
+    // PC12 (SCK): Output Push-Pull
+    GPIOC->MODER &= ~(3U << (12 * 2));
+    GPIOC->MODER |=  (1U << (12 * 2));
+
+    // PD2 (MOSI): Output Push-Pull
+    GPIOD->MODER &= ~(3U << (2 * 2));
+    GPIOD->MODER |=  (1U << (2 * 2));
+
+    // PC8 (MISO): Input with Pull-Up
+    GPIOC->MODER &= ~(3U << (8 * 2));
+    GPIOC->PUPDR &= ~(3U << (8 * 2));
+    GPIOC->PUPDR |=  (1U << (8 * 2));
+
+    // Initial state: CS High, MOSI High
+    GPIOC->BSRR = (1U << 11);
+    GPIOD->BSRR = (1U << 2);
+
+    // Send 80 clocks (10 bytes of 0xFF) with CS High to sync/wake SD card
+    for (int i = 0; i < 10; i++) {
+        sd_spi_xfer(0xFF);
+    }
+
+    // Assert CS Low
+    GPIOC->BSRR = (1U << (11 + 16));
+    sd_spi_delay();
+
+    // Send CMD0 (Reset / Enter SPI Mode): 0x40, 0x00, 0x00, 0x00, 0x00, 0x95
+    sd_spi_xfer(0x40);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x00);
+    sd_spi_xfer(0x95);
+
+    // Read response (R1) - up to 16 bytes
+    uint8_t r1 = 0xFF;
+    for (int i = 0; i < 16; i++) {
+        uint8_t r = sd_spi_xfer(0xFF);
+        if (r != 0xFF) {
+            r1 = r;
+            break;
+        }
+    }
+
+    // Deassert CS High
+    GPIOC->BSRR = (1U << 11);
+    sd_spi_xfer(0xFF);
+
+    // Restore original pin registers immediately
+    GPIOC->MODER = orig_c_moder;
+    GPIOC->PUPDR = orig_c_pupdr;
+    GPIOC->ODR   = orig_c_odr;
+    GPIOD->MODER = orig_d_moder;
+    GPIOD->PUPDR = orig_d_pupdr;
+    GPIOD->ODR   = orig_d_odr;
+
+    s_last_probe_r1 = r1;
+
+    // A real SD card in SPI mode responds to CMD0 with 0x01 (In Idle State) or 0x00.
+    // If no card is plugged into the socket, MISO stays pulled high and r1 remains 0xFF.
+    return (r1 != 0xFF && (r1 & 0x80) == 0) ? 1U : 0U;
 }
 
 void SDCard_Emergency_Freeze(void) {
@@ -218,14 +321,22 @@ uint8_t SDCard_Hardware_Poll_Lockout(void) {
     if (s_sd_critical_locked) {
         return 1;
     }
+    static uint32_t s_last_poll_tick = 0;
+    uint32_t now = xTaskGetTickCount();
+    if (now - s_last_poll_tick < 100) {
+        return 0;
+    }
+    s_last_poll_tick = now;
+
     static uint8_t s_missing_count = 0;
     if (SDCard_Hardware_Check_Present() == 0) {
         s_missing_count++;
-        if (s_missing_count >= 3) {
+        if (s_missing_count >= 2) {
             s_sd_critical_locked = 1;
             s_sd_status.critical_locked = 1;
             SDCard_Emergency_Freeze();
             Log_Event("SYS", "CRITICAL LOCKDOWN: SD Card physically removed! Actuators frozen.");
+            HTTP_SSE_PushLockout(1);
             return 1;
         }
     } else {
@@ -245,6 +356,7 @@ uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd) {
     }
     s_sd_critical_locked = 0;
     s_sd_status.critical_locked = 0;
+    HTTP_SSE_PushLockout(0);
     Log_Event("SYS", "CRITICAL LOCKDOWN CLEARED: Admin authenticated, SD Card present.");
     return 1;
 }
