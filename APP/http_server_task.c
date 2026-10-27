@@ -700,11 +700,12 @@ static int JSON_MqttLogResponse(char *buf, int buflen) {
         uint32_t log_uptime = g_mqtt_status.log[i].timestamp;
         uint32_t entry_epoch = (now_epoch > 0 && g_uptime_seconds >= log_uptime) ?
                                (now_epoch - (g_uptime_seconds - log_uptime)) : 0;
-        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"epoch\":%lu,\"size\":%u}",
+        pos = sfmt_append(buf, buflen, pos, "%s{\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"up_s\":%lu,\"epoch\":%lu,\"size\":%u}",
             emitted_log ? "," : "",
             g_mqtt_status.log[i].topic,
             clean_payload,
             g_mqtt_status.log[i].success,
+            (unsigned long)log_uptime,
             (unsigned long)log_uptime,
             (unsigned long)entry_epoch,
             (unsigned int)strlen((const char *)g_mqtt_status.log[i].payload));
@@ -741,10 +742,11 @@ static int JSON_MqttLogEntryResponse(char *buf, int buflen, int idx) {
 
     int pos = 0;
     pos = sfmt_append(buf, buflen, pos,
-        "{\"ok\":true,\"idx\":%d,\"topic\":\"%s\",\"success\":%u,\"time\":%lu,\"size\":%u,\"payload\":\"",
+        "{\"ok\":true,\"idx\":%d,\"topic\":\"%s\",\"success\":%u,\"time\":%lu,\"up_s\":%lu,\"size\":%u,\"payload\":\"",
         idx,
         g_mqtt_status.log[idx].topic,
         g_mqtt_status.log[idx].success,
+        (unsigned long)g_mqtt_status.log[idx].timestamp,
         (unsigned long)g_mqtt_status.log[idx].timestamp,
         (unsigned int)raw_len);
 
@@ -851,8 +853,8 @@ void HTTP_SSE_PushMqttLog(const char *topic, const char *payload, uint8_t succes
     uint32_t epoch = Time_Now();
     uint32_t sz = payload ? (uint32_t)strlen(payload) : 0;
     char buf[SSE_EVENT_MAX_LEN];
-    snprintf(buf, sizeof(buf), "{\"type\":\"mqtt_log\",\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"epoch\":%lu,\"size\":%lu}",
-             topic, clean_pl, (unsigned)success, (unsigned long)ts, (unsigned long)epoch, (unsigned long)sz);
+    snprintf(buf, sizeof(buf), "{\"type\":\"mqtt_log\",\"topic\":\"%s\",\"payload\":\"%s\",\"success\":%u,\"time\":%lu,\"up_s\":%lu,\"epoch\":%lu,\"size\":%lu}",
+             topic, clean_pl, (unsigned)success, (unsigned long)ts, (unsigned long)ts, (unsigned long)epoch, (unsigned long)sz);
     SSE_Queue_Push(buf);
 }
 
