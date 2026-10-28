@@ -51,7 +51,7 @@
 | T0 Stack | `-fstack-usage` without LTO | Top frames: `Dispatch_Request` 5,120 B, `Task_MQTTClient` 3,976 B, `Task_HTTPServer` 1,960 B, `Task_ControlEngine` 1,576 B, `Send_Action_Response` 1,248 B |
 | T1 pytest (host) | `pytest tests --ignore=tests/test_http_api.py` | ✅ 252 passed (2 stale source-grep tests fixed, see §5) |
 | T1 audit checks | `pytest tests/test_iot_audit.py` | 17 passed, 28 xfailed (= open findings, all fail on the real assertion) |
-| T1 C host tests | `test_config_logic.c`, `test_rules_parser.c`, `test_safe_fmt.c` | see §5 |
+| T1 C host tests | MinGW-w64 gcc 16.2 (WinLibs UCRT), `-Wall -Wextra`: `test_config_logic.c`, `test_safe_fmt.c`, `test_rules_parser.c` | ✅ 12/12, 8/8, 21/21 + 20,000-iteration parser fuzz (0 mismatches). 0 compiler warnings. ASan/UBSan not available on MinGW |
 | T2 live, read-only | `test_http_api.py` GET + auth-gate subset (22 tests) | ✅ 22 passed |
 | T2 live probe | Unauth GETs, headers, CORS preflight, malformed requests, Modbus TCP | See items SEC-04, SEC-11, MEM-02, SEC-10. Board stayed up after 3 malformed requests |
 | T2 live health | `/api/status` → `health` | heap 5,736 B free of 45,056 (87 % used, min = current); no faults, no restarts; lowest stack margin IOWorker 832 B |
