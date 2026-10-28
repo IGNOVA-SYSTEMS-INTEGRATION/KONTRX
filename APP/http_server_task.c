@@ -4510,10 +4510,24 @@ void Task_HTTPServer(void *arg) {
                             s_sock_teardown_tick[sn] = osKernelGetTickCount();
                             s_sock_est_tick[sn] = 0;
                         }
-                    } else if (now - s_sock_est_tick[sn] > 2000) {
-                        /* Inactivity timeout: close if connected > 2000ms with no HTTP request */
-                        close(sn);
-                        s_sock_est_tick[sn] = 0;
+                    } else {
+                        /* Inactivity timeout: close if connected with no HTTP request.
+                         * 2000ms while another HTTP socket is still listening, so a slow
+                         * or lossy link keeps its connection. 500ms only when none is
+                         * listening, so idle browser preconnects can't hold all 3 HTTP
+                         * sockets and make new connections get refused. */
+                        uint8_t other_listening = 0;
+                        for (uint8_t j = 0; j < HTTP_NUM_SOCKS; j++) {
+                            if (s_http_socks[j] != sn && getSn_SR(s_http_socks[j]) == SOCK_LISTEN) {
+                                other_listening = 1;
+                                break;
+                            }
+                        }
+                        uint32_t idle_limit = other_listening ? 2000U : 500U;
+                        if (now - s_sock_est_tick[sn] > idle_limit) {
+                            close(sn);
+                            s_sock_est_tick[sn] = 0;
+                        }
                     }
                 }
                 break;
