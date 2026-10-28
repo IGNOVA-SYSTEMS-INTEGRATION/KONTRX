@@ -96,7 +96,7 @@ class TestSecurity:
     def test_sec09_public_routes_minimal(self):
         body = func_body(HTTP, "static uint8_t Is_Public_Route")
         routes = re.findall(r'"((?:GET|POST) [^"]+)"', body)
-        assert sorted(routes) == ["GET /api/sdcard/status", "POST /api/sdcard/unlock"]
+        assert sorted(routes) == ["GET /api/ping", "GET /api/sdcard/status", "POST /api/sdcard/unlock"]
 
     def test_sec05_multiple_sessions(self):
         assert re.search(r"#define\s+SESSION_SLOTS\s+4", HTTP)

@@ -1642,9 +1642,11 @@ static int Find_Content_Length(const char *req, const char *hdr_end) {
  *  Request dispatcher
  * ====================================================================== */
 /* Routes reachable without a session: the lockdown screen must be able
- * to show SD status and unlock with the admin password. */
+ * to show SD status and unlock with the admin password, and OTA/monitoring
+ * tools need firmware version and uptime (GET /api/ping). */
 static uint8_t Is_Public_Route(const char *line) {
-    return (uint8_t)(strncmp(line, "GET /api/sdcard/status", 22) == 0 ||
+    return (uint8_t)(strncmp(line, "GET /api/ping", 13) == 0 ||
+                     strncmp(line, "GET /api/sdcard/status", 22) == 0 ||
                      strncmp(line, "POST /api/sdcard/unlock", 23) == 0);
 }
 
@@ -1888,6 +1890,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if ((strncmp(line, "POST ", 5) == 0 || strncmp(line, "GET /api/", 9) == 0) &&
         !Is_Public_Route(line) && !Is_Session_Valid(line)) {
         Send_Response(sn, HTTP_401, NULL);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/ping  (public) -> {"fw":"x.y.z","uptime_s":N}
+     * Liveness and reboot detection only; nothing else is exposed.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/ping", 13) == 0) {
+        char ping[64];
+        snprintf(ping, sizeof(ping), "{\"fw\":\"" FW_VERSION "\",\"uptime_s\":%lu}",
+                 (unsigned long)g_uptime_seconds);
+        Send_Response(sn, HTTP_200_JSON, ping);
         return;
     }
 

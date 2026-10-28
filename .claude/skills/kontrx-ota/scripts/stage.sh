@@ -34,7 +34,8 @@ echo "[+] SHA256 $SHA"
 
 ssh "${SSH_OPTS[@]}" "$HOST" "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force '$RDIR' | Out-Null\"" 2>&1 | quiet
 scp -q "${SSH_OPTS[@]}" "$BIN" "$HOST:$RDIR/KontrxRTOS.bin" 2>&1 | quiet
-scp -q "${SSH_OPTS[@]}" "$SKILL/ota_upload.ps1" "$SKILL/lat_test.ps1" "$HOST:$RDIR/" 2>&1 | quiet
+scp -q "${SSH_OPTS[@]}" "$SKILL/ota_upload.ps1" "$SKILL/lat_test.ps1" "$SKILL/login.ps1" "$SKILL/session.ps1" \
+    "$SKILL/health.ps1" "$SKILL/smoke_get.ps1" "$HOST:$RDIR/" 2>&1 | quiet
 
 RSHA=$(ssh "${SSH_OPTS[@]}" "$HOST" "powershell -NoProfile -Command \"(Get-FileHash '$RDIR/KontrxRTOS.bin' -Algorithm SHA256).Hash\"" 2>&1 | quiet | tr -d '\r\n ')
 if [ "$RSHA" != "$SHA" ]; then

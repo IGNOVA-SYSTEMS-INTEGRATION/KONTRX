@@ -278,6 +278,11 @@ class TestDefaultDeny:
         r = requests.post(f"{base_url}{path}", data="{}", timeout=5)
         assert r.status_code == 401
 
+    def test_public_ping(self, base_url):
+        r = requests.get(f"{base_url}/api/ping", timeout=5)
+        assert r.status_code == 200
+        assert set(r.json()) == {"fw", "uptime_s"}
+
     def test_public_sd_status(self, base_url):
         r = requests.get(f"{base_url}/api/sdcard/status", timeout=5)
         assert r.status_code == 200

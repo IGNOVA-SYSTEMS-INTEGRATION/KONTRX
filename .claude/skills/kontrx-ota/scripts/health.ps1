@@ -1,7 +1,10 @@
 param([string]$B = '192.168.1.200')
 # Read-only health snapshot after an OTA: status, sensors, MQTT, recent logs.
+# Gated routes need the session saved by login.ps1.
+. (Join-Path $PSScriptRoot 'session.ps1')
+$H = Get-AuthHeaders
 function Get-Json($path) {
-    try { return ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "http://$B$path").Content | ConvertFrom-Json) }
+    try { return ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Headers $H "http://$B$path").Content | ConvertFrom-Json) }
     catch { Write-Host "GET $path failed: $($_.Exception.Message)"; return $null }
 }
 $s = Get-Json '/api/status'

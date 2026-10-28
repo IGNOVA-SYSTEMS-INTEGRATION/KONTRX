@@ -1,8 +1,11 @@
 param([string]$B = '192.168.1.200')
 # Read-only smoke test: every GET route once, with status, size, time and
 # JSON validity. Skips /api/sdcard/download (streams the whole log partition).
+# Gated routes need the session saved by login.ps1.
+. (Join-Path $PSScriptRoot 'session.ps1')
+$H = Get-AuthHeaders
 $routes = @(
-  '/', '/dashboard', '/api/status', '/api/hardware', '/api/interfaces', '/api/analog', '/api/pwm', '/api/pto',
+  '/', '/dashboard', '/api/ping', '/api/status', '/api/hardware', '/api/interfaces', '/api/analog', '/api/pwm', '/api/pto',
   '/api/config/actuators', '/api/config/mqtt', '/api/config/relays', '/api/config/sensors',
   '/api/rules', '/api/rules/history', '/api/rules/pending', '/api/layout',
   '/api/logs?limit=20', '/api/mqtt/log', '/api/modbus/scan', '/api/auth/me',
@@ -12,7 +15,7 @@ foreach ($r in $routes) {
   $sw = [Diagnostics.Stopwatch]::StartNew()
   $code = 0; $len = 0; $json = '-'; $note = ''
   try {
-    $resp = Invoke-WebRequest -UseBasicParsing -TimeoutSec 15 "http://$B$r"
+    $resp = Invoke-WebRequest -UseBasicParsing -TimeoutSec 15 -Headers $H "http://$B$r"
     $code = [int]$resp.StatusCode; $len = $resp.RawContentLength
     $ct = "$($resp.Headers['Content-Type'])"
     if ($ct -match 'json') {
