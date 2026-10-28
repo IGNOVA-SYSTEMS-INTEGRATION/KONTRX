@@ -44,3 +44,6 @@ AGENT/
 skills-lock.json
 
 
+
+# Local secrets (never commit)
+secrets/

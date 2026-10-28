@@ -145,29 +145,34 @@ class TestConfigPageLoading:
 
 
 class TestAuthGatekeeper:
+    def _gate(self, c):
+        i = c.find("Default-deny API Gatekeeper")
+        assert i >= 0, "default-deny gatekeeper missing"
+        return c[i:i + 900]
+
+    def _public(self, c):
+        i = c.find("static uint8_t Is_Public_Route")
+        assert i >= 0, "Is_Public_Route missing"
+        return c[i:c.find("\n}", i)]
+
     def test_config_requires_auth(self):
         c = read_c_file()
-        gk = c[c.find("Protected API Gatekeeper"):c.find("Protected API Gatekeeper") + 800]
-        assert "POST /api/config/" in gk
+        gk = self._gate(c)
+        assert 'strncmp(line, "POST ", 5) == 0' in gk and "Is_Session_Valid" in gk
+        assert "POST /api/config" not in self._public(c)
 
     def test_relay_requires_auth(self):
-        c = read_c_file()
-        gk = c[c.find("Protected API Gatekeeper"):c.find("Protected API Gatekeeper") + 800]
-        assert "POST /api/relay" in gk
+        assert "POST /api/relay" not in self._public(read_c_file())
 
     def test_bearer_and_cookie_validation(self):
         c = read_c_file()
         assert "Bearer " in c
         assert "kx_session=" in c
 
-    def test_mobile_provision_exempt_from_session_gatekeeper(self):
-        """Ensure POST /api/provision is exempt from gatekeeper so mobile app can commission device."""
-        c = read_c_file()
-        gk = c[c.find("Protected API Gatekeeper"):c.find("Protected API Gatekeeper") + 1500]
-        # /api/provision alone must NOT be blocked, but delete and manual are guarded
-        assert 'strncmp(line, "POST /api/provision", 19) == 0' not in gk
-        assert 'POST /api/provision/delete' in gk
-        assert 'POST /api/provision/manual' in gk
+    def test_provision_requires_session(self):
+        """Provisioning rewrites the MQTT broker, so it is no longer exempt."""
+        pub = self._public(read_c_file())
+        assert "provision" not in pub and "rules" not in pub
 
 
 class TestEmbeddedHTMLSync:

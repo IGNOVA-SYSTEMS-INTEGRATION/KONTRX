@@ -36,6 +36,10 @@ def session_token(base_url, credentials):
     return data["token"]
 
 
+def auth(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
 # ── Auth Tests ────────────────────────────────────────────
 
 class TestAuth:
@@ -93,33 +97,33 @@ class TestAuth:
 # ── Status & Read-Only API Tests ──────────────────────────
 
 class TestStatusAPI:
-    def test_get_status(self, base_url):
-        r = requests.get(f"{base_url}/api/status", timeout=5)
+    def test_get_status(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/status", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
         data = r.json()
         assert "fw" in data
         assert "uptime_s" in data or "uptime" in data
 
-    def test_get_interfaces(self, base_url):
-        r = requests.get(f"{base_url}/api/interfaces", timeout=5)
+    def test_get_interfaces(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/interfaces", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
         data = r.json()
         assert isinstance(data, dict)
 
-    def test_get_config_sensors(self, base_url):
-        r = requests.get(f"{base_url}/api/config/sensors", timeout=5)
+    def test_get_config_sensors(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/config/sensors", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
 
-    def test_get_config_mqtt(self, base_url):
-        r = requests.get(f"{base_url}/api/config/mqtt", timeout=5)
+    def test_get_config_mqtt(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/config/mqtt", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
 
-    def test_get_config_actuators(self, base_url):
-        r = requests.get(f"{base_url}/api/config/actuators", timeout=5)
+    def test_get_config_actuators(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/config/actuators", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
 
-    def test_get_rules(self, base_url):
-        r = requests.get(f"{base_url}/api/rules", timeout=5)
+    def test_get_rules(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/rules", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
 
 
@@ -218,8 +222,8 @@ class TestOTA:
 # ── Modbus Scan Tests ─────────────────────────────────────
 
 class TestModbusScan:
-    def test_scan_status(self, base_url):
-        r = requests.get(f"{base_url}/api/modbus/scan", timeout=5)
+    def test_scan_status(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/modbus/scan", headers=auth(session_token), timeout=5)
         assert r.status_code == 200
 
 
@@ -234,8 +238,8 @@ class TestSDCard:
 # ── Edge Cases ────────────────────────────────────────────
 
 class TestEdgeCases:
-    def test_404_unknown_path(self, base_url):
-        r = requests.get(f"{base_url}/api/nonexistent", timeout=5)
+    def test_404_unknown_path(self, base_url, session_token):
+        r = requests.get(f"{base_url}/api/nonexistent", headers=auth(session_token), timeout=5)
         assert r.status_code == 404
 
     def test_large_request_body(self, base_url, session_token):
@@ -247,7 +251,43 @@ class TestEdgeCases:
         )
         assert r.status_code in [200, 400, 413]
 
-    def test_options_preflight(self, base_url):
-        r = requests.options(f"{base_url}/api/status", timeout=5)
+    def test_options_preflight_grants_nothing(self, base_url):
+        r = requests.options(f"{base_url}/api/status",
+                             headers={"Origin": "http://evil.example",
+                                      "Access-Control-Request-Method": "POST"}, timeout=5)
+        assert r.status_code == 204
+        assert "Access-Control-Allow-Origin" not in r.headers
+        assert "Access-Control-Allow-Credentials" not in r.headers
+
+
+# ── Default-deny gate (PR 1a) ─────────────────────────────
+
+class TestDefaultDeny:
+    @pytest.mark.parametrize("path", ["/api/status", "/api/rules", "/api/config/mqtt",
+                                      "/api/logs", "/api/sdcard/read?path=system_event.log",
+                                      "/api/events"])
+    def test_get_api_requires_session(self, base_url, path):
+        r = requests.get(f"{base_url}{path}", timeout=5, stream=True)
+        assert r.status_code == 401
+        r.close()
+
+    @pytest.mark.parametrize("path", ["/api/no-such-route", "/api/ota/verify"])
+    def test_post_requires_session(self, base_url, path):
+        # Only routes that change nothing even without a gate: an unknown
+        # path (401, not 404, proves every POST is gated) and an OTP check.
+        r = requests.post(f"{base_url}{path}", data="{}", timeout=5)
+        assert r.status_code == 401
+
+    def test_public_sd_status(self, base_url):
+        r = requests.get(f"{base_url}/api/sdcard/status", timeout=5)
         assert r.status_code == 200
-        assert "Access-Control-Allow-Methods" in r.headers
+
+    def test_page_has_security_headers(self, base_url):
+        r = requests.get(f"{base_url}/", timeout=5)
+        assert r.headers.get("X-Frame-Options") == "DENY"
+        assert r.headers.get("X-Content-Type-Options") == "nosniff"
+
+    def test_ota_prepare_needs_own_otp(self, base_url, session_token):
+        # A session that never verified the OTP must not be able to erase flash.
+        r = requests.post(f"{base_url}/api/ota/prepare", headers=auth(session_token), timeout=5)
+        assert r.status_code == 401
