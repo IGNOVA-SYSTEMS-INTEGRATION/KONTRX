@@ -75,7 +75,8 @@ class TestPostBodyAccumulation:
         if idx < 0:
             idx = c.find("content_len")
         assert idx >= 0
-        assert "500" in c[idx:idx + 1000], "Accumulation needs timeout"
+        # The header wait (300 ms) and body wait (2500 ms) loops follow the comment.
+        assert "osKernelGetTickCount() - t0) < 2500" in c[idx:idx + 5000], "Accumulation needs timeout"
 
 
 class TestQRCodeFix:
@@ -136,7 +137,9 @@ class TestConfigPageLoading:
         c = read_c_file()
         idx = c.find("static int JSON_StatusResponse")
         assert idx >= 0, "JSON_StatusResponse function not found"
-        block = c[idx:idx + 5000]
+        # Scan the whole function body: it has grown past a fixed window.
+        end = c.find("\nstatic ", idx + 1)
+        block = c[idx:end if end > 0 else len(c)]
         for field in ["type", "pin", "name"]:
             assert field in block, f"Status response missing '{field}' field"
 
