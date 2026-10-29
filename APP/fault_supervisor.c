@@ -16,6 +16,7 @@
 #include "fault_supervisor.h"
 #include "freertos_tasks.h"
 #include "safe_fmt.h"
+#include "failsafe.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -143,11 +144,13 @@ static void Record_Fault(uint32_t type, const char *task, uint32_t pc, uint32_t 
     for (uint32_t i = 0; i < sizeof(b->task); i++) b->task[i] = g_fault_record.task[i];
 }
 
-/* No safe way to continue: keep outputs as they are and stop. */
+/* No safe way to continue: drive GPIO outputs to their fail-safe level
+ * (HOLD ones stay as they are) and stop. */
 static void Fault_Unrecoverable(void) __attribute__((noreturn));
 static void Fault_Unrecoverable(void) {
     g_fault_record.last_type = FAULT_UNRECOVERABLE;
     __asm volatile ("cpsid i" ::: "memory");
+    Failsafe_ApplyFromFault();
     for (;;) { }
 }
 

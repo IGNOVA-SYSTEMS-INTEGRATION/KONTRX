@@ -33,6 +33,7 @@
 #include "flash_stm32.h"
 #include "rtc_stm32.h"
 #include "rng_stm32.h"
+#include "failsafe.h"
 #include "stm32f407_regs.h"
 #include "gpio_stm32.h"
 #include "socket.h"
@@ -1401,6 +1402,25 @@ static int JSON_ReadInt(const char *src, const char *key) {
         v++;
     }
     return val * sign;
+}
+
+/* Reads "key":[n, n, ...] into out (at most max numbers). Returns how
+ * many were read, or -1 if the key or the array is missing. */
+static int JSON_ReadNumArray(const char *src, const char *key, float *out, int max) {
+    const char *v = JSON_FindValue(src, key);
+    if (!v || *v != '[') return -1;
+    v++;
+    int n = 0;
+    while (*v && *v != ']' && n < max) {
+        while (*v == ' ' || *v == ',') v++;
+        if (*v == ']') break;
+        char *end;
+        float f = strtof(v, &end);
+        if (end == v) return -1;
+        out[n++] = f;
+        v = end;
+    }
+    return n;
 }
 
 static void Parse_Pin_String(const char *str, uint8_t *port_id, uint8_t *pin_num) {
@@ -2938,6 +2958,56 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         return;
     }
 
+    /* -----------------------------------------------------------------
+     * GET  /api/config/failsafe -> {"stale_timeout_s":N,"modes":[..],
+     *                               "restore":[..],"values":[..]}
+     * POST /api/config/failsafe    same shape; arrays indexed by actuator.
+     * modes: 0 HOLD, 1 OFF, 2 ON, 3 VALUE (see failsafe.h).
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/config/failsafe", 24) == 0) {
+        Failsafe_Config_t fc;
+        Failsafe_GetConfig(&fc);
+        size_t pos = sfmt_append(tx_buf, sizeof(tx_buf), 0, "{\"stale_timeout_s\":%u,\"modes\":[",
+                                 (unsigned)fc.stale_timeout_s);
+        for (int i = 0; i < MAX_RELAYS; i++)
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "%s%u", i ? "," : "", (unsigned)fc.mode[i]);
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "],\"restore\":[");
+        for (int i = 0; i < MAX_RELAYS; i++)
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "%s%u", i ? "," : "", (unsigned)fc.restore_on_power[i]);
+        pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "],\"values\":[");
+        for (int i = 0; i < MAX_RELAYS; i++)
+            pos = sfmt_append(tx_buf, sizeof(tx_buf), pos, "%s%.2f", i ? "," : "", (double)fc.safe_value[i]);
+        sfmt_append(tx_buf, sizeof(tx_buf), pos, "]}");
+        Send_Response(sn, HTTP_200_JSON, tx_buf);
+        return;
+    }
+    if (strncmp(line, "POST /api/config/failsafe", 25) == 0) {
+        char *body = strstr(line, "\r\n\r\n");
+        if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
+        body += 4;
+        Failsafe_Config_t fc;
+        Failsafe_GetConfig(&fc);
+        int t = JSON_ReadInt(body, "stale_timeout_s");
+        if (t > 0) fc.stale_timeout_s = (uint16_t)t;
+        float arr[MAX_RELAYS];
+        int n = JSON_ReadNumArray(body, "modes", arr, MAX_RELAYS);
+        for (int i = 0; i < n; i++) fc.mode[i] = (uint8_t)arr[i];
+        n = JSON_ReadNumArray(body, "restore", arr, MAX_RELAYS);
+        for (int i = 0; i < n; i++) fc.restore_on_power[i] = arr[i] != 0.0f;
+        n = JSON_ReadNumArray(body, "values", arr, MAX_RELAYS);
+        for (int i = 0; i < n; i++) fc.safe_value[i] = arr[i];
+        if (!Failsafe_SetConfig(&fc)) {
+            Send_Response(sn, HTTP_200_JSON,
+                          "{\"ok\":false,\"error\":\"Invalid fail-safe settings (mode 0-3, timeout 5-3600 s)\"}");
+            return;
+        }
+        Get_Shared_Config(&s_http_cfg_temp);
+        Failsafe_RefreshFaultPlan(&s_http_cfg_temp);
+        Log_Event("SYS", "Fail-safe settings updated");
+        Send_Response(sn, HTTP_200_JSON, HTTP_200_OK_JSON);
+        return;
+    }
+
     if (strncmp(line, "GET /api/config/actuators", 25) == 0 ||
         strncmp(line, "GET /api/config/relays", 22) == 0) {
         Get_Shared_Config(&s_http_cfg_temp);
@@ -3275,20 +3345,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         body += 4;
         Get_Shared_Config(&s_http_cfg_temp);
 
-        /* De-assert old local pins first */
-        for (int i = 0; i < (int)s_http_cfg_temp.actuator_count && i < MAX_RELAYS; i++) {
-            if (s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO ||
-                s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_DIGITAL_OUT) {
-                int port = GPIO_GetPortId(s_http_cfg_temp.actuators[i].port_or_ip);
-                uint8_t pin = s_http_cfg_temp.actuators[i].pin_or_slave;
-                if (port >= 0 && port <= 4 && pin <= 15) {
-                    GPIO_TypeDef *gpio = GPIO_Ports[port];
-                    gpio->MODER &= ~(3U << (pin * 2));
-                    gpio->PUPDR &= ~(3U << (pin * 2));
-                }
-            }
-        }
-
         uint8_t actuator_count = 0;
         Actuator_Config_t temp_actuators[MAX_RELAYS];
         memset(temp_actuators, 0, sizeof(temp_actuators));
@@ -3398,10 +3454,51 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             cursor = close + 1;
         }
 
+        /* ACT-10: two actuators must not drive the same pin or channel. GPIO
+         * relays and digital outputs share the pin space; PWM, PTO and each
+         * analog type have their own channel numbers. */
+        for (int a = 0; a < actuator_count; a++) {
+            for (int b = a + 1; b < actuator_count; b++) {
+                const Actuator_Config_t *x = &temp_actuators[a], *y = &temp_actuators[b];
+                uint8_t x_gpio = (x->type == ACTUATOR_TYPE_LOCAL_GPIO || x->type == ACTUATOR_TYPE_DIGITAL_OUT);
+                uint8_t y_gpio = (y->type == ACTUATOR_TYPE_LOCAL_GPIO || y->type == ACTUATOR_TYPE_DIGITAL_OUT);
+                uint8_t clash = 0;
+                if (x_gpio && y_gpio) {
+                    clash = (strcmp(x->port_or_ip, y->port_or_ip) == 0 && x->pin_or_slave == y->pin_or_slave);
+                } else if (x->type == y->type &&
+                           (x->type == ACTUATOR_TYPE_PWM || x->type == ACTUATOR_TYPE_PTO ||
+                            x->type == ACTUATOR_TYPE_ANALOG_MA || x->type == ACTUATOR_TYPE_ANALOG_V)) {
+                    clash = (x->pin_or_slave == y->pin_or_slave);
+                }
+                if (clash) {
+                    snprintf(tx_buf, sizeof(tx_buf),
+                             "{\"ok\":false,\"error\":\"Actuators %d and %d use the same output (%s).\"}",
+                             a + 1, b + 1, x->port_or_ip);
+                    Send_Response(sn, HTTP_200_JSON, tx_buf);
+                    return;
+                }
+            }
+        }
+
         /* Allow empty relay list (clears config) */
 
-        /* Build and update new config */
+        /* De-assert old local pins only now that the new list is valid:
+         * a rejected request must leave the running outputs untouched. */
         Get_Shared_Config(&s_http_cfg_temp);
+        for (int i = 0; i < (int)s_http_cfg_temp.actuator_count && i < MAX_RELAYS; i++) {
+            if (s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_LOCAL_GPIO ||
+                s_http_cfg_temp.actuators[i].type == ACTUATOR_TYPE_DIGITAL_OUT) {
+                int port = GPIO_GetPortId(s_http_cfg_temp.actuators[i].port_or_ip);
+                uint8_t pin = s_http_cfg_temp.actuators[i].pin_or_slave;
+                if (port >= 0 && port <= 4 && pin <= 15) {
+                    GPIO_TypeDef *gpio = GPIO_Ports[port];
+                    gpio->MODER &= ~(3U << (pin * 2));
+                    gpio->PUPDR &= ~(3U << (pin * 2));
+                }
+            }
+        }
+
+        /* Build and update new config */
         
         s_http_cfg_temp.actuator_count = actuator_count;
         memcpy(s_http_cfg_temp.actuators, temp_actuators, sizeof(s_http_cfg_temp.actuators));
@@ -3414,8 +3511,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 int port = GPIO_GetPortId(s_http_cfg_temp.actuators[i].port_or_ip);
                 uint8_t pin = s_http_cfg_temp.actuators[i].pin_or_slave;
                 if (port >= 0 && port <= 4 && pin <= 15) {
+                    /* OFF level before the pin becomes an output (ACT-02);
+                     * Relay_SetState(i, 0) is a no-op when relayStates[i]
+                     * is already 0, so set the state directly. */
+                    GPIO_Ports[port]->BSRR = s_http_cfg_temp.actuators[i].is_active_low
+                                             ? (1U << pin) : (1U << (pin + 16U));
                     GPIO_InitOutput(GPIO_Ports[port], pin);
-                    Relay_SetState((uint8_t)i, 0);
+                    relayStates[i] = 0;
                 }
             }
         }
@@ -4139,6 +4241,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         /* Pause background tasks cleanly without mutex deadlocks */
         g_ota_in_progress = 1;
         osDelay(100);
+
+        /* The erase stalls the CPU for seconds: put outputs in their
+         * fail-safe state first (HOLD ones stay as they are). */
+        Get_Shared_Config(&s_http_cfg_temp);
+        Failsafe_ApplyAll(&s_http_cfg_temp, FS_REASON_OTA);
 
         /* Backup configuration to W25Q16 external flash before destructive erase */
         Get_Shared_Config(&s_http_cfg_temp);

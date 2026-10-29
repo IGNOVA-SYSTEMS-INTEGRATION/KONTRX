@@ -194,9 +194,13 @@ class TestReliability:
     def test_rel05_malloc_failed_hook(self):
         assert "vApplicationMallocFailedHook" in src("APP/main_kontrx.c")
 
-    @open_finding("REL-07: RCC_CSR reset flags read but never cleared (RMVF), cause accumulates")
     def test_rel07_reset_flags_cleared(self):
-        assert "RMVF" in all_fw() or "(1U << 24)" in SDCARD
+        fs = src("APP/failsafe.c")
+        assert "RCC_CSR_REG |= RCC_CSR_RMVF" in fs
+        # Captured first thing in main(), and the boot audit reads the copy.
+        main = src("APP/main_kontrx.c")
+        assert main.index("Failsafe_CaptureResetCause();") < main.index("RCC_SystemClock_168MHz_Init();")
+        assert "uint32_t csr = g_reset_csr;" in SDCARD
 
     def test_rel03_fault_supervisor_records_faults(self):
         assert "g_fault_record" in src("APP/fault_supervisor.c")
@@ -265,11 +269,17 @@ class TestModbus:
 
 # ---------------------------------------------------------------- Actuation
 class TestActuation:
-    @open_finding("ACT-02: Relay_Init calls Relay_SetState(i,0) which is a no-op (state already 0),"
-                  " so active-low (NC) relay pins stay LOW = energised after boot")
     def test_act02_relay_init_drives_safe_level(self):
         body = func_body(TASKS, "void Relay_Init(void)")
-        assert "BSRR" in body or "ODR" in body
+        # The OFF level is written before the pin is switched to output.
+        assert body.index("gpio->BSRR") < body.index("gpio->MODER  |=  (1U << (pin * 2));")
+        assert "is_active_low ? (1U << pin)" in body and "relayStates[i] = 0;" in body
+        assert "Relay_SetState((uint8_t)i, 0);" not in body
+
+    def test_act02_relay_reconfig_drives_safe_level(self):
+        i = HTTP.find('strncmp(line, "POST /api/config/relays", 23) == 0')
+        block = HTTP[i:i + 12000]
+        assert block.index("->BSRR = s_http_cfg_temp.actuators[i].is_active_low") < block.index("GPIO_InitOutput(GPIO_Ports[port], pin);")
 
     def test_act08_analog_outputs_clamped(self):
         assert "voltage > 10.0f" in src("HAL/analog_010v.c")
@@ -278,9 +288,33 @@ class TestActuation:
     def test_act07_pto_limit_switch_estop(self):
         assert "PTO_EmergencyStop" in src("HAL/pto_motion.h")
 
-    @open_finding("ACT-01: no per-actuator fail-safe state on comms/sensor loss or supervisor halt")
     def test_act01_failsafe_state(self):
-        assert re.search(r"fail_?safe", TASKS + src("HAL/modbus_dma.h"), re.I)
+        h = src("APP/failsafe.h")
+        assert "FAILSAFE_HOLD  = 0" in h          # default mode is HOLD
+        assert "Failsafe_ApplyFromFault();" in src("APP/fault_supervisor.c")
+        assert "Failsafe_ApplyAll(&s_http_cfg_temp, FS_REASON_OTA);" in HTTP
+        assert "Failsafe_ApplyOne(out, &cfg_snap, FS_REASON_STALE);" in TASKS
+        assert "Failsafe_BootRestore(&fs_cfg);" in TASKS
+        assert "APP/failsafe.c" in src("CMakeLists.txt")
+
+    def test_act01_power_on_restore_is_opt_in(self):
+        body = func_body(src("APP/failsafe.c"), "void Failsafe_BootRestore")
+        assert "(!power_on || s_cfg.restore_on_power[i])" in body
+        assert "never resume motion" in body
+
+    def test_act01_failsafe_flash_area_is_unused(self):
+        fs = src("APP/failsafe.c")
+        start = int(re.search(r"FS_CFG_PRIMARY_ADDR\s+(0x[0-9A-Fa-f]+)U", fs).group(1), 16)
+        ring = int(re.search(r"FS_RING_ADDR\s+(0x[0-9A-Fa-f]+)U", fs).group(1), 16)
+        assert 0x00000000 <= start and ring + 2 * 0x1000 <= 0x00080000   # inside the web partition
+        assert "PARTITION_WEB_ADDR" not in all_fw().replace(src("HAL/flash_partition.h"), "")
+
+    def test_act10_duplicate_outputs_rejected(self):
+        assert "use the same output" in HTTP
+        i = HTTP.find('strncmp(line, "POST /api/config/relays", 23) == 0')
+        block = HTTP[i:i + 12000]
+        # A rejected list must not touch the running pins.
+        assert block.index("use the same output") < block.index("De-assert old local pins only now")
 
     @open_finding("ACT-05: MQTT relay_N target parses one digit only (relay_10 -> relay 1)")
     def test_act_mqtt_multi_digit_relay_index(self):
@@ -289,6 +323,15 @@ class TestActuation:
 
 # ---------------------------------------------------------------- Storage
 class TestStorage:
+    @open_finding("STO-09: rules history (0xEC000-0x103FFF) lies inside the offline queue (0x88000-0x103FFF)")
+    def test_sto09_partitions_do_not_overlap(self):
+        h = src("HAL/flash_partition.h")
+        def v(name):
+            return int(re.search(name + r"\s+(0x[0-9A-Fa-f]+)U", h).group(1), 16)
+        q0, q1 = v("PARTITION_QUEUE_ADDR"), v("PARTITION_QUEUE_ADDR") + v("PARTITION_QUEUE_SIZE")
+        r0 = v("PARTITION_RULES_HISTORY_ADDR")
+        assert not (q0 <= r0 < q1)
+
     def test_sto03_dual_sector_config_with_crc(self):
         fp = src("HAL/flash_partition.c")
         assert "CONFIG_BACKUP_ADDR" in fp and "Compute_CRC32" in fp
