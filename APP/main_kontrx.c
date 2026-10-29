@@ -28,6 +28,7 @@
 #include "spi_stm32.h"
 #include "flash_stm32.h"
 #include "rtc_stm32.h"
+#include "rng_stm32.h"
 #include "led.h"
 #include "modbus_dma.h"
 #include "freertos_tasks.h"
@@ -231,7 +232,7 @@ static void Load_Config_From_Flash(void) {
 
         strncpy(sharedConfig.admin_username, "admin", sizeof(sharedConfig.admin_username));
         strncpy(sharedConfig.admin_password, "adminkontrx", sizeof(sharedConfig.admin_password));
-        strncpy(sharedConfig.master_password, "KontrxMaster2026", sizeof(sharedConfig.master_password));
+        sharedConfig.master_password[0] = '\0'; /* unset until the admin sets one */
         sharedConfig.actuator_mask = 0x0F; // All enabled by default (PTO, 0-10V, 4-20mA, PWM)
 
         Partition_SaveConfig(&sharedConfig);
@@ -258,6 +259,7 @@ int main(void) {
     GPIO_Init_USART1_Pins();
     UART_Debug_Init();
     RTC_Init();
+    RNG_Init();   /* session tokens */
     printf("\r\n\r\n");
     Log_Event("SYS", "System initialized and booted successfully at 168 MHz.");
     printf("╔══════════════════════════════════════════╗\r\n");

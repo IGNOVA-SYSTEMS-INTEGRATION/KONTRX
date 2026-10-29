@@ -356,14 +356,11 @@ uint8_t SDCard_Hardware_Poll_Lockout(void) {
 
 uint8_t SDCard_UnlockWithPassword(const char *pwd, const char *admin_pwd, const char *master_pwd) {
     if (!pwd || pwd[0] == '\0') return 0;
-    const char *exp_admin = (admin_pwd && admin_pwd[0]) ? admin_pwd : "adminkontrx";
-    const char *exp_master = (master_pwd && master_pwd[0]) ? master_pwd : "KontrxMaster2026";
-
+    /* Only the current admin password, or the master password when one is
+     * set. No built-in fallbacks (SEC-02). */
     uint8_t matched = 0;
-    if (strcmp(pwd, exp_admin) == 0 ||
-        strcmp(pwd, exp_master) == 0 ||
-        strcmp(pwd, "adminkontrx") == 0 ||
-        strcmp(pwd, "KontrxMaster2026") == 0) {
+    if ((admin_pwd && admin_pwd[0] && strcmp(pwd, admin_pwd) == 0) ||
+        (master_pwd && master_pwd[0] && strcmp(pwd, master_pwd) == 0)) {
         matched = 1;
     }
     if (!matched) {

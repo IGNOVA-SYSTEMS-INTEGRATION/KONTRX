@@ -11,7 +11,8 @@ Windows PowerShell 5.1 and no Python.
 
 ## Rule: the user authenticates, not Claude
 
-The OTA needs the admin password and the OTA OTP. Claude never types, reads,
+The OTA needs the admin password (login + OTA step-up; firmware older than
+PR 2 also asks for its OTA OTP). Claude never types, reads,
 stores or sends them, and never runs `tools/ota_upload.py` (it hard-codes
 them). The user runs `scripts/ota_upload.ps1` themselves; it prompts for both
 with hidden input. Everything before and after that step is automated.
@@ -40,7 +41,7 @@ code that has not been reviewed.
 4. **Hand off.** Give the user the `USER_COMMAND` line in a `powershell`
    block, to run in their own SSH session on the remote host
    (`ssh kontrx-remote`) or on its desktop. The script shows target, size and
-   hash, asks them to type `FLASH`, prompts for password and OTP, uploads,
+   hash, asks them to type `FLASH`, prompts for the password (and the OTP only on older firmware), uploads,
    and waits for the reboot. End the turn; do not poll.
 
 5. **After `REBOOTED`** (the watcher's notification), run the tests from the
@@ -67,7 +68,7 @@ Run it in the background; `http://localhost:18080`, Modbus TCP on `localhost:150
 ## Files
 
 - `scripts/stage.sh` — build, size/hash check, copy to remote, print user command.
-- `scripts/ota_upload.ps1` — user-run uploader (login, OTP, prepare, `/update`, reboot wait).
+- `scripts/ota_upload.ps1` — user-run uploader (login, password step-up, prepare, `/update`, reboot wait).
 - `scripts/wait_reboot.sh` — background watcher; prints `REBOOTED` or `TIMEOUT`.
 - `scripts/lat_test.ps1` — Modbus TCP FC03 idle and under log-page load, HTTP status, log pages.
 - `scripts/smoke_get.ps1` — every GET route once: status, size, time, JSON validity (read-only).

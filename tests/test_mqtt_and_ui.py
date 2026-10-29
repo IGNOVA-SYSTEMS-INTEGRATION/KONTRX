@@ -87,12 +87,12 @@ class TestOTAAuthentication:
         return read_file(HTTP_SERVER_C)
 
     def test_web_upload_authenticates_otp(self, html):
-        """Ensure the web uploadFirmware function validates OTP before flashing."""
+        """uploadFirmware re-asks the admin password (step-up) before flashing."""
         idx = html.find("function uploadFirmware")
         assert idx != -1
         func_block = html[idx:idx + 1800]
         assert "/api/ota/verify" in func_block
-        assert "KontrxOTA2026" in func_block
+        assert "password:otaPwd" in func_block and "KontrxOTA2026" not in html
         assert "/api/ota/prepare" in func_block
         assert "/update" in func_block
 
