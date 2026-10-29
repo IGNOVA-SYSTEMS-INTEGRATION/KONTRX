@@ -98,6 +98,9 @@ static char    tx_buf[12288] __attribute__((section(".ccmram")));  /* Sized for 
 
 /* Static temporary storage for rules in CCMRAM to avoid ~4KB on HTTP task stack */
 static RuleConfig_t s_tempRules __attribute__((section(".ccmram")));
+/* Layout of one archive slot; shared by accept (archive) and rollback (load),
+ * both handled sequentially by the HTTP task. */
+static char s_archive_layout[ARCHIVE_LAYOUT_MAX + 1] __attribute__((section(".ccmram")));
 
 /* ======================================================================
  *  Static working buffers for JSON_StatusResponse
@@ -2621,9 +2624,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
             // Archive to persistent history (SD Card / Flash) along with current layout
             {
-                static char s_arch_layout[3000] __attribute__((section(".ccmram")));
-                uint32_t ll = Partition_LoadLayout(s_arch_layout, sizeof(s_arch_layout));
-                Partition_ArchiveRules(&newRules, ll > 0 ? s_arch_layout : NULL, ll);
+                uint32_t ll = Partition_LoadLayout(s_archive_layout, sizeof(s_archive_layout));
+                Partition_ArchiveRules(&newRules, ll > 0 ? s_archive_layout : NULL, ll);
             }
 
             char accept_log[128];
@@ -2722,23 +2724,28 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             return;
         }
 
-        RuleConfig_t rolledRules;
+        /* A rollback is a rule change like an upload: the archived version
+         * becomes the pending set and runs only after POST /api/rules/accept.
+         * Its layout is stored the same way an upload stores its layout. */
+        #define rolledRules s_tempRules
         memset(&rolledRules, 0, sizeof(rolledRules));
-        if (Partition_RollbackRules(target_ver, &rolledRules)) {
+        s_archive_layout[0] = '\0';
+        if (Partition_LoadArchivedRules(target_ver, &rolledRules, s_archive_layout, sizeof(s_archive_layout))) {
+            if (s_archive_layout[0] != '\0') {
+                Partition_SaveLayout(s_archive_layout, strlen(s_archive_layout));
+            }
             if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
-                activeRules = rolledRules;
-                hasPendingRules = 0;
-                memset(&pendingRules, 0, sizeof(RuleConfig_t));
+                pendingRules = rolledRules;
+                hasPendingRules = 1;
                 osMutexRelease(rulesMutex);
             }
-            ControlEngine_ResetStates();
             char r_log[128];
-            snprintf(r_log, sizeof(r_log), "Rules rolled back to version %s successfully.", target_ver);
+            snprintf(r_log, sizeof(r_log), "Rollback to version %s requested (pending approval).", target_ver);
             Log_Event("SYS", r_log);
 
             char ok_body[160];
             snprintf(ok_body, sizeof(ok_body),
-                     "{\"ok\":true,\"status\":\"rolled_back\",\"version_id\":\"%s\"}", target_ver);
+                     "{\"ok\":true,\"status\":\"pending\",\"version_id\":\"%s\"}", target_ver);
             Send_Response(sn, HTTP_200_JSON, ok_body);
         } else {
             char err_body[160];
@@ -2746,6 +2753,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                      "{\"ok\":false,\"error\":\"Version '%s' not found in archives\"}", target_ver);
             Send_Response(sn, HTTP_200_JSON, err_body);
         }
+        #undef rolledRules
         return;
     }
 

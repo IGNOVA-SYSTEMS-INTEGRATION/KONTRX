@@ -40,6 +40,7 @@
 #include "task.h"
 #include "modbus_dma.h"
 #include "flash_partition.h"
+#include "rule_sequence.h"
 #include "http_server_task.h"
 #include "ota_task.h"
 #include "rtc_stm32.h"
@@ -683,14 +684,7 @@ typedef struct {
     uint8_t  sr_state;
 } CondNodeState_t;
 
-/* State memory for sequences */
-typedef struct {
-    uint8_t  active;
-    uint8_t  current_step;
-    uint8_t  current_cycle;
-    uint32_t step_start_ticks;
-} RuleSeqState_t;
-
+/* Sequence state memory: RuleSeqState_t (rule_sequence.h) */
 static CondNodeState_t s_node_states[MAX_COND_NODES] = {0};
 static RuleSeqState_t  s_seq_states[MAX_RULES] = {0};
 
@@ -699,25 +693,45 @@ void ControlEngine_ResetStates(void) {
     memset(s_seq_states, 0, sizeof(s_seq_states));
 }
 
+/* auto_reverse action for an output type: PWM -> duty 0, 4-20mA -> 4 mA,
+ * 0-10V -> 0 V, binary -> inverse of fwd_action. PTO has no inverse move:
+ * returns 0 and the output is left alone. */
+static uint8_t Auto_Reverse_Action(uint8_t atype, const char *fwd_action, char *out, size_t out_len, float *value) {
+    const char *act;
+    if (atype == ACTUATOR_TYPE_PWM)            { act = "SET_DUTY"; *value = 0.0f; }
+    else if (atype == ACTUATOR_TYPE_ANALOG_MA) { act = "SET_MA";   *value = 4.0f; }
+    else if (atype == ACTUATOR_TYPE_ANALOG_V)  { act = "SET_V";    *value = 0.0f; }
+    else if (atype == ACTUATOR_TYPE_PTO)       { return 0; }
+    else act = (string_equals_ci(fwd_action, "ON") || strcmp(fwd_action, "1") == 0) ? "OFF" : "ON";
+    strncpy(out, act, out_len - 1);
+    out[out_len - 1] = '\0';
+    return 1;
+}
+
 static uint8_t Evaluate_Cond_Node(int8_t node_idx, const RuleConfig_t *cfg, const Gateway_Config_t *gw_cfg, const Modbus_SensorData_t *sd, uint32_t now_ticks) {
     if (!cfg || node_idx < 0 || node_idx >= cfg->cond_node_count) return 0;
     const CondNode_t *n = &cfg->cond_nodes[node_idx];
     CondNodeState_t *st = &s_node_states[node_idx];
 
+    /* AND / OR evaluate every child each cycle (no short-circuit): TON, TP,
+     * SR latch and hysteresis children keep their state only if they run.
+     * A gate with no inputs is false, so an unwired gate never drives an output. */
     if (n->type == COND_NODE_AND) {
-        if (n->child_count == 0) return 1;
+        if (n->child_count == 0) return 0;
+        uint8_t all = 1;
         for (uint8_t c = 0; c < n->child_count; c++) {
-            if (!Evaluate_Cond_Node(n->children[c], cfg, gw_cfg, sd, now_ticks)) return 0;
+            if (!Evaluate_Cond_Node(n->children[c], cfg, gw_cfg, sd, now_ticks)) all = 0;
         }
-        return 1;
+        return all;
     }
 
     if (n->type == COND_NODE_OR) {
         if (n->child_count == 0) return 0;
+        uint8_t any = 0;
         for (uint8_t c = 0; c < n->child_count; c++) {
-            if (Evaluate_Cond_Node(n->children[c], cfg, gw_cfg, sd, now_ticks)) return 1;
+            if (Evaluate_Cond_Node(n->children[c], cfg, gw_cfg, sd, now_ticks)) any = 1;
         }
-        return 0;
+        return any;
     }
 
     if (n->type == COND_NODE_NOT) {
@@ -1134,57 +1148,17 @@ static void Task_ControlEngine(void *arg) {
 
                     if (rule->sequence_idx >= 0 && rule->sequence_idx < localRules.seq_count) {
                         const ActionSequence_t *seq = &localRules.sequences[rule->sequence_idx];
-                        RuleSeqState_t *sq = &s_seq_states[i];
+                        uint8_t step_idx = 0;
 
-                        if (cond_met) {
-                            if (!sq->active) {
-                                sq->active = 1;
-                                sq->current_step = 0;
-                                sq->current_cycle = 0;
-                                sq->step_start_ticks = now_ticks;
-                            }
-                        } else {
-                            if (sq->active) {
-                                if (seq->on_false == SEQ_ON_FALSE_FINISH_CYCLE) {
-                                    // Let current cycle finish, then stop
-                                } else if (seq->on_false == SEQ_ON_FALSE_HOLD) {
-                                    // Hold current step
-                                } else {
-                                    // SEQ_ON_FALSE_ABORT_SAFE: immediate reset
-                                    sq->active = 0;
-                                    sq->current_step = 0;
-                                }
-                            }
-                        }
-
-                        if (sq->active && seq->step_count > 0) {
+                        if (RuleSeq_Update(seq, &s_seq_states[i], cond_met, now_ticks, configTICK_RATE_HZ, &step_idx)) {
                             eff_active = 1;
-                            const SeqStep_t *cur_step = &seq->steps[sq->current_step];
+                            const SeqStep_t *cur_step = &seq->steps[step_idx];
                             strncpy(eff_action, cur_step->action, sizeof(eff_action) - 1);
                             eff_action[sizeof(eff_action) - 1] = '\0';
                             eff_value = cur_step->value;
-
-                            uint32_t step_hold = cur_step->hold_ms > 0 ? cur_step->hold_ms : 1000;
-                            if ((now_ticks - sq->step_start_ticks) >= pdMS_TO_TICKS(step_hold)) {
-                                sq->current_step++;
-                                sq->step_start_ticks = now_ticks;
-                                if (sq->current_step >= seq->step_count) {
-                                    sq->current_cycle++;
-                                    if (seq->mode == SEQ_MODE_LOOP) {
-                                        sq->current_step = 0;
-                                    } else if (seq->mode == SEQ_MODE_COUNT && sq->current_cycle < seq->repeat_count) {
-                                        sq->current_step = 0;
-                                    } else {
-                                        // Once or count completed
-                                        sq->active = 0;
-                                        sq->current_step = 0;
-                                        eff_active = 0;
-                                    }
-                                }
-                            }
-                        } else if (!cond_met && rule->auto_reverse) {
-                            eff_active = 2; // Auto-reverse active
-                            strncpy(eff_action, "OFF", sizeof(eff_action) - 1);
+                        } else if (!cond_met && rule->auto_reverse &&
+                                   Auto_Reverse_Action(atype, "ON", eff_action, sizeof(eff_action), &eff_value)) {
+                            eff_active = 2; // Auto-reverse: output to its off / safe level
                         }
                     } else {
                         // Standard single action
@@ -1192,20 +1166,9 @@ static void Task_ControlEngine(void *arg) {
                             eff_active = 1;
                             strncpy(eff_action, rule->action, sizeof(eff_action) - 1);
                             eff_action[sizeof(eff_action) - 1] = '\0';
-                        } else if (rule->auto_reverse) {
+                        } else if (rule->auto_reverse &&
+                                   Auto_Reverse_Action(atype, rule->action, eff_action, sizeof(eff_action), &eff_value)) {
                             eff_active = 2; // Auto-reverse
-                            if (atype == ACTUATOR_TYPE_PWM) {
-                                strncpy(eff_action, "SET_DUTY", sizeof(eff_action) - 1);
-                                eff_value = 0.0f;
-                            } else if (atype == ACTUATOR_TYPE_ANALOG_MA) {
-                                strncpy(eff_action, "SET_MA", sizeof(eff_action) - 1);
-                                eff_value = 4.0f;
-                            } else if (atype == ACTUATOR_TYPE_ANALOG_V) {
-                                strncpy(eff_action, "SET_V", sizeof(eff_action) - 1);
-                                eff_value = 0.0f;
-                            } else {
-                                strncpy(eff_action, (string_equals_ci(rule->action, "ON") || strcmp(rule->action, "1") == 0) ? "OFF" : "ON", sizeof(eff_action) - 1);
-                            }
                         }
                     }
 

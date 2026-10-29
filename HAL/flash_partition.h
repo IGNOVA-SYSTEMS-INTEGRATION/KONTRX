@@ -226,9 +226,9 @@ uint32_t Partition_Queue_StreamSize(void);
 #define MAX_HISTORY_ARCHIVES          12U
 #define ARCHIVE_SLOT_SIZE             0x00002000U // 8 KB per slot (4KB rules + 4KB layout)
 #define ARCHIVE_SLOT_MAGIC            0x52554C41U // "RULA"
+#define ARCHIVE_LAYOUT_MAX            4096U       // layout bytes per slot (second 4 KB sector)
 
 uint8_t  Partition_ArchiveRules(const RuleConfig_t *cfg, const char *layout_json, uint32_t layout_len);
-uint8_t  Partition_RollbackRules(const char *target_version_id, RuleConfig_t *out_rules);
 int      Partition_FormatRulesHistoryJSON(char *buf, int max_len, const char *active_version);
 uint8_t  Partition_LoadArchivedRules(const char *version_id, RuleConfig_t *out_rules, char *out_layout, uint32_t layout_max);
 

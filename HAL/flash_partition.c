@@ -1062,7 +1062,11 @@ uint8_t Partition_ArchiveRules(const RuleConfig_t *cfg, const char *layout_json,
     /* Write Header: [magic:4] [version_id:36] [timestamp:36] [rule_count:4] [layout_bytes:4] [rules_crc:4] */
     uint32_t magic = ARCHIVE_SLOT_MAGIC;
     uint32_t r_cnt = cfg->rule_count;
-    uint32_t l_len = (layout_json && layout_len > 0 && layout_len < 3800U) ? layout_len : 0;
+    uint32_t l_len = (layout_json && layout_len > 0 && layout_len <= ARCHIVE_LAYOUT_MAX) ? layout_len : 0;
+    if (layout_json && layout_len > ARCHIVE_LAYOUT_MAX) {
+        printf("[Rules Archive] Layout %lu bytes > %u: version '%s' archived without layout\r\n",
+               (unsigned long)layout_len, (unsigned)ARCHIVE_LAYOUT_MAX, cfg->version_id);
+    }
     uint32_t r_crc = Compute_CRC32((const uint8_t *)cfg, offsetof(RuleConfig_t, checksum));
 
     W25Q_Write(target_addr,       (const uint8_t *)&magic, 4);
@@ -1115,31 +1119,6 @@ uint8_t Partition_LoadArchivedRules(const char *version_id, RuleConfig_t *out_ru
         }
     }
     return 0;
-}
-
-uint8_t Partition_RollbackRules(const char *target_version_id, RuleConfig_t *out_rules) {
-    if (!target_version_id || !out_rules) return 0;
-
-    static char s_layout_buf[4096] __attribute__((section(".ccmram")));
-    memset(s_layout_buf, 0, sizeof(s_layout_buf));
-
-    if (!Partition_LoadArchivedRules(target_version_id, out_rules, s_layout_buf, sizeof(s_layout_buf))) {
-        printf("[Rollback] Target version '%s' not found in archives.\r\n", target_version_id);
-        return 0;
-    }
-
-    out_rules->rules_valid = 1;
-    Partition_SaveRules(out_rules);
-
-    if (s_layout_buf[0] != '\0') {
-        Partition_SaveLayout(s_layout_buf, strlen(s_layout_buf));
-    }
-
-    char r_msg[96];
-    snprintf(r_msg, sizeof(r_msg), "Rules rolled back to version %s", target_version_id);
-    Partition_Log_Append(Time_LogStamp(), 0, r_msg);
-    printf("[Rollback] Successfully restored rules & layout for version '%s'\r\n", target_version_id);
-    return 1;
 }
 
 int Partition_FormatRulesHistoryJSON(char *buf, int max_len, const char *active_version) {

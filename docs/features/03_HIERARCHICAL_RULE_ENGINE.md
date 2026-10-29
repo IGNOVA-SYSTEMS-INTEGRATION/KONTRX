@@ -9,14 +9,20 @@ Provides autonomous, edge-side closed-loop control without requiring constant cl
 ## 2. Technical Implementation & How It Works (بتشتغل ازاي)
 * **Code Location**: `APP/freertos_tasks.c` (`Task_ControlEngine`), `APP/main_kontrx.c`, `APP/cJSON.c`.
 * **Architecture & Flow**:
-  1. **Thread Execution**: Runs deterministically inside `Task_ControlEngine` with a cycle period of 100 ms and a stack size of 1024 words (`configMINIMAL_STACK_SIZE * 8`).
+  1. **Thread Execution**: Runs deterministically inside `Task_ControlEngine` with a cycle period of 25 ms (`osDelay(25)`) and a stack size of 1024 words (`configMINIMAL_STACK_SIZE * 8`).
   2. **Rule Schema**:
      * **Triggers**: Sensor value thresholds (`<`, `<=`, `>`, `>=`, `==`, `!=`), digital input states, timer intervals, or time-of-day schedules.
      * **Conditions**: Multi-condition logic gates (AND / OR) combining environmental inputs, sensor health flags, and manual override modes.
      * **Hysteresis & Debounce**: Configurable dead-band window to prevent rapid chattering of high-power contactors and relays.
      * **Actions**: Single or multiple actuator actions (Relay ON/OFF, PWM duty cycle change, PTO motor position move, 4–20mA output ramp).
      * **Priority & Hierarchies**: Rules are evaluated in ranked order. Safety interlocks (e.g., emergency stop or tank low-level cutoff) supersede normal production cycles.
-  3. **Thread Safety**: Interlocks access sensor cache via `sensorMutex` and actuator registers via `actuatorMutex` to prevent race conditions with HTTP or MQTT tasks.
+  3. **Gate & Sequence Semantics (FW 2.2.3)**:
+     * `AND` / `OR` evaluate every child each cycle (no short-circuit), so TON, TP, SR latch and hysteresis children keep correct state. A gate with no inputs is **false**.
+     * Action sequences (`APP/rule_sequence.c`, `RuleSeq_Update`): `on_false` = `abort_safe` stops at once; `finish_cycle` runs to the end of the current cycle then stops; `hold` keeps the current step and pauses its timer, then resumes from the same point. `once` / `count` run once per rising edge of the condition.
+     * `auto_reverse`: PWM -> duty 0, 4-20mA -> 4 mA, 0-10V -> 0 V, binary -> inverse action (sequence: OFF). PTO has no reverse move.
+     * Rollback (`POST /api/rules/rollback`) loads the archived version as **pending**; it runs only after `POST /api/rules/accept`.
+     * Archive slots keep up to 4096 bytes of canvas layout; larger layouts are archived without layout (logged).
+  4. **Thread Safety**: Interlocks access sensor cache via `sensorMutex` and actuator registers via `actuatorMutex` to prevent race conditions with HTTP or MQTT tasks.
 
 ---
 
