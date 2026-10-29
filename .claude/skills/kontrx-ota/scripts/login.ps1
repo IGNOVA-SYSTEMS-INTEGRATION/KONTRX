@@ -31,9 +31,9 @@ if (-not $token) { throw 'Login failed: no token in response.' }
 $path = Join-Path $PSScriptRoot '.session'
 Set-Content -Path $path -Value $token -NoNewline -Encoding ASCII
 # Owner-only ACL: drop inherited rules, grant the current user full control.
-$acl = Get-Acl $path
-$acl.SetAccessRuleProtection($true, $false)
+# icacls edits only the DACL; Set-Acl also rewrites the SACL and needs
+# SeSecurityPrivilege, which a normal shell does not hold.
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
-Set-Acl $path $acl
+& icacls $path /inheritance:r /grant:r "${me}:F" | Out-Null
+if ($LASTEXITCODE -ne 0) { Remove-Item $path -Force; throw "Could not restrict $path; token not kept." }
 Write-Host "[+] Session saved to $path (token only). It is lost when the controller reboots."

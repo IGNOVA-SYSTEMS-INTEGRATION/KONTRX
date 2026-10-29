@@ -5,7 +5,9 @@ function Get-AuthHeaders {
     $path = Join-Path $PSScriptRoot '.session'
     if (Test-Path $path) {
         $t = (Get-Content -Path $path -Raw).Trim()
-        if ($t) { return @{ Cookie = "kx_session=$t" } }
+        # Bearer, not Cookie: PowerShell 5.1 Invoke-WebRequest drops a
+        # Cookie passed through -Headers.
+        if ($t) { return @{ Authorization = "Bearer $t" } }
     }
     Write-Host '[!] No .session: run login.ps1 first for authenticated routes.'
     return @{}
