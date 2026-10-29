@@ -7,6 +7,12 @@
 gcc -o test_config tests/test_config_logic.c && ./test_config
 ```
 
+### Rule Sequence State Machine (C)
+```bash
+cd tests
+gcc -std=gnu11 -Wall -Wextra -g -Ihost_stubs -I../HAL -I../APP test_rule_sequence.c ../APP/rule_sequence.c -o test_rule_sequence && ./test_rule_sequence
+```
+
 ### Modbus Protocol (Python)
 ```bash
 pip install pytest

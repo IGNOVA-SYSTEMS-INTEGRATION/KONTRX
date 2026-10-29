@@ -89,6 +89,7 @@ set(RTOS_APP_SOURCES
     APP/ota_task.c
     APP/jspan.c
     APP/rules_parser.c
+    APP/rule_sequence.c
     APP/dsp_filter.c
     HAL/sdcard.c
     HAL/modbus_dma.c
