@@ -65,9 +65,10 @@ static void test_hold_pauses_and_resumes(void) {
     RuleSeqState_t st = {0};
     uint32_t t = 0;
     run(&seq, &st, 1, &t, 3000);                 /* 3 s into the 5 s ON step */
-    CHECK(run(&seq, &st, 0, &t, 60000) == 0, "hold: stays on ON while condition false");
-    CHECK(run(&seq, &st, 1, &t, 61900) == 0, "hold: ~2 s of ON left after resume");
-    CHECK(run(&seq, &st, 1, &t, 62200) == 1, "hold: OFF after the remaining 2 s");
+    /* 5 s false: a running timer would be in the OFF step by now */
+    CHECK(run(&seq, &st, 0, &t, 8000) == 0, "hold: stays on ON while condition false");
+    CHECK(run(&seq, &st, 1, &t, 9900) == 0, "hold: ~2 s of ON left after resume");
+    CHECK(run(&seq, &st, 1, &t, 10200) == 1, "hold: OFF after the remaining 2 s");
 }
 
 static void test_finish_cycle_loop_stops(void) {
