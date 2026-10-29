@@ -12,6 +12,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "rtc_stm32.h"
+#include "failsafe.h"
 #include "safe_fmt.h"
 #include "fault_supervisor.h"
 #include "portable.h"
@@ -80,8 +81,9 @@ int SDCard_FormatBootAudit(char *buf, int max_len) {
     size_t free_heap = xPortGetFreeHeapSize();
     size_t min_heap = xPortGetMinimumEverFreeHeapSize();
 
-    /* Reset flags from RCC_CSR (0x40023874) */
-    uint32_t csr = *(volatile uint32_t *)0x40023874UL;
+    /* Reset flags as captured at boot: main() clears them (RMVF) so the
+     * next reset reports only its own cause (REL-07). */
+    uint32_t csr = g_reset_csr;
     const char *reset_cause = "Power-On / External Reset";
     if (csr & (1U << 31)) reset_cause = "Low-Power Reset";
     else if (csr & (1U << 30)) reset_cause = "Window Watchdog Reset";

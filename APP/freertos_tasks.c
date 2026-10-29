@@ -43,6 +43,7 @@
 #include "http_server_task.h"
 #include "ota_task.h"
 #include "rtc_stm32.h"
+#include "failsafe.h"
 #include "MQTTClient.h"
 #include "mqtt_interface.h"
 #include "sparkplug_b_enc.h"
@@ -397,7 +398,7 @@ void vApplicationIdleHook(void) {
 
 
 
-static uint8_t Relay_Pin_Is_Reserved(uint8_t port, uint8_t pin) {
+uint8_t Relay_PinReserved(uint8_t port, uint8_t pin) {
     if (port > 4 || pin > 15) return 1;
 
     if (port == 0 && (pin == 6 || pin == 9 || pin == 10)) return 1;  /* LED, USART1 */
@@ -427,7 +428,7 @@ void Relay_Init(void) {
         uint8_t pin = s_tasks_cfg.actuators[i].pin_or_slave;
 
         if (port < 0 || port > 4) continue;
-        if (Relay_Pin_Is_Reserved(port, pin)) {
+        if (Relay_PinReserved(port, pin)) {
             printf("[Relay] %s pin P%c%u is reserved; relay disabled\r\n",
                    s_tasks_cfg.actuators[i].name[0] ? s_tasks_cfg.actuators[i].name : "Relay",
                    'A' + port, pin);
@@ -439,15 +440,19 @@ void Relay_Init(void) {
         /* Enable GPIO clock: AHB1ENR bit position = port index */
         RCC->AHB1ENR |= (1U << port);
 
+        /* OFF (de-energised) level first: ODR resets to 0, which is ON
+         * for an active-low relay, so the pin must not become an output
+         * before its level is set. Relay_SetState() cannot do this: it
+         * returns early because relayStates[i] already reads 0. */
+        relayStates[i] = 0;
+        gpio->BSRR = s_tasks_cfg.actuators[i].is_active_low ? (1U << pin) : (1U << (pin + 16U));
+
         /* Output push-pull */
-        gpio->MODER  &= ~(3U << (pin * 2));
-        gpio->MODER  |=  (1U << (pin * 2));
         gpio->OTYPER &= ~(1U << pin);
         gpio->OSPEEDR|=  (2U << (pin * 2)); /* High speed */
         gpio->PUPDR  &= ~(3U << (pin * 2));
-
-        /* Initialise to OFF state (deenergised) */
-        Relay_SetState((uint8_t)i, 0);
+        gpio->MODER  &= ~(3U << (pin * 2));
+        gpio->MODER  |=  (1U << (pin * 2));
     }
 }
 
@@ -494,7 +499,7 @@ void Relay_SetState(uint8_t idx, uint8_t state) {
     if (is_gpio) {
         port = Get_Port_Id(act.port_or_ip);
         if (port < 0 || port > 4) return;
-        if (Relay_Pin_Is_Reserved(port, pin)) return;
+        if (Relay_PinReserved(port, pin)) return;
     }
 
     /* Claim the transition atomically so two tasks switching the same
@@ -607,6 +612,27 @@ static void Task_IOWorker(void *arg) {
 
         if (g_ota_in_progress) continue;
 
+        /* Fail-safe bookkeeping (failsafe.h). The first pass restores the
+         * boot outputs: Relay_SetState() needs the scheduler, and this flag
+         * survives a supervisor restart of the task. One config copy in
+         * CCMRAM serves both: SRAM has little room left for the main stack. */
+        static uint8_t  s_boot_restored = 0;
+        static uint32_t s_last_fs = 0, s_fs_cfg_version = 0xFFFFFFFFU;
+        if (!s_boot_restored || (now_sup - s_last_fs) >= pdMS_TO_TICKS(1000)) {
+            static Gateway_Config_t fs_cfg __attribute__((section(".ccmram")));
+            s_last_fs = now_sup;
+            Get_Shared_Config(&fs_cfg);
+            if (s_fs_cfg_version != g_config_version) {
+                s_fs_cfg_version = g_config_version;
+                Failsafe_RefreshFaultPlan(&fs_cfg);
+            }
+            if (!s_boot_restored) {
+                Failsafe_BootRestore(&fs_cfg);
+                s_boot_restored = 1;
+            }
+            Failsafe_PersistTick(&fs_cfg);
+        }
+
         Time_Service();
         Remote_Actuator_Service();
 
@@ -644,6 +670,7 @@ static uint8_t Evaluate_Compare(float val, const char *op, float thr) {
 }
 
 static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found);
+static float Resolve_Input_Value_Raw(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found);
 
 /* Per-node timer/pulse state memory */
 typedef struct {
@@ -803,7 +830,17 @@ static uint8_t Evaluate_Cond_Node(int8_t node_idx, const RuleConfig_t *cfg, cons
     }
 }
 
+/* Lookups that found no fresh value since the Control Engine reset it:
+ * > 0 after a rule's evaluation means that rule ran on stale inputs. */
+static uint32_t s_eval_missing;
+
 static float Resolve_Input_Value(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found) {
+    float v = Resolve_Input_Value_Raw(input_id, cfg, sd, found);
+    if (!*found) s_eval_missing++;
+    return v;
+}
+
+static float Resolve_Input_Value_Raw(const char *input_id, const Gateway_Config_t *cfg, const Modbus_SensorData_t *sd, uint8_t *found) {
     *found = 0;
     
     // 1. Try to find mapping in mqtt_mappings by matching json_key
@@ -943,6 +980,12 @@ static void Task_ControlEngine(void *arg) {
 
     Modbus_SensorData_t sd = { .last_update_time = 0 };
 
+    /* Per output: whether a rule drives it, and when a rule driving it last
+     * had all its inputs fresh (ACT-01 stale fail-safe). */
+    static uint8_t  s_out_ruled[MAX_RELAYS];
+    static uint32_t s_out_fresh_tick[MAX_RELAYS];
+    static uint8_t  s_out_failsafed[MAX_RELAYS];
+
     for (;;) {
         FAULT_TEST_POINT();
         if (g_ota_in_progress) {
@@ -1040,6 +1083,8 @@ static void Task_ControlEngine(void *arg) {
                     const Rule_t *rule = &localRules.rules[i];
                     if (!rule->active) continue;
 
+                    int8_t fs_out = Resolve_Output_Id(rule->output_id, &cfg_snap);
+                    s_eval_missing = 0;
                     uint8_t cond_met = 0;
 
                     /* 1. Evaluate condition: use recursive tree if root_node is valid, else flat legacy */
@@ -1180,7 +1225,31 @@ static void Task_ControlEngine(void *arg) {
                     }
 
                 skip_rule:
-                    (void)0;
+                    if (fs_out >= 0 && fs_out < MAX_RELAYS) {
+                        if (!s_out_ruled[fs_out]) s_out_fresh_tick[fs_out] = now_ticks;
+                        s_out_ruled[fs_out] = 1;
+                        if (s_eval_missing == 0) s_out_fresh_tick[fs_out] = now_ticks;
+                    }
+                }
+
+                /* ACT-01: an output whose rules have run on stale inputs for
+                 * stale_timeout_s goes to its fail-safe state (HOLD = as is)
+                 * and rules stop driving it until an input is fresh again. */
+                uint32_t stale_ticks = pdMS_TO_TICKS((uint32_t)Failsafe_StaleTimeoutS() * 1000U);
+                for (uint8_t out = 0; out < cfg_snap.actuator_count && out < MAX_RELAYS; out++) {
+                    uint8_t stale = s_out_ruled[out] && !localRules.bypass_validation &&
+                                    (now_ticks - s_out_fresh_tick[out]) >= stale_ticks &&
+                                    Failsafe_Mode(out) != FAILSAFE_HOLD;
+                    if (stale) {
+                        if (!s_out_failsafed[out]) {
+                            Failsafe_ApplyOne(out, &cfg_snap, FS_REASON_STALE);
+                            s_out_failsafed[out] = 1;
+                        }
+                        claims[out].claimed = 0;
+                    } else if (s_out_failsafed[out]) {
+                        s_out_failsafed[out] = 0;
+                        Log_Event("SYS", "Fail-safe cleared: rule inputs fresh again");
+                    }
                 }
 
                 /* 4. Apply Arbitrated Outputs to Hardware */

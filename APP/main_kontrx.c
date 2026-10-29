@@ -29,6 +29,7 @@
 #include "flash_stm32.h"
 #include "rtc_stm32.h"
 #include "rng_stm32.h"
+#include "failsafe.h"
 #include "led.h"
 #include "modbus_dma.h"
 #include "freertos_tasks.h"
@@ -246,6 +247,7 @@ static void Load_Config_From_Flash(void) {
  *  main()
  * ====================================================================== */
 int main(void) {
+    Failsafe_CaptureResetCause();   /* before anything can reset again */
     memset((void *)&g_mqtt_status, 0, sizeof(g_mqtt_status));
 
     /* ---- 0. High-Performance Clock: 168 MHz via PLL (HSE / HSI auto-fallback) ---- */
@@ -363,6 +365,7 @@ int main(void) {
     /* ---- 8. Load saved relay/MQTT config from EEPROM ---- */
     Load_Config_From_Flash();
     Log_Event("SYS", "Configuration loaded from Flash Sector 7.");
+    Failsafe_Init();   /* fail-safe settings + last output states (W25Q16) */
 
     /* ---- 9. Initialise relay GPIO from config ---- */
     Relay_Init();

@@ -36,6 +36,8 @@ void Relay_SetState(uint8_t idx, uint8_t state);
  *         Call once after Modbus_DMA_Init().
  */
 void Relay_Init(void);
+/* 1 if PORT/PIN must never be driven as a relay (LED, UARTs, SPI, RS485). */
+uint8_t Relay_PinReserved(uint8_t port, uint8_t pin);
 
 /** @brief Global uptime counter, incremented by vApplicationTickHook */
 extern volatile uint32_t g_uptime_seconds;

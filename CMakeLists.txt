@@ -82,6 +82,7 @@ set(RTOS_APP_SOURCES
     MCAL/STM32F4/uart_debug_tx.c
     APP/freertos_tasks.c
     APP/fault_supervisor.c
+    APP/failsafe.c
     APP/timekeeper.c
     APP/sparkplug_b_enc.c
     APP/http_server_task.c
