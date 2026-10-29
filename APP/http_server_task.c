@@ -1590,8 +1590,8 @@ static void Stream_Web_Asset(uint8_t sn) {
     uint32_t html_len = KONTRX_HTML_LEN;
 
     printf("[HTTP] Streaming gzipped web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
+    char hdr[384]; /* ~320 B of headers; a truncated block loses the blank line */
+    int hdr_len = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Encoding: gzip\r\n"
@@ -1605,7 +1605,8 @@ static void Stream_Web_Asset(uint8_t sn) {
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
-    send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
+    if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr)) return;
+    send(sn, (uint8_t *)hdr, (uint16_t)hdr_len);
 
     /* Stream gzipped KONTRX_HTML directly from internal MCU Flash memory. */
     Send_Chunked(sn, KONTRX_HTML, html_len);

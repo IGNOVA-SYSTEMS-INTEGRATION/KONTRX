@@ -108,6 +108,17 @@ class TestSecurity:
     def test_sec11_security_headers(self):
         assert "X-Frame-Options: DENY" in HTTP and "X-Content-Type-Options: nosniff" in HTTP
 
+    def test_sec11_page_header_block_fits_buffer(self):
+        # A truncated header block loses its blank line and the browser
+        # parses the gzip body as headers (seen on the board, 2026-10-29).
+        body = func_body(HTTP, "static void Stream_Web_Asset")
+        size = int(re.search(r"char hdr\[(\d+)\]", body).group(1))
+        call = body.split("snprintf(hdr", 1)[1].split(");", 1)[0]
+        lits = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', call))
+        # Each C escape (\r, \n) is one byte; %lu can print up to 10 digits.
+        text = re.sub(r"\\.", "x", lits).replace("%lu", "4294967295")
+        assert len(text) + 1 <= size, f"{len(text)} B of headers in a {size} B buffer"
+
     @open_finding("SEC-10: Modbus TCP writes gated only by test_mode, no client allow-list")
     def test_sec10_modbus_tcp_write_acl(self):
         mb = src("HAL/modbus_tcp_server.c")
