@@ -96,6 +96,11 @@ class TestSecurity:
         i = HTTP.find("Default-deny API Gatekeeper")
         assert "password_change_required" in HTTP[i:i + 1500]
         assert "MIN_PASSWORD_LEN" in HTTP and "forcePasswordChange" in WEB
+        # The modal asks the current password itself (doLogin's password
+        # variable is shadowed by a hoisted var) and any 403
+        # password_change_required reply opens it.
+        assert '"Current (factory) password"' in WEB
+        assert '"password_change_required"===d.error&&forcePasswordChange' in WEB
 
     def test_sec06_login_lockout_exists(self):
         assert "LOGIN_MAX_ATTEMPTS" in HTTP and "s_login_lockout_until" in HTTP

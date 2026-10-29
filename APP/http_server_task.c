@@ -1891,12 +1891,14 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * GET /api/auth/me  → Session verification
      * ----------------------------------------------------------------- */
     if (strncmp(line, "GET /api/auth/me", 16) == 0) {
-        if (!Is_Session_Valid(line)) {
+        int slot = Session_Find(line);
+        if (slot < 0) {
             Send_Response(sn, HTTP_401, NULL);
             return;
         }
         Get_Shared_Config(&s_http_cfg_temp);
-        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"username\":\"%s\"}", s_http_cfg_temp.admin_username);
+        snprintf(tx_buf, sizeof(tx_buf), "{\"ok\":true,\"username\":\"%s\",\"must_change\":%s}",
+                 s_http_cfg_temp.admin_username, s_sessions[slot].must_change ? "true" : "false");
         Send_Response(sn, HTTP_200_JSON, tx_buf);
         return;
     }
