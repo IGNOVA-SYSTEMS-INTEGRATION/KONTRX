@@ -83,29 +83,41 @@ class TestSecurity:
     def test_sec06_session_cookie_httponly_samesite(self):
         assert "HttpOnly" in HTTP and "SameSite=Strict" in HTTP
 
-    @open_finding("SEC-04: CORS '*' and Origin reflected with Allow-Credentials")
-    def test_sec04_no_wildcard_cors(self):
-        assert "Access-Control-Allow-Origin: *" not in HTTP
+    def test_sec04_no_cors_headers(self):
+        assert "Access-Control-Allow-Origin" not in HTTP
+        assert "Access-Control-Allow-Credentials" not in HTTP
 
-    @open_finding("SEC-09: POST /api/rules* auth gate disabled (configurator TODO)")
-    def test_sec09_rules_write_requires_auth(self):
-        assert "TEMPORARILY DISABLED" not in HTTP
+    def test_sec09_default_deny_gate(self):
+        i = HTTP.find("Default-deny API Gatekeeper")
+        gate = HTTP[i:i + 900]
+        assert i >= 0 and 'strncmp(line, "POST ", 5) == 0' in gate
+        assert 'strncmp(line, "GET /api/", 9) == 0' in gate and "Is_Session_Valid" in gate
 
-    @open_finding("SEC-09: POST /api/provision is unauthenticated and rewrites MQTT broker")
-    def test_sec09_provision_requires_auth(self):
-        i = HTTP.find('strncmp(line, "POST /api/provision", 19) == 0')
-        if i < 0:
-            i = HTTP.find("POST /api/provision ")
-        block = HTTP[i:i + 600]
-        assert "Is_Session_Valid" in block
+    def test_sec09_public_routes_minimal(self):
+        body = func_body(HTTP, "static uint8_t Is_Public_Route")
+        routes = re.findall(r'"((?:GET|POST) [^"]+)"', body)
+        assert sorted(routes) == ["GET /api/ping", "GET /api/sdcard/status", "POST /api/sdcard/unlock"]
+
+    def test_sec05_multiple_sessions(self):
+        assert re.search(r"#define\s+SESSION_SLOTS\s+4", HTTP)
 
     @open_finding("SEC-08: web UI has no HTML-escape helper before innerHTML")
     def test_sec08_web_has_escape_helper(self):
         assert re.search(r"function\s+(esc|escapeHtml|escHtml)\s*\(", WEB)
 
-    @open_finding("SEC-11: no X-Frame-Options / CSP / nosniff headers")
     def test_sec11_security_headers(self):
-        assert "X-Frame-Options" in HTTP or "Content-Security-Policy" in HTTP
+        assert "X-Frame-Options: DENY" in HTTP and "X-Content-Type-Options: nosniff" in HTTP
+
+    def test_sec11_page_header_block_fits_buffer(self):
+        # A truncated header block loses its blank line and the browser
+        # parses the gzip body as headers (seen on the board, 2026-10-29).
+        body = func_body(HTTP, "static void Stream_Web_Asset")
+        size = int(re.search(r"char hdr\[(\d+)\]", body).group(1))
+        call = body.split("snprintf(hdr", 1)[1].split(");", 1)[0]
+        lits = "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', call))
+        # Each C escape (\r, \n) is one byte; %lu can print up to 10 digits.
+        text = re.sub(r"\\.", "x", lits).replace("%lu", "4294967295")
+        assert len(text) + 1 <= size, f"{len(text)} B of headers in a {size} B buffer"
 
     @open_finding("SEC-10: Modbus TCP writes gated only by test_mode, no client allow-list")
     def test_sec10_modbus_tcp_write_acl(self):
@@ -126,6 +138,11 @@ class TestOtaBoot:
     @open_finding("OTA-03: no trial boot / rollback to previous image")
     def test_ota03_rollback(self):
         assert re.search(r"rollback|trial|confirm", BOOT, re.I)
+
+    def test_ota09_otp_bound_to_session(self):
+        body = func_body(HTTP, "static uint8_t Ota_Otp_Ok")
+        assert "s_ota_otp_slot" in body and "OTA_OTP_WINDOW_MS" in body
+        assert HTTP.count("if (!Ota_Otp_Ok(line))") == 2
 
     def test_ota06_image_size_bounded(self):
         assert "content_length > 262144" in HTTP

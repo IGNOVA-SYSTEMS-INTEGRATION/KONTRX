@@ -44,3 +44,7 @@ AGENT/
 skills-lock.json
 
 
+
+# Local secrets (never commit)
+secrets/
+.claude/skills/kontrx-ota/scripts/.session

@@ -8,7 +8,8 @@ set -uo pipefail
 HOST="${1:-kontrx-remote}"
 IP="${2:-192.168.1.200}"
 MINUTES="${3:-60}"
-PS='try { $j = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 http://'"$IP"'/api/status).Content | ConvertFrom-Json; "$($j.uptime_s) $($j.fw)" } catch { "down" }'
+# /api/ping is public on default-deny firmware; /api/status covers older images.
+PS='$o = "down"; foreach ($p in "/api/ping", "/api/status") { try { $j = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://'"$IP"'$p").Content | ConvertFrom-Json; $o = "$($j.uptime_s) $($j.fw)"; break } catch { } }; $o'
 # PowerShell -EncodedCommand wants base64 of UTF-16LE (Git Bash has no iconv).
 ENC=$(printf %s "$PS" | python -I -c "import sys,base64;print(base64.b64encode(sys.stdin.read().encode('utf-16-le')).decode())")
 

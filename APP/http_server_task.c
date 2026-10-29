@@ -162,7 +162,15 @@ static void ParseQueryStringParam(const char *line, const char *param_name, char
 /* ======================================================================
  *  Web Authentication & Session State
  * ====================================================================== */
-static char s_session_token[42] = {0};
+/* Up to SESSION_SLOTS concurrent logins (browser, configurator, mobile).
+ * A new login takes a free slot, else evicts the least recently used one. */
+#define SESSION_SLOTS        4
+#define SESSION_TOKEN_SIZE   42
+typedef struct {
+    char     token[SESSION_TOKEN_SIZE];
+    uint32_t last_used;   /* tick of the last request that used it */
+} Session_t;
+static Session_t s_sessions[SESSION_SLOTS] = {0};
 static uint8_t  s_login_fail_count = 0;
 static uint32_t s_login_lockout_until = 0;
 #define LOGIN_MAX_ATTEMPTS   5
@@ -181,24 +189,58 @@ static void Generate_Session_Token(char *out, size_t maxlen) {
              (unsigned long)r3, (unsigned long)r4);
 }
 
+/* Slot of the session token carried by the request (cookie, Bearer or
+ * X-Auth-Token), or -1. A match must end where the token ends, so a token
+ * that merely starts with a valid one is rejected. */
+static int Session_Find(const char *req) {
+    static const char *const keys[] = { "kx_session=", "Bearer ", "X-Auth-Token: " };
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+        const char *c = strstr(req, keys[k]);
+        if (!c) continue;
+        c += strlen(keys[k]);
+        for (int i = 0; i < SESSION_SLOTS; i++) {
+            size_t n = strlen(s_sessions[i].token);
+            if (n == 0 || strncmp(c, s_sessions[i].token, n) != 0) continue;
+            char end = c[n];
+            if ((end >= '0' && end <= '9') || (end >= 'a' && end <= 'z') ||
+                (end >= 'A' && end <= 'Z')) continue;
+            s_sessions[i].last_used = xTaskGetTickCount();
+            return i;
+        }
+    }
+    return -1;
+}
+
 static uint8_t Is_Session_Valid(const char *req) {
-    if (s_session_token[0] == '\0') return 0;
-    const char *c = strstr(req, "kx_session=");
-    if (c) {
-        c += 11;
-        if (strncmp(c, s_session_token, strlen(s_session_token)) == 0) return 1;
+    return (uint8_t)(Session_Find(req) >= 0);
+}
+
+/* Issues a new session token and returns it. */
+static const char *Session_Create(void) {
+    int slot = 0;
+    for (int i = 0; i < SESSION_SLOTS; i++) {
+        if (s_sessions[i].token[0] == '\0') { slot = i; break; }
+        if (s_sessions[i].last_used < s_sessions[slot].last_used) slot = i;
     }
-    const char *a = strstr(req, "Bearer ");
-    if (a) {
-        a += 7;
-        if (strncmp(a, s_session_token, strlen(s_session_token)) == 0) return 1;
-    }
-    const char *x = strstr(req, "X-Auth-Token: ");
-    if (x) {
-        x += 14;
-        if (strncmp(x, s_session_token, strlen(s_session_token)) == 0) return 1;
-    }
-    return 0;
+    Generate_Session_Token(s_sessions[slot].token, sizeof(s_sessions[slot].token));
+    s_sessions[slot].last_used = xTaskGetTickCount();
+    return s_sessions[slot].token;
+}
+
+static void Session_ClearAll(void) {
+    memset(s_sessions, 0, sizeof(s_sessions));
+}
+
+/* OTA OTP approval belongs to the session that verified it and expires, so
+ * another client cannot ride on someone else's verification. */
+#define OTA_OTP_WINDOW_MS  120000U
+static int      s_ota_otp_slot = -1;
+static uint32_t s_ota_otp_tick = 0;
+
+static uint8_t Ota_Otp_Ok(const char *req) {
+    if (!ota_otp_validated || s_ota_otp_slot < 0) return 0;
+    if ((xTaskGetTickCount() - s_ota_otp_tick) >= pdMS_TO_TICKS(OTA_OTP_WINDOW_MS)) return 0;
+    return (uint8_t)(Session_Find(req) == s_ota_otp_slot);
 }
 
 static uint8_t Is_Page_Route(const char *line) {
@@ -542,9 +584,6 @@ static void Send_JSON_Logs(uint8_t sn, const char *line) {
         "Content-Type: application/json\r\n"
         "Content-Length: %d\r\n"
         "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Connection: close\r\n"
         "\r\n",
         n);
@@ -1009,9 +1048,6 @@ static void Send_Action_Response(uint8_t sn, const char *action_name, uint32_t t
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %d\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type\r\n"
         "Connection: close\r\n\r\n",
         (int)strlen(resp_buf));
 
@@ -1409,12 +1445,12 @@ static void JSON_ReadStr(const char *src, const char *key, char *out, int maxlen
  *  HTTP response helpers
  * ====================================================================== */
 #define HTTP_200_HTML "HTTP/1.1 200 OK\r\nContent-Type:text/html;charset=UTF-8\r\nConnection:close\r\n\r\n"
-#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+#define HTTP_200_JSON "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
 #define HTTP_400      "HTTP/1.1 400 Bad Request\r\nConnection:close\r\n\r\n{\"ok\":false}"
-#define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\"}"
-#define HTTP_423_LOCKED "HTTP/1.1 423 Locked\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"CRITICAL SYSTEM LOCK: MicroSD storage removed. Actuators frozen. Enter Admin password to unlock.\"}"
+#define HTTP_401      "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Unauthorized\"}"
+#define HTTP_423_LOCKED "HTTP/1.1 423 Locked\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"CRITICAL SYSTEM LOCK: MicroSD storage removed. Actuators frozen. Enter Admin password to unlock.\"}"
 #define HTTP_200_OK_JSON "{\"ok\":true}"
-#define HTTP_500_JSON "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+#define HTTP_500_JSON "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
 
 static void Send_Response(uint8_t sn, const char *header, const char *body) {
     if (!body || body[0] == '\0') {
@@ -1554,8 +1590,8 @@ static void Stream_Web_Asset(uint8_t sn) {
     uint32_t html_len = KONTRX_HTML_LEN;
 
     printf("[HTTP] Streaming gzipped web asset directly from MCU Flash: %lu bytes\r\n", (unsigned long)html_len);
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
+    char hdr[384]; /* ~320 B of headers; a truncated block loses the blank line */
+    int hdr_len = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Encoding: gzip\r\n"
@@ -1563,43 +1599,25 @@ static void Stream_Web_Asset(uint8_t sn) {
         "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Pragma: no-cache\r\n"
         "Expires: 0\r\n"
+        "X-Frame-Options: DENY\r\n"
+        "X-Content-Type-Options: nosniff\r\n"
+        "Referrer-Policy: no-referrer\r\n"
         "Connection: close\r\n"
         "\r\n",
         (unsigned long)html_len);
-    send(sn, (uint8_t *)hdr, (uint16_t)strlen(hdr));
+    if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr)) return;
+    send(sn, (uint8_t *)hdr, (uint16_t)hdr_len);
 
     /* Stream gzipped KONTRX_HTML directly from internal MCU Flash memory. */
     Send_Chunked(sn, KONTRX_HTML, html_len);
     printf("[HTTP] Stream complete: %lu bytes sent.\r\n", (unsigned long)html_len);
 }
 
-static void Extract_Origin_Header(const char *req, char *out, size_t maxlen) {
-    out[0] = '\0';
-    const char *p = strstr(req, "Origin: ");
-    if (!p) p = strstr(req, "origin: ");
-    if (p) {
-        p += 8;
-        size_t i = 0;
-        while (i < maxlen - 1 && p[i] != '\r' && p[i] != '\n' && p[i] != '\0') {
-            out[i] = p[i];
-            i++;
-        }
-        out[i] = '\0';
-    }
-}
-
+/* Same-origin only: no CORS headers are sent, so browsers block every
+ * cross-site read and preflighted write. Native clients are unaffected. */
 static void Build_CORS_Headers(const char *req, char *out_cors, size_t maxlen) {
-    char origin[64] = {0};
-    Extract_Origin_Header(req, origin, sizeof(origin));
-    if (origin[0]) {
-        snprintf(out_cors, maxlen,
-            "Access-Control-Allow-Origin: %s\r\n"
-            "Access-Control-Allow-Credentials: true\r\n",
-            origin);
-    } else {
-        snprintf(out_cors, maxlen,
-            "Access-Control-Allow-Origin: *\r\n");
-    }
+    (void)req;
+    if (maxlen) out_cors[0] = '\0';
 }
 
 /* Value of the Content-Length header (any letter case), or -1 if absent.
@@ -1624,6 +1642,15 @@ static int Find_Content_Length(const char *req, const char *hdr_end) {
 /* ======================================================================
  *  Request dispatcher
  * ====================================================================== */
+/* Routes reachable without a session: the lockdown screen must be able
+ * to show SD status and unlock with the admin password, and OTA/monitoring
+ * tools need firmware version and uptime (GET /api/ping). */
+static uint8_t Is_Public_Route(const char *line) {
+    return (uint8_t)(strncmp(line, "GET /api/ping", 13) == 0 ||
+                     strncmp(line, "GET /api/sdcard/status", 22) == 0 ||
+                     strncmp(line, "POST /api/sdcard/unlock", 23) == 0);
+}
+
 static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     if (len >= RX_BUF_SIZE) len = RX_BUF_SIZE - 1;
     req[len] = '\0';
@@ -1643,16 +1670,9 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
     /* OPTIONS check for CORS pre-flight requests */
     if (strncmp(line, "OPTIONS ", 8) == 0) {
-        char cors_part[128];
-        Build_CORS_Headers(line, cors_part, sizeof(cors_part));
-        char cors_hdr[320];
-        snprintf(cors_hdr, sizeof(cors_hdr),
-            "HTTP/1.1 200 OK\r\n"
-            "%s"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token, Cookie\r\n"
-            "Connection: close\r\n\r\n", cors_part);
-        send(sn, (uint8_t *)cors_hdr, (uint16_t)strlen(cors_hdr));
+        /* No Access-Control-Allow-* headers: cross-origin preflights fail. */
+        const char *r204 = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+        send(sn, (uint8_t *)r204, (uint16_t)strlen(r204));
         return;
     }
 
@@ -1721,13 +1741,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         if (strcmp(u, s_http_cfg_temp.admin_username) == 0 && strcmp(p, s_http_cfg_temp.admin_password) == 0) {
             s_login_fail_count = 0;
-            Generate_Session_Token(s_session_token, sizeof(s_session_token));
+            const char *token = Session_Create();
             char cors_str[128];
             Build_CORS_Headers(line, cors_str, sizeof(cors_str));
             const char *body_fmt = "{\"ok\":true,\"token\":\"%s\",\"username\":\"%s\"}";
             char body_json[128];
             int b_len = snprintf(body_json, sizeof(body_json), body_fmt,
-                                 s_session_token, s_http_cfg_temp.admin_username);
+                                 token, s_http_cfg_temp.admin_username);
             if (b_len >= (int)sizeof(body_json)) b_len = (int)sizeof(body_json) - 1;
             char resp[512];
             int r_len = snprintf(resp, sizeof(resp),
@@ -1736,7 +1756,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 "Content-Length: %d\r\n"
                 "%s"
                 "Set-Cookie: kx_session=%s; Path=/; SameSite=Strict; HttpOnly\r\n"
-                "Connection: close\r\n\r\n%s", b_len, cors_str, s_session_token, body_json);
+                "Connection: close\r\n\r\n%s", b_len, cors_str, token, body_json);
             if (r_len >= (int)sizeof(resp)) r_len = (int)sizeof(resp) - 1;
             send(sn, (uint8_t *)resp, (uint16_t)r_len);
             Log_Event("AUTH", "User logged in successfully");
@@ -1766,7 +1786,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/auth/logout  → Clear active session
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/auth/logout", 21) == 0) {
-        s_session_token[0] = '\0';
+        int slot = Session_Find(line);
+        if (slot >= 0) s_sessions[slot].token[0] = '\0';
         char cors_str[128];
         Build_CORS_Headers(line, cors_str, sizeof(cors_str));
         const char *body_out = "{\"ok\":true}";
@@ -1806,7 +1827,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         Get_Shared_Config(&s_http_cfg_temp);
         if (strcmp(cur_p, s_http_cfg_temp.admin_password) != 0 &&
             (s_http_cfg_temp.master_password[0] == '\0' || strcmp(cur_p, s_http_cfg_temp.master_password) != 0)) {
-            const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Current password is incorrect\"}";
+            const char *err = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"ok\":false,\"error\":\"Current password is incorrect\"}";
             send(sn, (uint8_t *)err, strlen(err));
             return;
         }
@@ -1825,7 +1846,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         s_http_cfg_temp.magic = CONFIG_MAGIC_CURRENT;
         Update_Shared_Config(&s_http_cfg_temp);
         Safe_Write_Config_To_Flash(&s_http_cfg_temp, "admin_auth");
-        Generate_Session_Token(s_session_token, sizeof(s_session_token));
+        Session_ClearAll(); /* new credentials: every session logs in again */
         Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         Log_Event("AUTH", "Admin credentials updated");
         return;
@@ -1862,29 +1883,27 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
-     * Protected API Gatekeeper:
-     * Restrict sensitive configuration writes & firmware updates to authenticated sessions.
-     * Note: POST /api/provision is exempt so mobile onboarding/provisioning can configure MQTT.
-     * Note: POST /api/rules is TEMPORARILY exempt for desktop configurator uploads.
-     *       TODO: Re-enable auth for /api/rules once configurator sends session tokens.
+     * Default-deny API Gatekeeper:
+     * Every POST and every "GET /api/..." needs a valid session, except the
+     * few routes in Is_Public_Route(). Login, logout and page routes are
+     * answered above this point.
      * ----------------------------------------------------------------- */
-    if ((strncmp(line, "POST /api/config/", 17) == 0 && strncmp(line, "POST /api/config/provision", 26) != 0) ||
-        strncmp(line, "POST /api/auth/change_password", 30) == 0 ||
-        strncmp(line, "POST /api/relay", 15) == 0 ||
-        /* strncmp(line, "POST /api/rules", 15) == 0 || */  /* TEMPORARILY DISABLED — configurator auth bypass */
-        strncmp(line, "POST /api/pto", 13) == 0 ||
-        strncmp(line, "POST /api/pwm", 13) == 0 ||
-        strncmp(line, "POST /api/analog", 16) == 0 ||
-        strncmp(line, "POST /api/modbus", 16) == 0 ||
-        strncmp(line, "POST /api/provision/delete", 26) == 0 ||
-        strncmp(line, "POST /api/provision/manual", 26) == 0 ||
-        strncmp(line, "POST /api/queue/clear", 21) == 0 ||
-        strncmp(line, "POST /api/time", 14) == 0 ||
-        strncmp(line, "POST /api/debug/", 16) == 0) {
-        if (!Is_Session_Valid(line)) {
-            Send_Response(sn, HTTP_401, NULL);
-            return;
-        }
+    if ((strncmp(line, "POST ", 5) == 0 || strncmp(line, "GET /api/", 9) == 0) &&
+        !Is_Public_Route(line) && !Is_Session_Valid(line)) {
+        Send_Response(sn, HTTP_401, NULL);
+        return;
+    }
+
+    /* -----------------------------------------------------------------
+     * GET /api/ping  (public) -> {"fw":"x.y.z","uptime_s":N}
+     * Liveness and reboot detection only; nothing else is exposed.
+     * ----------------------------------------------------------------- */
+    if (strncmp(line, "GET /api/ping", 13) == 0) {
+        char ping[64];
+        snprintf(ping, sizeof(ping), "{\"fw\":\"" FW_VERSION "\",\"uptime_s\":%lu}",
+                 (unsigned long)g_uptime_seconds);
+        Send_Response(sn, HTTP_200_JSON, ping);
+        return;
     }
 
     /* -----------------------------------------------------------------
@@ -1946,9 +1965,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n\r\n", pos);
         send(sn, (uint8_t *)if_hdr, (uint16_t)strlen(if_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
@@ -1979,9 +1995,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n\r\n", pos);
         send(sn, (uint8_t *)pto_hdr, (uint16_t)strlen(pto_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
@@ -2083,9 +2096,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n\r\n", pos);
         send(sn, (uint8_t *)pwm_hdr, (uint16_t)strlen(pwm_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
@@ -2151,9 +2161,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n\r\n", pos);
         send(sn, (uint8_t *)an_hdr, (uint16_t)strlen(an_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)pos);
@@ -2227,9 +2234,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             n);
@@ -2256,9 +2260,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             pos);
@@ -2334,9 +2335,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             pos);
@@ -2362,9 +2360,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %lu\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             (unsigned long)layout_len);
@@ -2513,9 +2508,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             pos);
@@ -2804,9 +2796,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             resp_len);
@@ -2833,9 +2822,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             n);
@@ -2865,7 +2851,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
             "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n"
             "\r\n",
             n);
@@ -2986,7 +2971,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n", n);
         send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
         Send_Chunked(sn, (const uint8_t *)tx_buf, (uint32_t)n);
@@ -3013,7 +2997,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 "Content-Type: application/json; charset=utf-8\r\n"
                 "Content-Disposition: attachment; filename=\"%s\"\r\n"
                 "Content-Length: %d\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n",
                 fname, n);
             send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
@@ -3031,7 +3014,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 "Content-Type: text/plain; charset=utf-8\r\n"
                 "Content-Disposition: attachment; filename=\"%s\"\r\n"
                 "Content-Length: %d\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n\r\n",
                 fname, n);
             send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
@@ -3048,7 +3030,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: text/plain; charset=utf-8\r\n"
             "Content-Disposition: attachment; filename=\"%s\"\r\n"
             "Content-Length: %lu\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n",
             fname, (unsigned long)dl_size);
         send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
@@ -3076,7 +3057,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n\r\n",
             n);
         send(sn, (uint8_t *)sd_hdr, (uint16_t)strlen(sd_hdr));
@@ -3154,7 +3134,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n\r\n";
+            "\r\n";
         send(sn, (uint8_t *)sse_hdr, (uint16_t)strlen(sse_hdr));
         char init_ev[256];
         snprintf(init_ev, sizeof(init_ev),
@@ -3402,9 +3382,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %d\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type\r\n"
             "Connection: close\r\n"
             "\r\n",
             (int)strlen(api_resp));
@@ -4062,11 +4039,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         char otp[64] = {0};
         JSON_ReadStr(body, "otp", otp, sizeof(otp));
 
-        if (strcmp(otp, OTA_OTP_SECRET) == 0) {
+        int slot = Session_Find(line);
+        if (slot >= 0 && strcmp(otp, OTA_OTP_SECRET) == 0) {
             ota_otp_validated = 1;
+            s_ota_otp_slot = slot;
+            s_ota_otp_tick = xTaskGetTickCount();
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":true}");
         } else {
             ota_otp_validated = 0;
+            s_ota_otp_slot = -1;
             Send_Response(sn, HTTP_200_JSON, "{\"ok\":false}");
         }
         return;
@@ -4078,12 +4059,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * POST /api/ota/prepare  → Erase staging sectors for OTA
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/ota/prepare", 21) == 0) {
-        if (!ota_otp_validated) {
+        if (!Ota_Otp_Ok(line)) {
             /* Even for authenticated session (Is_Session_Valid), OTP validation is required */
             Send_Response(sn, HTTP_401, "{\"error\":\"Unauthorized: OTA OTP not verified\"}");
             return;
         }
-        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{\"status\":\"preparing\"}";
+        const char *resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"preparing\"}";
         send(sn, (uint8_t *)resp, strlen(resp));
         
         /* Give W5500 and TCP stack 100ms to transmit the HTTP response
@@ -4129,7 +4110,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         g_ota_in_progress = 1;
         osDelay(100);
 
-        if (!ota_otp_validated) {
+        if (!Ota_Otp_Ok(line)) {
             /* Even for authenticated session (Is_Session_Valid), OTP validation is required */
             Send_Response(sn, HTTP_401, "{\"error\":\"OTA OTP not validated\"}");
             g_ota_in_progress = 0;
@@ -4224,13 +4205,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Log_Event("OTA", "Firmware upload incomplete or aborted.");
             const char *resp = "HTTP/1.1 500 Internal Server Error\r\n"
                                "Content-Type: application/json\r\n"
-                               "Access-Control-Allow-Origin: *\r\n"
                                "Connection: close\r\n\r\n"
                                "{\"ok\":false,\"error\":\"OTA INCOMPLETE\"}";
             send(sn, (uint8_t *)resp, strlen(resp));
             g_ota_in_progress = 0;
             disconnect(sn);
             ota_otp_validated = 0;
+            s_ota_otp_slot = -1;
             return;
         }
 
@@ -4244,7 +4225,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Log_Event("OTA", "Firmware upload successful. Device is rebooting...");
             const char *resp = "HTTP/1.1 200 OK\r\n"
                                "Content-Type: application/json\r\n"
-                               "Access-Control-Allow-Origin: *\r\n"
                                "Connection: close\r\n\r\n"
                                "{\"ok\":true,\"status\":\"OTA OK. Rebooting...\"}";
             send(sn, (uint8_t *)resp, strlen(resp));
@@ -4253,7 +4233,6 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             Log_Event("OTA", "Firmware upload failed (CRC check failed).");
             const char *resp = "HTTP/1.1 500 Internal Server Error\r\n"
                                "Content-Type: application/json\r\n"
-                               "Access-Control-Allow-Origin: *\r\n"
                                "Connection: close\r\n\r\n"
                                "{\"ok\":false,\"error\":\"OTA CRC FAIL\"}";
             send(sn, (uint8_t *)resp, strlen(resp));
@@ -4263,6 +4242,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         disconnect(sn);
         ota_otp_validated  = 0; /* Reset OTP after use */
+        s_ota_otp_slot     = -1;
         return;
     }
 
@@ -4460,7 +4440,7 @@ void Task_HTTPServer(void *arg) {
                                     /* Body larger than rx_buf: processing a cut copy could
                                      * save half a config or rule set, so refuse it. */
                                     Send_Response(sn, "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\n"
-                                                      "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                                                      "Connection: close\r\n\r\n",
                                                   "{\"ok\":false,\"error\":\"Request body too large\"}");
                                     Log_Event("SYS", "HTTP: request body too large, rejected (413)");
                                     total = 0;

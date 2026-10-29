@@ -62,11 +62,16 @@ function Split-Response([string]$raw) {
     return @{ Code = $code; Body = $body; Raw = $raw }
 }
 
+# fw + uptime_s. GET /api/ping is public on firmware with default-deny auth;
+# older firmware only has the then-public /api/status.
 function Get-BoardStatus {
-    try {
-        $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://$Ip/api/status"
-        return ($r.Content | ConvertFrom-Json)
-    } catch { return $null }
+    foreach ($path in '/api/ping', '/api/status') {
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://$Ip$path"
+            return ($r.Content | ConvertFrom-Json)
+        } catch { }
+    }
+    return $null
 }
 
 # ---- 1. Check the image ----
@@ -152,5 +157,5 @@ while ((Get-Date) -lt $deadline) {
     if ($st -and [int64]$st.uptime_s -lt [int64]$before.uptime_s -and [int64]$st.uptime_s -lt 600) { $after = $st; break }
 }
 if (-not $after) { throw 'Controller did not report a fresh boot within 120 s. Check it before retrying.' }
-Write-Host "[SUCCESS] Controller back: fw $($after.fw), uptime $($after.uptime_s) s, heap_free $($after.sys.heap_free)"
+Write-Host "[SUCCESS] Controller back: fw $($after.fw), uptime $($after.uptime_s) s"
 Write-Host "OTA_RESULT ok sha256=$sha"

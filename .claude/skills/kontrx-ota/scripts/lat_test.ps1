@@ -1,5 +1,8 @@
 param([int]$N = 300)
 $B = '192.168.1.200'
+# HTTP checks need the session saved by login.ps1.
+. (Join-Path $PSScriptRoot 'session.ps1')
+$H = Get-AuthHeaders
 function Pct($v, $name) {
   $s = $v | Sort-Object; $n = $s.Count
   "{0}: n={1} min={2:N1} p50={3:N1} p95={4:N1} p99={5:N1} max={6:N1} ms" -f $name, $n, $s[0], $s[[int]($n/2)], $s[[int]($n*0.95)-1], $s[[int]($n*0.99)-1], $s[$n-1]
@@ -21,16 +24,16 @@ ModbusRun $N 'modbus_idle'
 $lat = New-Object System.Collections.Generic.List[double]
 for ($i = 0; $i -lt 30; $i++) {
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "http://$B/api/status"
+  $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 -Headers $H "http://$B/api/status"
   $lat.Add($sw.Elapsed.TotalMilliseconds)
 }
 (Pct $lat 'http_status') + " bytes=" + $r.RawContentLength
 # Concurrent: log pages (flash reads under sdMutex) while Modbus TCP runs
-$job = Start-Job -ScriptBlock { param($B) $t = New-Object System.Collections.Generic.List[double]
-  for ($k = 0; $k -lt 8; $k++) { $sw = [Diagnostics.Stopwatch]::StartNew(); try { $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 "http://$B/api/logs?limit=50&offset=$($k*50)" } catch {}; $t.Add($sw.Elapsed.TotalMilliseconds) }
-  $t } -ArgumentList $B
+$job = Start-Job -ScriptBlock { param($B, $H) $t = New-Object System.Collections.Generic.List[double]
+  for ($k = 0; $k -lt 8; $k++) { $sw = [Diagnostics.Stopwatch]::StartNew(); try { $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 20 -Headers $H "http://$B/api/logs?limit=50&offset=$($k*50)" } catch {}; $t.Add($sw.Elapsed.TotalMilliseconds) }
+  $t } -ArgumentList $B, $H
 ModbusRun $N 'modbus_during_logs'
 $t = Receive-Job $job -Wait; Remove-Job $job
 Pct $t 'http_logs_page'
-$j = (Invoke-WebRequest -UseBasicParsing "http://$B/api/status").Content | ConvertFrom-Json
+$j = (Invoke-WebRequest -UseBasicParsing -Headers $H "http://$B/api/status").Content | ConvertFrom-Json
 "sys: cpu=$($j.sys.cpu_pct) heap_free=$($j.sys.heap_free) fw=$($j.fw) uptime=$($j.uptime_s)"
