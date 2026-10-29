@@ -158,7 +158,7 @@ class TestAuthGatekeeper:
     def test_config_requires_auth(self):
         c = read_c_file()
         gk = self._gate(c)
-        assert 'strncmp(line, "POST ", 5) == 0' in gk and "Is_Session_Valid" in gk
+        assert 'strncmp(line, "POST ", 5) == 0' in gk and "Session_Find(line)" in gk
         assert "POST /api/config" not in self._public(c)
 
     def test_relay_requires_auth(self):

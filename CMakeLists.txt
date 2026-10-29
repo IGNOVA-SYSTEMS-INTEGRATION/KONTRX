@@ -28,6 +28,7 @@ set(MCAL_SOURCES
     MCAL/STM32F4/spi_stm32.c
     MCAL/STM32F4/flash_stm32.c
     MCAL/STM32F4/rtc_stm32.c
+    MCAL/STM32F4/rng_stm32.c
     HAL/w25q16.c
     HAL/flash_partition.c
     HAL/safe_fmt.c

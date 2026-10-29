@@ -2,8 +2,9 @@
 .SYNOPSIS
   Kontrx OTA uploader for Windows PowerShell 5.1 (no Python needed).
   Run it yourself on a machine on the controller's LAN. It prompts for the
-  admin password and the OTA OTP; neither is stored or passed on the
-  command line.
+  admin password (used for login and, on current firmware, the OTA
+  step-up check) and, only for older firmware, the OTA OTP. Nothing is
+  stored or passed on the command line.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File ota_upload.ps1 -BinPath .\KontrxRTOS.bin
@@ -98,24 +99,33 @@ if ($answer -ne 'FLASH') { Write-Host 'Cancelled.'; exit 2 }
 # ---- 2. Authenticate ----
 $password = Read-Secret "Password for '$Username'"
 $loginBody = [Text.Encoding]::UTF8.GetBytes((@{ username = $Username; password = $password } | ConvertTo-Json -Compress))
-$password = $null
 $r = Invoke-RawPost '/api/auth/login' @{ 'Content-Type' = 'application/json' } $loginBody 5000
 $loginBody = $null
-if ($r.Code -ne 200) { throw "Login failed (HTTP $($r.Code)): $($r.Body)" }
-$token = ($r.Body | ConvertFrom-Json).token
-if (-not $token) { throw 'Login returned no session token.' }
+if ($r.Code -ne 200) { $password = $null; throw "Login failed (HTTP $($r.Code)): $($r.Body)" }
+$login = $r.Body | ConvertFrom-Json
+$token = $login.token
+if (-not $token) { $password = $null; throw 'Login returned no session token.' }
+if ($login.must_change) { $password = $null; throw 'Factory password still set: change it in the web UI, then retry.' }
 $cookie = @{ 'Cookie' = "kx_session=$token" }
 Write-Host '[+] Logged in.'
 
-# ---- 3. Verify OTP ----
-$otp = Read-Secret 'OTA OTP'
-$otpBody = [Text.Encoding]::UTF8.GetBytes((@{ otp = $otp } | ConvertTo-Json -Compress))
-$otp = $null
+# ---- 3. OTA step-up ----
+# Current firmware re-checks the admin password. Older firmware ignores it
+# and answers 200 {"ok":false}; only then ask for its OTP.
 $h = @{ 'Content-Type' = 'application/json'; 'Cookie' = "kx_session=$token" }
-$r = Invoke-RawPost '/api/ota/verify' $h $otpBody 4000
-$otpBody = $null
-if ($r.Code -ne 200 -or $r.Body -notmatch '"ok":true') { throw "OTP rejected (HTTP $($r.Code)): $($r.Body)" }
-Write-Host '[+] OTP accepted.'
+$vBody = [Text.Encoding]::UTF8.GetBytes((@{ password = $password } | ConvertTo-Json -Compress))
+$password = $null
+$r = Invoke-RawPost '/api/ota/verify' $h $vBody 4000
+$vBody = $null
+if ($r.Code -eq 200 -and $r.Body -match '"ok":false') {
+    $otp = Read-Secret 'OTA OTP (older firmware)'
+    $vBody = [Text.Encoding]::UTF8.GetBytes((@{ otp = $otp } | ConvertTo-Json -Compress))
+    $otp = $null
+    $r = Invoke-RawPost '/api/ota/verify' $h $vBody 4000
+    $vBody = $null
+}
+if ($r.Code -ne 200 -or $r.Body -notmatch '"ok":true') { throw "OTA step-up rejected (HTTP $($r.Code)): $($r.Body)" }
+Write-Host '[+] OTA step-up accepted.'
 
 # ---- 4. Erase staging flash ----
 $r = Invoke-RawPost '/api/ota/prepare' $cookie $null 8000

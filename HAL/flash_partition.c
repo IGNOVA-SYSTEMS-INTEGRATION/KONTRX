@@ -229,8 +229,11 @@ static uint8_t Sanitize_Config(Gateway_Config_t *cfg) {
         strncpy(cfg->admin_password, "adminkontrx", sizeof(cfg->admin_password) - 1);
         changed = 1;
     }
-    if (cfg->master_password[0] == '\0') {
-        strncpy(cfg->master_password, "KontrxMaster2026", sizeof(cfg->master_password) - 1);
+    /* Older firmware filled an empty master password with a value shared
+     * by every unit. Clear it: the master stays unset until the admin sets
+     * one (SEC-02). */
+    if (strcmp(cfg->master_password, "KontrxMaster2026") == 0) {
+        memset(cfg->master_password, 0, sizeof(cfg->master_password));
         changed = 1;
     }
     if (cfg->provision_status[0] == '\0') {

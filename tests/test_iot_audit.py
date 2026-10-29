@@ -59,23 +59,43 @@ def open_finding(reason):
 
 # ---------------------------------------------------------------- Security
 class TestSecurity:
-    @open_finding("SEC-02: SD unlock accepts hardcoded adminkontrx/KontrxMaster2026 even after password change")
     def test_sec02_no_backdoor_passwords_in_sd_unlock(self):
         body = func_body(SDCARD, "uint8_t SDCard_UnlockWithPassword")
         assert '"KontrxMaster2026"' not in body and 'strcmp(pwd, "adminkontrx")' not in body
 
-    @open_finding("SEC-02: OTA OTP is a fixed compile-time string")
     def test_sec02_ota_otp_not_hardcoded(self):
-        assert not re.search(r'#define\s+OTA_OTP_SECRET\s+"', HTTP)
+        assert "OTA_OTP_SECRET" not in HTTP and "KontrxOTA2026" not in HTTP + WEB
 
-    @open_finding("SEC-05: session token from LCG of tick/DWT, hardware RNG unused")
+    def test_sec02_ota_step_up_uses_admin_password(self):
+        i = HTTP.find('strncmp(line, "POST /api/ota/verify", 20) == 0')
+        block = HTTP[i:i + 2000]
+        assert 'JSON_ReadStr(body, "password"' in block and "admin_password" in block
+        assert "s_login_lockout_until" in block
+
+    def test_sec02_no_shared_master_default(self):
+        for rel in ("APP/main_kontrx.c", "HAL/modbus_dma.c", "HAL/sdcard.c"):
+            assert "KontrxMaster2026" not in src(rel), rel
+        # flash_partition.c may only name it to clear it on old configs.
+        fp = src("HAL/flash_partition.c")
+        assert fp.count("KontrxMaster2026") == 1 and "memset(cfg->master_password" in fp
+
     def test_sec05_session_token_uses_hw_rng(self):
-        body = func_body(HTTP, "static void Generate_Session_Token")
-        assert "RNG" in body
+        body = func_body(HTTP, "static uint8_t Generate_Session_Token")
+        assert body.count("RNG_Read32") == 1 and "xTaskGetTickCount" not in body
+        assert "MCAL/STM32F4/rng_stm32.c" in src("CMakeLists.txt")
+        assert "RNG_Init();" in src("APP/main_kontrx.c")
 
-    @open_finding("SEC-05: session has no expiry / idle timeout")
     def test_sec05_session_expiry(self):
-        assert re.search(r"SESSION_(TIMEOUT|EXPIRY|TTL)", HTTP)
+        assert re.search(r"#define\s+SESSION_IDLE_MS\s+\(30UL \* 60UL \* 1000UL\)", HTTP)
+        assert re.search(r"#define\s+SESSION_MAX_AGE_MS\s+\(12UL \* 60UL \* 60UL \* 1000UL\)", HTTP)
+        body = func_body(HTTP, "static int Session_Find")
+        assert "SESSION_IDLE_MS" in body and "SESSION_MAX_AGE_MS" in body
+
+    def test_sec01_factory_password_forces_change(self):
+        assert "must_change" in func_body(HTTP, "static const char *Session_Create")
+        i = HTTP.find("Default-deny API Gatekeeper")
+        assert "password_change_required" in HTTP[i:i + 1500]
+        assert "MIN_PASSWORD_LEN" in HTTP and "forcePasswordChange" in WEB
 
     def test_sec06_login_lockout_exists(self):
         assert "LOGIN_MAX_ATTEMPTS" in HTTP and "s_login_lockout_until" in HTTP
@@ -91,7 +111,7 @@ class TestSecurity:
         i = HTTP.find("Default-deny API Gatekeeper")
         gate = HTTP[i:i + 900]
         assert i >= 0 and 'strncmp(line, "POST ", 5) == 0' in gate
-        assert 'strncmp(line, "GET /api/", 9) == 0' in gate and "Is_Session_Valid" in gate
+        assert 'strncmp(line, "GET /api/", 9) == 0' in gate and "Session_Find(line)" in gate
 
     def test_sec09_public_routes_minimal(self):
         body = func_body(HTTP, "static uint8_t Is_Public_Route")

@@ -32,6 +32,7 @@
 #include "flash_partition.h"
 #include "flash_stm32.h"
 #include "rtc_stm32.h"
+#include "rng_stm32.h"
 #include "stm32f407_regs.h"
 #include "gpio_stm32.h"
 #include "socket.h"
@@ -74,7 +75,6 @@ osSemaphoreId_t   sem_ota_done  = NULL;
 static const uint8_t s_http_socks[HTTP_NUM_SOCKS] = {0, 3, 6};
 #define RX_BUF_SIZE      12288U  /* Sized to fit full rulesets with canvas layout JSON */
 
-#define OTA_OTP_SECRET   "KontrxOTA2026"
 #define STAGING_ADDR     0x08040000U
 
 extern volatile uint32_t g_uptime_seconds;
@@ -166,9 +166,17 @@ static void ParseQueryStringParam(const char *line, const char *param_name, char
  * A new login takes a free slot, else evicts the least recently used one. */
 #define SESSION_SLOTS        4
 #define SESSION_TOKEN_SIZE   42
+#define SESSION_IDLE_MS      (30UL * 60UL * 1000UL)        /* 30 min unused */
+#define SESSION_MAX_AGE_MS   (12UL * 60UL * 60UL * 1000UL) /* 12 h after login */
+/* Factory password: still accepted for the first login, but that session
+ * may only change it (SEC-01). */
+#define DEFAULT_ADMIN_PASSWORD  "adminkontrx"
+#define MIN_PASSWORD_LEN        8
 typedef struct {
     char     token[SESSION_TOKEN_SIZE];
+    uint32_t created;     /* tick of the login */
     uint32_t last_used;   /* tick of the last request that used it */
+    uint8_t  must_change; /* logged in with the factory password */
 } Session_t;
 static Session_t s_sessions[SESSION_SLOTS] = {0};
 static uint8_t  s_login_fail_count = 0;
@@ -176,17 +184,17 @@ static uint32_t s_login_lockout_until = 0;
 #define LOGIN_MAX_ATTEMPTS   5
 #define LOGIN_LOCKOUT_SEC   30
 
-static void Generate_Session_Token(char *out, size_t maxlen) {
-    volatile uint32_t *dwt_cyccnt = (volatile uint32_t *)0xE0001004U;
-    uint32_t t = xTaskGetTickCount();
-    uint32_t cyc = *dwt_cyccnt;
-    uint32_t r1 = (t * 1103515245U + 12345U) ^ cyc;
-    uint32_t r2 = (cyc * 214013U + 2531011U) ^ (uint32_t)g_uptime_seconds;
-    uint32_t r3 = r1 ^ (r2 << 13) ^ (t >> 7);
-    uint32_t r4 = (r2 * 16807U) ^ (r1 >> 3) ^ cyc;
+/* 128 random bits from the hardware RNG. Returns 0 (and an empty token)
+ * if the RNG fails: a predictable fallback would defeat the purpose. */
+static uint8_t Generate_Session_Token(char *out, size_t maxlen) {
+    uint32_t r[4];
+    for (int i = 0; i < 4; i++) {
+        if (!RNG_Read32(&r[i])) { out[0] = '\0'; return 0; }
+    }
     snprintf(out, maxlen, "kx%08lx%08lx%08lx%08lx",
-             (unsigned long)r1, (unsigned long)r2,
-             (unsigned long)r3, (unsigned long)r4);
+             (unsigned long)r[0], (unsigned long)r[1],
+             (unsigned long)r[2], (unsigned long)r[3]);
+    return 1;
 }
 
 /* Slot of the session token carried by the request (cookie, Bearer or
@@ -204,7 +212,13 @@ static int Session_Find(const char *req) {
             char end = c[n];
             if ((end >= '0' && end <= '9') || (end >= 'a' && end <= 'z') ||
                 (end >= 'A' && end <= 'Z')) continue;
-            s_sessions[i].last_used = xTaskGetTickCount();
+            uint32_t now = xTaskGetTickCount();
+            if ((now - s_sessions[i].last_used) >= pdMS_TO_TICKS(SESSION_IDLE_MS) ||
+                (now - s_sessions[i].created) >= pdMS_TO_TICKS(SESSION_MAX_AGE_MS)) {
+                memset(&s_sessions[i], 0, sizeof(s_sessions[i]));  /* expired */
+                continue;
+            }
+            s_sessions[i].last_used = now;
             return i;
         }
     }
@@ -215,15 +229,19 @@ static uint8_t Is_Session_Valid(const char *req) {
     return (uint8_t)(Session_Find(req) >= 0);
 }
 
-/* Issues a new session token and returns it. */
-static const char *Session_Create(void) {
+/* Issues a new session token and returns it, or NULL if the RNG failed. */
+static const char *Session_Create(uint8_t must_change) {
     int slot = 0;
     for (int i = 0; i < SESSION_SLOTS; i++) {
         if (s_sessions[i].token[0] == '\0') { slot = i; break; }
         if (s_sessions[i].last_used < s_sessions[slot].last_used) slot = i;
     }
-    Generate_Session_Token(s_sessions[slot].token, sizeof(s_sessions[slot].token));
-    s_sessions[slot].last_used = xTaskGetTickCount();
+    memset(&s_sessions[slot], 0, sizeof(s_sessions[slot]));
+    if (!Generate_Session_Token(s_sessions[slot].token, sizeof(s_sessions[slot].token)))
+        return NULL;
+    s_sessions[slot].created     = xTaskGetTickCount();
+    s_sessions[slot].last_used   = s_sessions[slot].created;
+    s_sessions[slot].must_change = must_change;
     return s_sessions[slot].token;
 }
 
@@ -1736,18 +1754,26 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             strncpy(s_http_cfg_temp.admin_username, "admin", sizeof(s_http_cfg_temp.admin_username));
         }
         if (s_http_cfg_temp.admin_password[0] == '\0') {
-            strncpy(s_http_cfg_temp.admin_password, "adminkontrx", sizeof(s_http_cfg_temp.admin_password));
+            strncpy(s_http_cfg_temp.admin_password, DEFAULT_ADMIN_PASSWORD, sizeof(s_http_cfg_temp.admin_password));
         }
 
         if (strcmp(u, s_http_cfg_temp.admin_username) == 0 && strcmp(p, s_http_cfg_temp.admin_password) == 0) {
             s_login_fail_count = 0;
-            const char *token = Session_Create();
+            uint8_t must_change = (uint8_t)(strcmp(s_http_cfg_temp.admin_password, DEFAULT_ADMIN_PASSWORD) == 0);
+            const char *token = Session_Create(must_change);
+            if (!token) {
+                Send_Response(sn, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                              "{\"ok\":false,\"error\":\"Random number generator failure\"}");
+                Log_Event("AUTH", "Login refused: hardware RNG failure");
+                return;
+            }
             char cors_str[128];
             Build_CORS_Headers(line, cors_str, sizeof(cors_str));
-            const char *body_fmt = "{\"ok\":true,\"token\":\"%s\",\"username\":\"%s\"}";
-            char body_json[128];
+            const char *body_fmt = "{\"ok\":true,\"token\":\"%s\",\"username\":\"%s\",\"must_change\":%s}";
+            char body_json[160];
             int b_len = snprintf(body_json, sizeof(body_json), body_fmt,
-                                 token, s_http_cfg_temp.admin_username);
+                                 token, s_http_cfg_temp.admin_username,
+                                 must_change ? "true" : "false");
             if (b_len >= (int)sizeof(body_json)) b_len = (int)sizeof(body_json) - 1;
             char resp[512];
             int r_len = snprintf(resp, sizeof(resp),
@@ -1835,6 +1861,15 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             strncpy(s_http_cfg_temp.admin_username, new_u, sizeof(s_http_cfg_temp.admin_username) - 1);
             s_http_cfg_temp.admin_username[sizeof(s_http_cfg_temp.admin_username) - 1] = '\0';
         }
+        int slot = Session_Find(line);
+        uint8_t forced = (uint8_t)(slot >= 0 && s_sessions[slot].must_change);
+        if ((forced && new_p[0] == '\0') ||
+            (new_p[0] != '\0' && (strlen(new_p) < MIN_PASSWORD_LEN ||
+                                  strcmp(new_p, DEFAULT_ADMIN_PASSWORD) == 0))) {
+            Send_Response(sn, "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                          "{\"ok\":false,\"error\":\"New password must be at least 8 characters and not the factory default\"}");
+            return;
+        }
         if (new_p[0] != '\0') {
             strncpy(s_http_cfg_temp.admin_password, new_p, sizeof(s_http_cfg_temp.admin_password) - 1);
             s_http_cfg_temp.admin_password[sizeof(s_http_cfg_temp.admin_password) - 1] = '\0';
@@ -1889,9 +1924,18 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
      * answered above this point.
      * ----------------------------------------------------------------- */
     if ((strncmp(line, "POST ", 5) == 0 || strncmp(line, "GET /api/", 9) == 0) &&
-        !Is_Public_Route(line) && !Is_Session_Valid(line)) {
-        Send_Response(sn, HTTP_401, NULL);
-        return;
+        !Is_Public_Route(line)) {
+        int slot = Session_Find(line);
+        if (slot < 0) {
+            Send_Response(sn, HTTP_401, NULL);
+            return;
+        }
+        /* Change-password, logout and auth/me are answered above. */
+        if (s_sessions[slot].must_change) {
+            Send_Response(sn, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                          "{\"ok\":false,\"error\":\"password_change_required\"}");
+            return;
+        }
     }
 
     /* -----------------------------------------------------------------
@@ -4029,18 +4073,28 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
     }
 
     /* -----------------------------------------------------------------
-     * POST /api/ota/verify  → validate OTP
+     * POST /api/ota/verify {"password":"..."}  → step-up: the logged-in
+     * admin re-enters the admin password. Shares the login lockout.
      * ----------------------------------------------------------------- */
     if (strncmp(line, "POST /api/ota/verify", 20) == 0) {
         char *body = strstr(line, "\r\n\r\n");
         if (!body) { Send_Response(sn, HTTP_400, NULL); return; }
         body += 4;
 
-        char otp[64] = {0};
-        JSON_ReadStr(body, "otp", otp, sizeof(otp));
+        uint32_t now_sec = g_uptime_seconds;
+        if (s_login_fail_count >= LOGIN_MAX_ATTEMPTS && now_sec < s_login_lockout_until) {
+            Send_Response(sn, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                          "{\"ok\":false,\"error\":\"Too many attempts\"}");
+            return;
+        }
+
+        char pwd[32] = {0};
+        JSON_ReadStr(body, "password", pwd, sizeof(pwd));
+        Get_Shared_Config(&s_http_cfg_temp);
 
         int slot = Session_Find(line);
-        if (slot >= 0 && strcmp(otp, OTA_OTP_SECRET) == 0) {
+        if (slot >= 0 && pwd[0] != '\0' && strcmp(pwd, s_http_cfg_temp.admin_password) == 0) {
+            s_login_fail_count = 0;
             ota_otp_validated = 1;
             s_ota_otp_slot = slot;
             s_ota_otp_tick = xTaskGetTickCount();
@@ -4048,7 +4102,11 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         } else {
             ota_otp_validated = 0;
             s_ota_otp_slot = -1;
-            Send_Response(sn, HTTP_200_JSON, "{\"ok\":false}");
+            if (++s_login_fail_count >= LOGIN_MAX_ATTEMPTS) {
+                s_login_lockout_until = now_sec + LOGIN_LOCKOUT_SEC;
+            }
+            Log_Event("AUTH", "OTA password check failed");
+            Send_Response(sn, HTTP_401, NULL);
         }
         return;
     }
