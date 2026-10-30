@@ -31,6 +31,7 @@ set(MCAL_SOURCES
     MCAL/STM32F4/rng_stm32.c
     HAL/w25q16.c
     HAL/flash_partition.c
+    HAL/layout_store.c
     HAL/safe_fmt.c
     HAL/plc_control.c
 )

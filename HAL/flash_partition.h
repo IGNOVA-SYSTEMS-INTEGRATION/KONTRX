@@ -154,7 +154,12 @@ _Static_assert(sizeof(RuleConfig_t) <= 4096, "RuleConfig_t exceeds 4096-byte fla
 #define LAYOUT_PARTITION_ADDR    0x00084000U
 #define LAYOUT_PARTITION_SIZE    0x00004000U  // 16 KB (Sectors 132 to 135)
 #define LAYOUT_MAGIC             0x4C41594FU  // "LAYO"
-#define LAYOUT_MAX_DATA          (LAYOUT_PARTITION_SIZE - 12U) // 12 = magic + len + crc
+/* Two 8 KB slots (HAL/layout_store.c): active = layout of the accepted rules,
+   pending = layout waiting for approval; accept copies pending -> active. */
+#define LAYOUT_SLOT_SIZE         0x00002000U  // 8 KB
+#define LAYOUT_ACTIVE_ADDR       LAYOUT_PARTITION_ADDR                       // Sectors 132-133
+#define LAYOUT_PENDING_ADDR      (LAYOUT_PARTITION_ADDR + LAYOUT_SLOT_SIZE)  // Sectors 134-135
+#define LAYOUT_MAX_DATA          (LAYOUT_SLOT_SIZE - 12U) // 12 = magic + len + crc
 
 #define PARTITION_QUEUE_ADDR     0x00088000U
 #define PARTITION_QUEUE_SIZE     0x0007C000U  // 496 KB (Sectors 136 to 259)
@@ -195,6 +200,10 @@ uint8_t Partition_BackupCurrentRules(void);
 
 // Canvas Layout Blob (opaque JSON round-trip for desktop configurator)
 uint8_t Partition_SaveLayout(const char *json, uint32_t len);
+uint8_t Partition_SavePendingLayout(const char *json, uint32_t len);
+uint32_t Partition_LoadPendingLayout(char *buf, uint32_t buf_size);
+uint8_t Partition_CommitPendingLayout(void);
+void Partition_ClearPendingLayout(void);
 uint32_t Partition_LoadLayout(char *buf, uint32_t buf_size);
 
 // Offline Telemetry Queue (FIFO Ring)
