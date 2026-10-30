@@ -13,8 +13,8 @@ Provides a guaranteed-delivery, zero-data-loss telemetry queue that automaticall
      * If an SD card is detected (`SDCard_IsMounted()`), telemetry records (`OfflineRecord_t`) are stored into a fast binary FIFO file queue (`/queue/telemetry.bin`).
      * Supports gigabytes of storage (millions of data points across weeks of offline operation).
   2. **Fallback Tier (SPI NOR Flash W25Q16)**:
-     * If no SD card is inserted, the queue seamlessly redirects to dedicated sectors on the W25Q16 SPI Flash (`PARTITION_QUEUE_ADDR = 0x00088000`, 496 KB, Sectors 136 to 259).
-     * Holds up to **31,744 individual 16-byte records** (`QUEUE_RECORD_SIZE = 16U`).
+     * If no SD card is inserted, the queue seamlessly redirects to dedicated sectors on the W25Q16 SPI Flash (`PARTITION_QUEUE_ADDR = 0x00088000`, 400 KB, Sectors 136 to 235; the rules history archive follows at sector 236).
+     * Holds up to **25,600 individual 16-byte records** (`QUEUE_RECORD_SIZE = 16U`).
 * **Store-and-Forward Replay Cycle**:
   1. `Task_MQTTClient` detects socket disconnect (`W5500_IsConnected() == false`).
   2. Incoming telemetry records from `Task_ModbusSensorPoll` and actuator events are routed to `SDCard_Queue_Push()` or `Partition_QueuePush()`.
