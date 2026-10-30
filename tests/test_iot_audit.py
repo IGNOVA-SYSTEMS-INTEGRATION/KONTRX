@@ -323,14 +323,24 @@ class TestActuation:
 
 # ---------------------------------------------------------------- Storage
 class TestStorage:
-    @open_finding("STO-09: rules history (0xEC000-0x103FFF) lies inside the offline queue (0x88000-0x103FFF)")
     def test_sto09_partitions_do_not_overlap(self):
         h = src("HAL/flash_partition.h")
         def v(name):
             return int(re.search(name + r"\s+(0x[0-9A-Fa-f]+)U", h).group(1), 16)
-        q0, q1 = v("PARTITION_QUEUE_ADDR"), v("PARTITION_QUEUE_ADDR") + v("PARTITION_QUEUE_SIZE")
-        r0 = v("PARTITION_RULES_HISTORY_ADDR")
-        assert not (q0 <= r0 < q1)
+        parts = [
+            ("web", v("PARTITION_WEB_ADDR"), v("PARTITION_WEB_SIZE")),
+            ("config", v("PARTITION_CONFIG_ADDR"), v("PARTITION_CONFIG_SIZE")),
+            ("layout", v("LAYOUT_PARTITION_ADDR"), v("LAYOUT_PARTITION_SIZE")),
+            ("queue", v("PARTITION_QUEUE_ADDR"), v("PARTITION_QUEUE_SIZE")),
+            ("history", v("PARTITION_RULES_HISTORY_ADDR"), v("PARTITION_RULES_HISTORY_SIZE")),
+            ("log", v("PARTITION_LOG_ADDR"), v("PARTITION_LOG_SIZE")),
+        ]
+        parts.sort(key=lambda p: p[1])
+        for (n0, a0, s0), (n1, a1, _) in zip(parts, parts[1:]):
+            assert a0 + s0 <= a1, f"{n0} overlaps {n1}"
+        assert parts[-1][1] + parts[-1][2] <= v("W25Q16_SIZE")
+        # The build also refuses an overlapping map.
+        assert "_Static_assert(PARTITION_QUEUE_ADDR + PARTITION_QUEUE_SIZE <= PARTITION_RULES_HISTORY_ADDR" in h
 
     def test_sto03_dual_sector_config_with_crc(self):
         fp = src("HAL/flash_partition.c")

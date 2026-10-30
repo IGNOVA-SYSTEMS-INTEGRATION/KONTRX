@@ -161,10 +161,13 @@ _Static_assert(sizeof(RuleConfig_t) <= 4096, "RuleConfig_t exceeds 4096-byte fla
 #define LAYOUT_PENDING_ADDR      (LAYOUT_PARTITION_ADDR + LAYOUT_SLOT_SIZE)  // Sectors 134-135
 #define LAYOUT_MAX_DATA          (LAYOUT_SLOT_SIZE - 12U) // 12 = magic + len + crc
 
+/* The queue ends where the rules history archive starts (sector 236).
+   It used to run to 0x103FFF and, once ~25600 records were queued, erased
+   the history archives (and archiving overwrote queued records). */
 #define PARTITION_QUEUE_ADDR     0x00088000U
-#define PARTITION_QUEUE_SIZE     0x0007C000U  // 496 KB (Sectors 136 to 259)
+#define PARTITION_QUEUE_SIZE     0x00064000U  // 400 KB (Sectors 136 to 235)
 #define QUEUE_RECORD_SIZE        16U
-#define QUEUE_MAX_ENTRIES        (PARTITION_QUEUE_SIZE / QUEUE_RECORD_SIZE) // 31744
+#define QUEUE_MAX_ENTRIES        (PARTITION_QUEUE_SIZE / QUEUE_RECORD_SIZE) // 25600
 
 #define PARTITION_LOG_ADDR       0x00104000U
 #define PARTITION_LOG_SIZE       0x000FC000U // 1008 KB (Sectors 260 to 511)
@@ -236,6 +239,19 @@ uint32_t Partition_Queue_StreamSize(void);
 #define ARCHIVE_SLOT_SIZE             0x00002000U // 8 KB per slot (4KB rules + 4KB layout)
 #define ARCHIVE_SLOT_MAGIC            0x52554C41U // "RULA"
 #define ARCHIVE_LAYOUT_MAX            4096U       // layout bytes per slot (second 4 KB sector)
+
+/* W25Q16 map must stay in order and inside 2 MB: a build that overlaps two
+   partitions fails here instead of erasing data on the board. */
+#define W25Q16_SIZE                   0x00200000U
+_Static_assert(PARTITION_WEB_ADDR + PARTITION_WEB_SIZE <= PARTITION_CONFIG_ADDR, "web overlaps config");
+_Static_assert(PARTITION_CONFIG_ADDR + PARTITION_CONFIG_SIZE <= LAYOUT_PARTITION_ADDR, "config overlaps layout");
+_Static_assert(LAYOUT_PENDING_ADDR + LAYOUT_SLOT_SIZE <= LAYOUT_PARTITION_ADDR + LAYOUT_PARTITION_SIZE, "layout slots exceed partition");
+_Static_assert(LAYOUT_PARTITION_ADDR + LAYOUT_PARTITION_SIZE <= PARTITION_QUEUE_ADDR, "layout overlaps queue");
+_Static_assert(PARTITION_QUEUE_ADDR + PARTITION_QUEUE_SIZE <= PARTITION_RULES_HISTORY_ADDR, "queue overlaps rules history");
+_Static_assert(MAX_HISTORY_ARCHIVES * ARCHIVE_SLOT_SIZE <= PARTITION_RULES_HISTORY_SIZE, "history slots exceed partition");
+_Static_assert(PARTITION_RULES_HISTORY_ADDR + PARTITION_RULES_HISTORY_SIZE <= PARTITION_LOG_ADDR, "rules history overlaps log");
+_Static_assert(PARTITION_LOG_ADDR + PARTITION_LOG_SIZE <= W25Q16_SIZE, "log exceeds flash size");
+_Static_assert(PARTITION_QUEUE_SIZE % 4096U == 0, "queue must be whole sectors");
 
 uint8_t  Partition_ArchiveRules(const RuleConfig_t *cfg, const char *layout_json, uint32_t layout_len);
 int      Partition_FormatRulesHistoryJSON(char *buf, int max_len, const char *active_version);

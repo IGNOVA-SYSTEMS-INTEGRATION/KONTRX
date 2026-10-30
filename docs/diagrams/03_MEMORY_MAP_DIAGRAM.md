@@ -66,7 +66,8 @@ Address Range           Size      Sectors       Function / Contents
 0x00083000 - 0x00083FFF   4 KB    Sector 131    Backup Rules (Rollback Target)
 0x00084000 - 0x00085FFF   8 KB    132 to 133    Canvas Layout, active slot (JSON, Magic "LAYO")
 0x00086000 - 0x00087FFF   8 KB    134 to 135    Canvas Layout, pending slot (awaiting approval)
-0x00088000 - 0x00103FFF 496 KB    136 to 259    Offline Telemetry Queue (31,744 Records)
+0x00088000 - 0x000EBFFF 400 KB    136 to 235    Offline Telemetry Queue (25,600 Records)
+0x000EC000 - 0x00103FFF  96 KB    236 to 259    Rules History Archives (12 x 8 KB slots)
 0x00104000 - 0x001FFFFF 1008 KB   260 to 511    System Event & Audit Logs
 --------------------------------------------------------------------------------------
 ```

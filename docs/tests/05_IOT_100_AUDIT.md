@@ -144,7 +144,7 @@ Legend: ✅ PASS · ⚠️ PARTIAL · ❌ FAIL · 🔍 NOT VERIFIED · N/A. Sev 
 
 | ID | Issue | Status | Sev | Evidence | Fix | Test |
 |---|---|---|---|---|---|---|
-| TEL-01 | Store-and-forward | ✅ | — | 496 KB ring on W25Q16 | — | — |
+| TEL-01 | Store-and-forward | ✅ | — | 400 KB ring on W25Q16 | — | — |
 | TEL-02 | Duplicates / ordering on replay | 🔍 | M | QoS1 + persistent session → duplicates possible; needs broker-side test | Message id / seq in payload | — |
 | TEL-03 | Timestamps before time sync | ✅ | — | `TIME_UPTIME_FLAG` marks unsynced stamps | — | ✅ |
 | TEL-04 | NTP failure | ✅ | — | SNTP local→internet, browser fallback | — | — |
