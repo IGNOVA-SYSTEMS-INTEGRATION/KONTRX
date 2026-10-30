@@ -9,7 +9,7 @@ Provides non-volatile, fail-safe storage for both visual node-graph layouts and 
 ---
 
 ## 2. Technical Implementation & How It Works (بتشتغل ازاي)
-* **Code Location**: `HAL/flash_partition.c`, `HAL/flash_partition.h`, `HAL/w25q16.c`, `APP/freertos_tasks.c`.
+* **Code Location**: `HAL/flash_partition.c`, `HAL/layout_store.c`, `HAL/flash_partition.h`, `HAL/w25q16.c`, `APP/freertos_tasks.c`.
 * **Flash Partition Scheme on W25Q16 (2 MB)**:
   * `PARTITION_CONFIG_ADDR` (`0x00080000`, 16 KB):
     * Primary Config (`0x00080000`, 4 KB, Sector 128)
@@ -17,7 +17,11 @@ Provides non-volatile, fail-safe storage for both visual node-graph layouts and 
     * Primary Rules (`0x00082000`, 4 KB, Sector 130)
     * Backup Rules (`0x00083000`, 4 KB, Sector 131)
   * `LAYOUT_PARTITION_ADDR` (`0x00084000`, 16 KB, Sectors 132 to 135):
-    * Stores raw visual canvas JSON (up to 16,372 bytes) prefixed with magic `0x4C41594FU` ("LAYO"), 32-bit payload length, and CRC32.
+    * Two 8 KB slots, each holding raw canvas JSON (up to 8,180 bytes) prefixed with magic `0x4C41594FU` ("LAYO"), 32-bit payload length, and CRC32:
+      * **Active** (`0x00084000`, Sectors 132–133): layout of the accepted rules, served by `GET /api/rules` and `GET /api/layout`.
+      * **Pending** (`0x00086000`, Sectors 134–135): layout of an upload (`POST /api/rules`) or rollback waiting for approval.
+    * `POST /api/rules/accept` verifies the pending slot, copies it over the active slot in 256-byte chunks and verifies the copy; reject / clear drop it, so a rejected upload never replaces the active layout (FW 2.2.3+).
+    * Known limit: if accepted rules fail the stability window and the board falls back to `RULES_BACKUP_ADDR`, the active layout stays the new one.
 * **Dual-Sector Atomic Rollback Sequence**:
   1. **Atomic Write**: When new rules/configs arrive via HTTP or MQTT, `Partition_BackupCurrentRules()` copies current operational rules to `RULES_BACKUP_ADDR`.
   2. **Staged Validation**: The new rule set is written to `RULES_PRIMARY_ADDR` with `rules_valid = 0` (Testing mode).

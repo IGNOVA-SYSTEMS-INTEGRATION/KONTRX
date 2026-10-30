@@ -101,6 +101,8 @@ static RuleConfig_t s_tempRules __attribute__((section(".ccmram")));
 /* Layout of one archive slot; shared by accept (archive) and rollback (load),
  * both handled sequentially by the HTTP task. */
 static char s_archive_layout[ARCHIVE_LAYOUT_MAX + 1] __attribute__((section(".ccmram")));
+/* 1 = the pending layout slot belongs to the current pending rules. */
+static uint8_t s_pending_layout_valid = 0;
 
 /* ======================================================================
  *  Static working buffers for JSON_StatusResponse
@@ -2622,6 +2624,12 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 osMutexRelease(rulesMutex);
             }
 
+            // The approved upload's layout becomes the active layout
+            if (s_pending_layout_valid) {
+                Partition_CommitPendingLayout();
+                s_pending_layout_valid = 0;
+            }
+
             // Archive to persistent history (SD Card / Flash) along with current layout
             {
                 uint32_t ll = Partition_LoadLayout(s_archive_layout, sizeof(s_archive_layout));
@@ -2653,6 +2661,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                 memset(&pendingRules, 0, sizeof(RuleConfig_t));
                 hasPendingRules = 0;
                 cleared = 1;
+                s_pending_layout_valid = 0;
             }
             osMutexRelease(rulesMutex);
         }
@@ -2683,6 +2692,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             
             memset(&pendingRules, 0, sizeof(RuleConfig_t));
             hasPendingRules = 0;
+            s_pending_layout_valid = 0;
             
             osMutexRelease(rulesMutex);
         }
@@ -2726,14 +2736,13 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
 
         /* A rollback is a rule change like an upload: the archived version
          * becomes the pending set and runs only after POST /api/rules/accept.
-         * Its layout is stored the same way an upload stores its layout. */
+         * Its layout goes to the pending layout slot, like an upload's. */
         #define rolledRules s_tempRules
         memset(&rolledRules, 0, sizeof(rolledRules));
         s_archive_layout[0] = '\0';
         if (Partition_LoadArchivedRules(target_ver, &rolledRules, s_archive_layout, sizeof(s_archive_layout))) {
-            if (s_archive_layout[0] != '\0') {
-                Partition_SaveLayout(s_archive_layout, strlen(s_archive_layout));
-            }
+            s_pending_layout_valid = (s_archive_layout[0] != '\0') &&
+                                     Partition_SavePendingLayout(s_archive_layout, strlen(s_archive_layout));
             if (osMutexAcquire(rulesMutex, osWaitForever) == osOK) {
                 pendingRules = rolledRules;
                 hasPendingRules = 1;
@@ -2768,8 +2777,10 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
         }
         body += 4;
 
-        /* If payload contains "layout":{...}, save it directly to flash and
-           replace it with null in place, so the rules parser only scans the rules. */
+        /* If payload contains "layout":{...}, save it to the pending layout slot
+           and replace it with null in place, so the rules parser only scans the rules. */
+        uint8_t upload_has_layout = 0;
+        s_pending_layout_valid = 0;
         char *lkey = strstr(body, "\"layout\"");
         if (lkey) {
             char *colon = strchr(lkey, ':');
@@ -2794,7 +2805,8 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
                     }
                     if (depth == 0) {
                         uint32_t layout_bytes = (uint32_t)(p - brace + 1);
-                        Partition_SaveLayout(brace, layout_bytes);
+                        /* Stored with the pending rules; becomes active on accept. */
+                        upload_has_layout = Partition_SavePendingLayout(brace, layout_bytes);
                         /* Replace '{...}' with 'null       ' in place */
                         brace[0] = 'n';
                         brace[1] = 'u';
@@ -2853,6 +2865,7 @@ static void Dispatch_Request(uint8_t sn, uint8_t *req, uint16_t len) {
             hasPendingRules = 1;
             osMutexRelease(rulesMutex);
         }
+        s_pending_layout_valid = upload_has_layout;
 
         char update_log[128];
         snprintf(update_log, sizeof(update_log), "New rules version %s received (pending approval).", tempRules.version_id);

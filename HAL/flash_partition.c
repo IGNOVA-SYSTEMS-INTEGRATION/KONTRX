@@ -421,63 +421,7 @@ uint8_t Partition_BackupCurrentRules(void) {
     return 0;
 }
 
-/* ======================================================================
- *  Canvas Layout Blob (opaque JSON round-trip for desktop configurator)
- *  Flash format: [magic:4] [data_len:4] [json_data:N] [crc32:4]
- * ====================================================================== */
-uint8_t Partition_SaveLayout(const char *json, uint32_t len) {
-    if (!json || len == 0 || len > LAYOUT_MAX_DATA) {
-        printf("[Layout] Save rejected: len=%lu (max %lu)\r\n",
-               (unsigned long)len, (unsigned long)LAYOUT_MAX_DATA);
-        return 0;
-    }
-
-    uint32_t sectors = (len + 12U + 4095U) / 4096U;
-    if (sectors > (LAYOUT_PARTITION_SIZE / 4096U)) sectors = LAYOUT_PARTITION_SIZE / 4096U;
-    for (uint32_t s = 0; s < sectors; s++) {
-        W25Q_EraseSector(LAYOUT_PARTITION_ADDR + s * 4096U);
-    }
-
-    uint32_t magic = LAYOUT_MAGIC;
-    uint32_t crc   = Compute_CRC32((const uint8_t *)json, len);
-
-    W25Q_Write(LAYOUT_PARTITION_ADDR,      (const uint8_t *)&magic, 4);
-    W25Q_Write(LAYOUT_PARTITION_ADDR + 4,  (const uint8_t *)&len,   4);
-    W25Q_Write(LAYOUT_PARTITION_ADDR + 8,  (const uint8_t *)json,   len);
-    W25Q_Write(LAYOUT_PARTITION_ADDR + 8 + len, (const uint8_t *)&crc, 4);
-
-    printf("[Layout] Saved %lu bytes of canvas layout to flash.\r\n", (unsigned long)len);
-    return 1;
-}
-
-uint32_t Partition_LoadLayout(char *buf, uint32_t buf_size) {
-    uint32_t magic = 0, data_len = 0;
-    W25Q_Read(LAYOUT_PARTITION_ADDR,     (uint8_t *)&magic,    4);
-    W25Q_Read(LAYOUT_PARTITION_ADDR + 4, (uint8_t *)&data_len, 4);
-
-    if (magic != LAYOUT_MAGIC || data_len == 0 || data_len > LAYOUT_MAX_DATA) {
-        return 0;
-    }
-    if (data_len >= buf_size) {
-        printf("[Layout] Buffer too small: need %lu, have %lu\r\n",
-               (unsigned long)data_len, (unsigned long)buf_size);
-        return 0;
-    }
-
-    W25Q_Read(LAYOUT_PARTITION_ADDR + 8, (uint8_t *)buf, data_len);
-    buf[data_len] = '\0';
-
-    uint32_t stored_crc = 0;
-    W25Q_Read(LAYOUT_PARTITION_ADDR + 8 + data_len, (uint8_t *)&stored_crc, 4);
-    uint32_t cal_crc = Compute_CRC32((const uint8_t *)buf, data_len);
-
-    if (stored_crc != cal_crc) {
-        printf("[Layout] CRC mismatch — layout data corrupted.\r\n");
-        return 0;
-    }
-
-    return data_len;
-}
+/* Canvas layout blob: HAL/layout_store.c */
 
 /* ======================================================================
  *  Offline Telemetry Queue (FIFO Ring)

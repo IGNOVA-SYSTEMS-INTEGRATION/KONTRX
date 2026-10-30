@@ -13,6 +13,12 @@ cd tests
 gcc -std=gnu11 -Wall -Wextra -g -Ihost_stubs -I../HAL -I../APP test_rule_sequence.c ../APP/rule_sequence.c -o test_rule_sequence && ./test_rule_sequence
 ```
 
+### Canvas Layout Slots (C)
+```bash
+cd tests
+gcc -std=gnu11 -Wall -Wextra -g -Ihost_stubs -I../HAL -I../APP test_layout_store.c ../HAL/layout_store.c -o test_layout_store && ./test_layout_store
+```
+
 No host `gcc` on Windows? `python -m pip install ziglang` and use `python -m ziglang cc` in place of `gcc`
 (AddressSanitizer is not available there; use `-fsanitize=undefined -fsanitize-trap=undefined`).
 
